@@ -134,6 +134,15 @@ impl ClaudeProcess {
             .context("failed to spawn claude process")?;
 
         let stdout = child.stdout.take().context("no stdout pipe")?;
+
+        // Set stdout to non-blocking so try_read_event doesn't hang the event loop
+        use std::os::unix::io::AsRawFd;
+        let fd = stdout.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
         let reader = BufReader::new(stdout);
 
         Ok(Self {
@@ -152,28 +161,27 @@ impl ClaudeProcess {
     }
 
     /// Try to read and parse the next NDJSON line from stdout.
-    /// Returns `None` if the process has exited (EOF).
+    /// Returns `None` if no data is ready (WouldBlock) or EOF.
     pub fn try_read_event(&mut self) -> Result<Option<StreamEvent>> {
         let mut line = String::new();
-        let bytes = self.reader.read_line(&mut line)
-            .context("failed to read from claude stdout")?;
-        if bytes == 0 {
-            return Ok(None); // EOF
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        let event = parse_event_line(trimmed)?;
-
-        // Capture session_id from init event
-        if let StreamEvent::System { subtype, session_id: Some(ref sid), .. } = &event {
-            if subtype == "init" {
-                self.session_id = Some(sid.clone());
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Ok(None), // EOF
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                let event = parse_event_line(trimmed)?;
+                if let StreamEvent::System { subtype, session_id: Some(ref sid), .. } = &event {
+                    if subtype == "init" {
+                        self.session_id = Some(sid.clone());
+                    }
+                }
+                Ok(Some(event))
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e.into()),
         }
-
-        Ok(Some(event))
     }
 
     /// Check if the child process is still alive.
@@ -275,5 +283,23 @@ mod tests {
             .build();
         assert!(args.contains(&"--add-dir".to_string()));
         assert!(args.contains(&"/some/path".to_string()));
+    }
+
+    #[test]
+    fn test_set_nonblocking_does_not_panic() {
+        use std::os::unix::io::AsRawFd;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("echo")
+            .arg("test")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let fd = stdout.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        child.wait().ok();
     }
 }
