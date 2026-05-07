@@ -100,7 +100,7 @@ fn run_loop(
                         }
                         AppMode::Input { .. } => handle_input_key(app, key.code)?,
                         AppMode::Status => handle_status_key(app, key.code)?,
-                        AppMode::AgentDetail { .. } => handle_detail_key(app, key.code),
+                        AppMode::AgentDetail { .. } => handle_detail_key(app, key.code, key.modifiers)?,
                         AppMode::Help => {
                             app.mode = AppMode::Dashboard;
                         }
@@ -110,18 +110,18 @@ fn run_loop(
                     }
                 }
                 Event::Paste(text) => {
-                    if matches!(app.mode, AppMode::Input { .. }) {
-                        // Replace newlines with spaces for single-line input
-                        let cleaned = text.replace('\n', " ").replace('\r', "");
-                        app.input_buf.push_str(&cleaned);
+                    let cleaned = text.replace('\r', "");
+                    if matches!(app.mode, AppMode::AgentDetail { .. }) {
+                        app.agent_input_buf.push_str(&cleaned);
                     } else {
-                        // Auto-enter chat mode and paste
-                        app.mode = AppMode::Input {
-                            prompt_label: "> ".to_string(),
-                            callback: InputCallback::ChatOrc,
-                        };
-                        let cleaned = text.replace('\n', " ").replace('\r', "");
-                        app.input_buf = cleaned;
+                        if !matches!(app.mode, AppMode::Input { .. }) {
+                            app.mode = AppMode::Input {
+                                prompt_label: "> ".to_string(),
+                                callback: InputCallback::ChatOrc,
+                            };
+                            app.input_buf.clear();
+                        }
+                        app.input_buf.push_str(&cleaned);
                     }
                 }
                 _ => {}
@@ -146,25 +146,17 @@ fn handle_dashboard_key(
     modifiers: KeyModifiers,
 ) -> Result<()> {
     match code {
+        KeyCode::Esc => enter_chat_mode(app),
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.select_next(),
         KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
         KeyCode::Enter => {
             if app.selected_agent().is_some() {
-                app.mode = AppMode::AgentDetail {
-                    agent_idx: app.selected,
-                    scroll: 0,
-                };
+                enter_agent_mode(app, app.selected);
+            } else {
+                enter_chat_mode(app);
             }
-        }
-        // Chat with orc
-        KeyCode::Char('c') => {
-            app.mode = AppMode::Input {
-                prompt_label: "> ".to_string(),
-                callback: InputCallback::ChatOrc,
-            };
-            app.input_buf.clear();
         }
         KeyCode::Char('n') => {
             app.mode = AppMode::Input {
@@ -220,6 +212,26 @@ fn handle_dashboard_key(
     Ok(())
 }
 
+fn enter_chat_mode(app: &mut App) {
+    app.mode = AppMode::Input {
+        prompt_label: "> ".to_string(),
+        callback: InputCallback::ChatOrc,
+    };
+    app.input_buf.clear();
+}
+
+fn enter_agent_mode(app: &mut App, idx: usize) {
+    if let Some(agent) = app.agents.get(idx) {
+        let name = agent.name.clone();
+        app.mode = AppMode::AgentDetail {
+            agent_idx: idx,
+            scroll: 0,
+        };
+        app.agent_input_buf.clear();
+        app.agent_input_name = name;
+    }
+}
+
 fn handle_input_key(
     app: &mut App,
     code: KeyCode,
@@ -228,7 +240,6 @@ fn handle_input_key(
         KeyCode::Enter => {
             let input = app.input_buf.clone();
             if input.is_empty() {
-                app.mode = AppMode::Dashboard;
                 return Ok(());
             }
             let mode = std::mem::replace(&mut app.mode, AppMode::Dashboard);
@@ -240,6 +251,8 @@ fn handle_input_key(
                     InputCallback::ChatOrc => chat_orc(app, &input)?,
                 }
             }
+            // Return to chat mode after sending
+            enter_chat_mode(app);
             Ok(())
         }
         KeyCode::Char(c) => {
@@ -290,23 +303,64 @@ fn handle_status_key(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
-fn handle_detail_key(app: &mut App, code: KeyCode) {
+fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = AppMode::Dashboard;
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                *scroll = scroll.saturating_add(1);
+        KeyCode::Esc => {
+            if app.agent_input_buf.is_empty() {
+                enter_chat_mode(app);
+            } else {
+                app.agent_input_buf.clear();
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        // Scroll with Ctrl+U / Ctrl+D
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                *scroll = scroll.saturating_sub(1);
+                *scroll = scroll.saturating_add(5);
             }
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_sub(5);
+            }
+        }
+        KeyCode::Enter => {
+            if !app.agent_input_buf.is_empty() {
+                let input = app.agent_input_buf.clone();
+                if let AppMode::AgentDetail { agent_idx, .. } = &app.mode {
+                    let idx = *agent_idx;
+                    if let Some(agent) = app.agents.get(idx) {
+                        let flat = input.lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let tmp_path = dirs::home_dir()
+                            .unwrap_or_default()
+                            .join(".orc/msg.tmp");
+                        fs::write(&tmp_path, &flat)?;
+                        Command::new("tmux")
+                            .args(["load-buffer", tmp_path.to_str().unwrap()])
+                            .status().ok();
+                        Command::new("tmux")
+                            .args(["paste-buffer", "-t", &agent.pane.target()])
+                            .status().ok();
+                        tmux::send_keys_raw(&agent.pane, "Enter")?;
+                        fs::remove_file(&tmp_path).ok();
+                        app.set_status(format!("sent to {}", agent.name));
+                    }
+                }
+                app.agent_input_buf.clear();
+            }
+        }
+        KeyCode::Char(c) => {
+            app.agent_input_buf.push(c);
+        }
+        KeyCode::Backspace => {
+            app.agent_input_buf.pop();
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
@@ -324,7 +378,32 @@ fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
 
 fn chat_orc(app: &mut App, message: &str) -> Result<()> {
     if let Some(orc_pane) = &app.orc_pane {
-        tmux::send_keys(orc_pane, message)?;
+        // For multi-line or long messages, use tmux load-buffer to avoid
+        // send-keys issues with special characters and newlines
+        let tmp_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".orc/msg.tmp");
+        // Collapse newlines to spaces for a single-message send
+        let flat = message.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        fs::write(&tmp_path, &flat)?;
+
+        // Load into tmux buffer and paste into the pane
+        Command::new("tmux")
+            .args(["load-buffer", tmp_path.to_str().unwrap()])
+            .status()
+            .ok();
+        Command::new("tmux")
+            .args(["paste-buffer", "-t", &orc_pane.target()])
+            .status()
+            .ok();
+        // Send Enter to submit
+        tmux::send_keys_raw(orc_pane, "Enter")?;
+        fs::remove_file(&tmp_path).ok();
+
         app.set_status("sent to orc".to_string());
     }
     Ok(())

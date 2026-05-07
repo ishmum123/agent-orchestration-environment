@@ -58,6 +58,8 @@ pub struct App {
     pub show_preview: bool,
     pub scroll_offset: usize,
     pub status_selected: usize,
+    pub agent_input_buf: String,
+    pub agent_input_name: String,
 }
 
 impl App {
@@ -66,7 +68,10 @@ impl App {
             session: TmuxSession::new(session_name),
             agents: Vec::new(),
             selected: 0,
-            mode: AppMode::Dashboard,
+            mode: AppMode::Input {
+                prompt_label: "> ".to_string(),
+                callback: InputCallback::ChatOrc,
+            },
             input_buf: String::new(),
             should_quit: false,
             project_dir: project_dir.to_string(),
@@ -78,6 +83,8 @@ impl App {
             show_preview: true,
             scroll_offset: 0,
             status_selected: 0,
+            agent_input_buf: String::new(),
+            agent_input_name: String::new(),
         }
     }
 

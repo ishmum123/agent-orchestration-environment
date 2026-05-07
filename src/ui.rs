@@ -25,13 +25,34 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
+fn input_height(app: &App, width: u16) -> u16 {
+    if !matches!(app.mode, AppMode::Input { .. }) {
+        return 3; // hints + status
+    }
+    let line_count = app.input_buf.lines().count().max(1) as u16;
+    // Also account for wrapping within the available width
+    let prompt_len = 3u16; // "> " + cursor
+    let content_width = (width as usize).saturating_sub(prompt_len as usize + 1);
+    let wrap_lines = if content_width > 0 {
+        app.input_buf.lines()
+            .map(|l| ((l.len() / content_width) as u16).max(1))
+            .sum::<u16>()
+            .max(1)
+    } else {
+        line_count
+    };
+    // 1 for border + lines for content, capped at 10
+    (1 + wrap_lines).min(10).max(2)
+}
+
 fn render_dashboard(f: &mut Frame, app: &App) {
+    let bottom_h = input_height(app, f.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),  // header
             Constraint::Min(5),    // main area
-            Constraint::Length(3), // bottom bar
+            Constraint::Length(bottom_h), // bottom bar (dynamic)
         ])
         .split(f.area());
 
@@ -126,8 +147,13 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let visible_lines: Vec<Line> = output
-        .lines()
+    // Claude Code layout: banner at top (~5 lines), status bar at bottom (~3 lines).
+    // Strip those by position rather than content matching to avoid false positives.
+    let all_lines: Vec<&str> = output.lines().collect();
+    let content_lines = strip_claude_chrome(&all_lines);
+
+    let visible_lines: Vec<Line> = content_lines
+        .into_iter()
         .rev()
         .filter(|l| !l.trim().is_empty())
         .take(area.height as usize + app.scroll_offset)
@@ -135,18 +161,7 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
         .into_iter()
         .rev()
         .skip(app.scroll_offset)
-        .map(|line| {
-            let style = if line.to_lowercase().contains("error") {
-                Style::default().fg(Color::Red)
-            } else if line.contains("\u{2713}") || line.to_lowercase().contains("success") {
-                Style::default().fg(Color::Green)
-            } else if line.starts_with('>') || line.starts_with("orc:") || line.starts_with("$") {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Line::styled(format!(" {}", line), style)
-        })
+        .map(|line| style_orc_line(line))
         .collect();
 
     let output_widget = Paragraph::new(visible_lines)
@@ -217,19 +232,48 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
 fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
     match &app.mode {
         AppMode::Input { prompt_label, .. } => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(2)])
-                .split(area);
+            let input_area = Rect {
+                y: area.y,
+                height: area.height,
+                ..area
+            };
 
             let border = Paragraph::new("")
                 .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
-            f.render_widget(border, chunks[0]);
+            f.render_widget(border, Rect { height: 1, ..input_area });
 
-            let input_text = format!(" {}{}\u{2588}", prompt_label, app.input_buf);
-            let input = Paragraph::new(input_text)
+            let text_area = Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1),
+                ..area
+            };
+
+            // Build multi-line display
+            let buf_lines: Vec<&str> = if app.input_buf.is_empty() {
+                vec![""]
+            } else {
+                app.input_buf.lines().collect()
+            };
+
+            let mut display_lines: Vec<Line> = Vec::new();
+            for (i, line) in buf_lines.iter().enumerate() {
+                let prefix = if i == 0 {
+                    format!(" {}", prompt_label)
+                } else {
+                    " .. ".to_string()
+                };
+                let is_last = i == buf_lines.len() - 1;
+                let text = if is_last {
+                    format!("{}{}\u{2588}", prefix, line)
+                } else {
+                    format!("{}{}", prefix, line)
+                };
+                display_lines.push(Line::from(text));
+            }
+
+            let input = Paragraph::new(display_lines)
                 .style(Style::default().fg(Color::Yellow));
-            f.render_widget(input, chunks[1]);
+            f.render_widget(input, text_area);
         }
         _ => {
             let chunks = Layout::default()
@@ -243,8 +287,8 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
 
             let has_agents = !app.agents.is_empty();
             let mut hints = vec![
-                Span::styled(" c", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled("hat  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" esc", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(" chat  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("n", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::styled("ew  ", Style::default().fg(Color::DarkGray)),
             ];
@@ -403,18 +447,28 @@ fn render_status(f: &mut Frame, app: &App) {
     f.render_widget(hint, chunks[2]);
 }
 
+fn agent_input_height(app: &App, width: u16) -> u16 {
+    let buf = &app.agent_input_buf;
+    if buf.is_empty() {
+        return 2; // border + single line
+    }
+    let line_count = buf.lines().count().max(1) as u16;
+    (1 + line_count).min(10).max(2)
+}
+
 fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize) {
     let agent = match app.agents.get(agent_idx) {
         Some(a) => a,
         None => return,
     };
 
+    let input_h = agent_input_height(app, f.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Length(input_h),
         ])
         .split(f.area());
 
@@ -446,46 +500,64 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(header, chunks[0]);
 
-    // Full output
+    // Output — strip chrome, style lines
     let all_lines: Vec<&str> = agent.last_output.lines().collect();
-    let visible_height = chunks[1].height as usize;
-    let total = all_lines.len();
-    let start = if total > visible_height + scroll {
-        total - visible_height - scroll
-    } else {
-        0
-    };
-    let end = if total > scroll {
-        total - scroll
-    } else {
-        0
-    };
+    let content = strip_claude_chrome(&all_lines);
 
-    let output_lines: Vec<Line> = all_lines[start..end]
-        .iter()
-        .map(|line| {
-            let style = if line.to_lowercase().contains("error") {
-                Style::default().fg(Color::Red)
-            } else if line.contains("\u{2713}") || line.to_lowercase().contains("success") {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Line::styled(format!(" {}", line), style)
-        })
+    let visible_lines: Vec<Line> = content
+        .into_iter()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(chunks[1].height as usize + scroll)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .skip(scroll)
+        .map(|line| style_orc_line(line))
         .collect();
 
-    let output = Paragraph::new(output_lines);
+    let output = Paragraph::new(visible_lines)
+        .wrap(Wrap { trim: false });
     f.render_widget(output, chunks[1]);
 
-    // Bottom hints
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" j/k", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("esc", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" back", Style::default().fg(Color::DarkGray)),
-    ]));
-    f.render_widget(hint, chunks[2]);
+    // Input box
+    let input_area = chunks[2];
+    let border = Paragraph::new("")
+        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(border, Rect { height: 1, ..input_area });
+
+    let text_area = Rect {
+        y: input_area.y + 1,
+        height: input_area.height.saturating_sub(1),
+        ..input_area
+    };
+
+    let prompt = format!("{}> ", agent.name);
+    let buf_lines: Vec<&str> = if app.agent_input_buf.is_empty() {
+        vec![""]
+    } else {
+        app.agent_input_buf.lines().collect()
+    };
+
+    let mut display_lines: Vec<Line> = Vec::new();
+    for (i, line) in buf_lines.iter().enumerate() {
+        let prefix = if i == 0 {
+            format!(" {}", prompt)
+        } else {
+            " .. ".to_string()
+        };
+        let is_last = i == buf_lines.len() - 1;
+        let text = if is_last {
+            format!("{}{}\u{2588}", prefix, line)
+        } else {
+            format!("{}{}", prefix, line)
+        };
+        display_lines.push(Line::from(text));
+    }
+
+    let input = Paragraph::new(display_lines)
+        .style(Style::default().fg(Color::Yellow));
+    f.render_widget(input, text_area);
 }
 
 fn render_help_overlay(f: &mut Frame) {
@@ -503,7 +575,7 @@ fn render_help_overlay(f: &mut Frame) {
 
     let help_lines = vec![
         Line::from(""),
-        help_line("c", "chat with orc"),
+        help_line("esc", "back to chat (default mode)"),
         help_line("n", "spawn new agent"),
         help_line("t", "tell agent (via orc)"),
         help_line("/", "send directly to agent"),
@@ -575,6 +647,124 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+/// Style a line of orc output based on Claude Code conversation structure
+fn style_orc_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim();
+    let owned = format!(" {}", line);
+
+    // User prompt: ❯
+    if trimmed.starts_with('\u{276f}') {
+        let content = trimmed.trim_start_matches('\u{276f}').trim_start().to_string();
+        return Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                "\u{276f} ".to_string(),
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                content,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+
+    // Assistant response marker: ⏺
+    if trimmed.starts_with('\u{23fa}') {
+        let content = trimmed.trim_start_matches('\u{23fa}').trim_start().to_string();
+        return Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                "\u{23fa} ".to_string(),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                content,
+                Style::default().fg(Color::White),
+            ),
+        ]);
+    }
+
+    // Tool use indicators: ⎿
+    if trimmed.starts_with('\u{23bf}') || trimmed.starts_with('\u{2502}') {
+        return Line::styled(owned, Style::default().fg(Color::DarkGray));
+    }
+
+    // Spinning/status indicators
+    if trimmed.starts_with('\u{2736}')  // ✶
+        || trimmed.starts_with('\u{25d0}') // ◐
+        || trimmed.starts_with('\u{25cf}') // ●
+        || trimmed.contains("Harmonizing")
+        || trimmed.contains("Pontificating")
+        || trimmed.contains("Thinking")
+        || trimmed.contains("Running")
+    {
+        return Line::styled(owned, Style::default().fg(Color::Yellow));
+    }
+
+    // Errors
+    if trimmed.to_lowercase().contains("error") {
+        return Line::styled(owned, Style::default().fg(Color::Red));
+    }
+
+    // Success
+    if trimmed.contains('\u{2713}') || trimmed.to_lowercase().contains("success")
+        || trimmed.to_lowercase().contains("complete")
+    {
+        return Line::styled(owned, Style::default().fg(Color::Green));
+    }
+
+    // Bullets / list items
+    if trimmed.starts_with('-') || trimmed.starts_with('*') || trimmed.starts_with('\u{2022}') {
+        return Line::styled(owned, Style::default().fg(Color::Rgb(200, 200, 220)));
+    }
+
+    // Code/command
+    if trimmed.starts_with("```") || trimmed.starts_with('$') {
+        return Line::styled(owned, Style::default().fg(Color::Cyan));
+    }
+
+    // Default
+    Line::styled(owned, Style::default().fg(Color::Rgb(180, 180, 195)))
+}
+
+/// Strip Claude Code UI chrome from captured pane output.
+/// Uses a hybrid approach: find conversation start by looking for the first real
+/// user prompt (not a "Try" suggestion), then filter remaining chrome lines.
+fn strip_claude_chrome<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
+    // Find first real content: ❯ not followed by Try/suggestion, or ⏺ response
+    let start = lines.iter().position(|l| {
+        let t = l.trim();
+        (t.starts_with('\u{276f}') && !t.contains("Try \"") && !t.contains("Try \u{201c}"))  // ❯ but not suggestion
+            || t.starts_with('\u{23fa}') // ⏺
+    }).unwrap_or(lines.len());
+
+    if start >= lines.len() {
+        return Vec::new();
+    }
+
+    // From start, keep only non-chrome lines
+    lines[start..]
+        .iter()
+        .filter(|l| !is_chrome_line(l))
+        .copied()
+        .collect()
+}
+
+fn is_chrome_line(line: &str) -> bool {
+    let l = line.trim();
+    l.contains("-- INSERT --")
+        || l.contains("-- NORMAL --")
+        || l.contains("Model: ")
+        || l.contains("Ctx Used:")
+        || l.contains("bypass permissions")
+        || l.contains("/effort")
+        || l.contains("native installer")
+        || l.contains("claude install")
+        || (l.starts_with('\u{276f}') && (l.contains("Try \"") || l.contains("Try \u{201c}")))
+        // Separator lines (only box-drawing chars and spaces)
+        || (l.len() > 20 && l.chars().all(|c| "\u{2500}\u{2501}\u{2502}\u{2550}\u{2551} -".contains(c)))
 }
 
 fn truncate(s: &str, max: usize) -> String {
