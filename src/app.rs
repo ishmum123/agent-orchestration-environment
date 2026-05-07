@@ -1,7 +1,6 @@
 use crate::agent::{Agent, AgentState, OutputEntry};
 use crate::claude::ClaudeProcess;
 use crate::events::{ContentBlock, StreamEvent};
-use std::path::PathBuf;
 use std::time::Instant;
 
 /// Dashboard interaction modes
@@ -41,43 +40,131 @@ pub enum OrcCommand {
     Kill { name: String },
 }
 
-/// Parse [SPAWN_AGENT ...], [TELL_AGENT ...], [KILL_AGENT ...] from orc output.
-pub fn parse_orc_commands(text: &str) -> Vec<OrcCommand> {
-    let mut cmds = Vec::new();
+/// Strip all command blocks ([SPAWN_AGENT ...], [TELL_AGENT ...], [KILL_AGENT ...]) from text.
+/// Returns the text with command blocks removed, suitable for display.
+pub fn strip_orc_commands(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
 
-    for line in text.lines() {
-        let trimmed = line.trim();
+    while !remaining.is_empty() {
+        let next_cmd = ["[SPAWN_AGENT", "[TELL_AGENT", "[KILL_AGENT"]
+            .iter()
+            .filter_map(|tag| remaining.find(tag))
+            .min();
 
-        if trimmed.starts_with("[SPAWN_AGENT") {
-            if let (Some(name), Some(task)) = (
-                extract_attr(trimmed, "name"),
-                extract_attr(trimmed, "task"),
-            ) {
-                cmds.push(OrcCommand::Spawn { name, task });
+        match next_cmd {
+            Some(start) => {
+                // Keep text before the command
+                result.push_str(&remaining[..start]);
+                let cmd_start = &remaining[start..];
+                // Find end of command block
+                let end = cmd_start.find("\"]")
+                    .map(|p| p + 2)
+                    .or_else(|| cmd_start.find(']').map(|p| p + 1))
+                    .unwrap_or(cmd_start.len());
+                remaining = &remaining[start + end..];
             }
-        } else if trimmed.starts_with("[TELL_AGENT") {
-            if let (Some(name), Some(message)) = (
-                extract_attr(trimmed, "name"),
-                extract_attr(trimmed, "message"),
-            ) {
-                cmds.push(OrcCommand::Tell { name, message });
-            }
-        } else if trimmed.starts_with("[KILL_AGENT") {
-            if let Some(name) = extract_attr(trimmed, "name") {
-                cmds.push(OrcCommand::Kill { name });
+            None => {
+                result.push_str(remaining);
+                break;
             }
         }
+    }
+
+    // Clean up: remove empty lines left by stripping
+    result.lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse [SPAWN_AGENT ...], [TELL_AGENT ...], [KILL_AGENT ...] from orc output.
+/// Handles multi-line commands — finds opening `[CMD` and scans until closing `"]`.
+pub fn parse_orc_commands(text: &str) -> Vec<OrcCommand> {
+    let mut cmds = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        // Find the next command start
+        let (cmd_type, start) = [
+            ("[SPAWN_AGENT", "spawn"),
+            ("[TELL_AGENT", "tell"),
+            ("[KILL_AGENT", "kill"),
+        ]
+        .iter()
+        .filter_map(|(tag, kind)| remaining.find(tag).map(|pos| (*kind, pos)))
+        .min_by_key(|(_, pos)| *pos)
+        .unwrap_or(("", remaining.len()));
+
+        if start >= remaining.len() {
+            break;
+        }
+
+        let cmd_start = &remaining[start..];
+        // Find closing `]` — the command ends at the first `"]` or `]`
+        let end = cmd_start.find("\"]")
+            .map(|p| p + 2)
+            .or_else(|| cmd_start.find(']').map(|p| p + 1));
+
+        let block = match end {
+            Some(e) => &cmd_start[..e],
+            None => {
+                remaining = &remaining[start + 1..];
+                continue;
+            }
+        };
+
+        match cmd_type {
+            "spawn" => {
+                if let (Some(name), Some(task)) = (
+                    extract_attr(block, "name"),
+                    extract_attr_multiline(block, "task"),
+                ) {
+                    cmds.push(OrcCommand::Spawn { name, task });
+                }
+            }
+            "tell" => {
+                if let (Some(name), Some(message)) = (
+                    extract_attr(block, "name"),
+                    extract_attr_multiline(block, "message"),
+                ) {
+                    cmds.push(OrcCommand::Tell { name, message });
+                }
+            }
+            "kill" => {
+                if let Some(name) = extract_attr(block, "name") {
+                    cmds.push(OrcCommand::Kill { name });
+                }
+            }
+            _ => {}
+        }
+
+        remaining = &remaining[start + end.unwrap_or(1)..];
     }
 
     cmds
 }
 
-/// Extract a named attribute value from a string like `name="value"`.
+/// Extract a short attribute (single line, no embedded quotes).
 fn extract_attr(s: &str, attr: &str) -> Option<String> {
     let pattern = format!("{}=\"", attr);
     let start = s.find(&pattern)? + pattern.len();
     let rest = &s[start..];
     let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract an attribute whose value may span multiple lines.
+/// Finds `attr="` and reads until the closing `"` before `]`.
+fn extract_attr_multiline(s: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr);
+    let start = s.find(&pattern)? + pattern.len();
+    let rest = &s[start..];
+    // Find the last `"` before the end (handles embedded content)
+    let end = rest.rfind('"')?;
+    if end == 0 {
+        return None;
+    }
     Some(rest[..end].to_string())
 }
 
@@ -93,7 +180,7 @@ pub struct App {
     pub status_line_at: Instant,
     pub orc: Option<ClaudeProcess>,
     pub orc_output: Vec<OutputEntry>,
-    pub orc_cmds_processed: usize,
+    pub orc_pending_cmds: Vec<OrcCommand>,
     pub orc_session_id: Option<String>,
     pub show_preview: bool,
     pub scroll_offset: usize,
@@ -119,7 +206,7 @@ impl App {
             status_line_at: Instant::now(),
             orc: None,
             orc_output: Vec::new(),
-            orc_cmds_processed: 0,
+            orc_pending_cmds: Vec::new(),
             orc_session_id: None,
             show_preview: true,
             scroll_offset: 0,
@@ -175,14 +262,32 @@ impl App {
 
     /// Drain available events from the orc process and all agent processes.
     /// Non-blocking: reads only what's available, doesn't wait.
-    pub fn drain_events(&mut self) {
+    /// Returns a list of (agent_name, result_text, is_error) for agents that just completed.
+    pub fn drain_events(&mut self) -> Vec<(String, String, bool)> {
         self.drain_orc_events();
 
+        let mut completions = Vec::new();
         for agent in &mut self.agents {
+            let was_done = matches!(agent.state, AgentState::Done | AgentState::Error);
             drain_agent_events(agent);
+            let is_done = matches!(agent.state, AgentState::Done | AgentState::Error);
+
+            if !was_done && is_done {
+                let result_text = agent.output.recent(1)
+                    .first()
+                    .map(|e| match e {
+                        OutputEntry::Result { text, .. } => text.clone(),
+                        OutputEntry::Text(t) => t.clone(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                let is_error = matches!(agent.state, AgentState::Error);
+                completions.push((agent.name.clone(), result_text, is_error));
+            }
         }
 
         self.last_poll = Instant::now();
+        completions
     }
 
     fn drain_orc_events(&mut self) {
@@ -206,7 +311,15 @@ impl App {
                             for block in &message.content {
                                 match block {
                                     ContentBlock::Text { text } => {
-                                        self.orc_output.push(OutputEntry::Text(text.clone()));
+                                        // Parse commands from raw text before filtering
+                                        let mut cmds = parse_orc_commands(text);
+                                        self.orc_pending_cmds.append(&mut cmds);
+
+                                        // Strip command blocks from display text
+                                        let filtered = strip_orc_commands(text);
+                                        if !filtered.trim().is_empty() {
+                                            self.orc_output.push(OutputEntry::Text(filtered));
+                                        }
                                     }
                                     ContentBlock::ToolUse { name, input, .. } => {
                                         let input_str = input.to_string();
@@ -304,6 +417,7 @@ fn drain_agent_events(agent: &mut Agent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn make_app() -> App {
         App::new("/tmp")
@@ -433,5 +547,66 @@ mod tests {
         let text = "Just some regular text, no commands here.";
         let cmds = parse_orc_commands(text);
         assert_eq!(cmds.len(), 0);
+    }
+
+    #[test]
+    fn test_strip_orc_commands_single_line() {
+        let text = r#"I'll spawn an agent.
+[SPAWN_AGENT name="fix" task="Fix bug"]
+Done."#;
+        let stripped = strip_orc_commands(text);
+        assert!(stripped.contains("I'll spawn an agent."));
+        assert!(stripped.contains("Done."));
+        assert!(!stripped.contains("SPAWN_AGENT"));
+    }
+
+    #[test]
+    fn test_strip_orc_commands_multiline() {
+        let text = r#"Here's the plan:
+[SPAWN_AGENT name="dark-mode" task="Add dark mode.
+Steps:
+1. Read theme
+2. Add toggle"]
+Working on it."#;
+        let stripped = strip_orc_commands(text);
+        assert!(stripped.contains("Here's the plan:"));
+        assert!(stripped.contains("Working on it."));
+        assert!(!stripped.contains("SPAWN_AGENT"));
+        assert!(!stripped.contains("dark-mode"));
+    }
+
+    #[test]
+    fn test_strip_orc_commands_no_commands() {
+        let text = "Just regular text, nothing special.";
+        let stripped = strip_orc_commands(text);
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn test_strip_orc_commands_only_command() {
+        let text = r#"[SPAWN_AGENT name="x" task="y"]"#;
+        let stripped = strip_orc_commands(text);
+        assert!(stripped.trim().is_empty());
+    }
+
+    #[test]
+    fn test_parse_orc_commands_multiline() {
+        let text = r#"Here's the plan:
+[SPAWN_AGENT name="dark-mode" task="Add dark mode toggle.
+Steps:
+1. Read theme files
+2. Add toggle button
+3. Persist preference"]
+Done."#;
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            OrcCommand::Spawn { name, task } => {
+                assert_eq!(name, "dark-mode");
+                assert!(task.contains("Steps:"));
+                assert!(task.contains("Persist preference"));
+            }
+            _ => panic!("expected Spawn"),
+        }
     }
 }

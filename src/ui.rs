@@ -116,13 +116,6 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let total_cost: f64 = app.agents.iter().map(|a| a.cost_usd).sum();
-    if total_cost > 0.001 {
-        parts.push(Span::styled(
-            format!("  ${:.2}", total_cost),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
 
     let header = Paragraph::new(Line::from(parts))
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
@@ -340,7 +333,6 @@ fn render_status(f: &mut Frame, app: &App) {
                         Span::styled(&agent.name, name_style),
                         Span::styled(format!("  [{}]", agent.state.label()), Style::default().fg(agent.state.color())),
                         Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("  ${:.2}", agent.cost_usd), Style::default().fg(Color::DarkGray)),
                     ]),
                     Line::from(vec![
                         Span::styled(
@@ -418,7 +410,6 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
             ),
             Span::styled(format!("[{}]", agent.state.label()), Style::default().fg(agent.state.color())),
             Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("  ${:.2}", agent.cost_usd), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::styled(format!(" {}", agent.task_description), Style::default().fg(Color::DarkGray)),

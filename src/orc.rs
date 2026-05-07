@@ -62,6 +62,7 @@ pub fn spawn_orc(project_dir: &str) -> Result<ClaudeProcess> {
     let args = ClaudeArgs::new()
         .system_prompt(&prompt)
         .tools("")
+        .disallowed_tools("LSP")
         .no_mcp();
     ClaudeProcess::spawn(args, project_dir)
 }

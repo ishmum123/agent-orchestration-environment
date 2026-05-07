@@ -1,6 +1,8 @@
 use crate::events::StreamEvent;
 use anyhow::{Context, Result};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 /// Format a user message as NDJSON for stdin.
@@ -26,9 +28,11 @@ pub struct ClaudeArgs {
     model: Option<String>,
     resume_session: Option<String>,
     tools: Option<String>,
+    disallowed_tools: Option<String>,
     permission_mode: Option<String>,
     add_dir: Option<String>,
     no_mcp: bool,
+    stderr_log: Option<PathBuf>,
     extra_args: Vec<String>,
 }
 
@@ -39,9 +43,11 @@ impl ClaudeArgs {
             model: None,
             resume_session: None,
             tools: None,
+            disallowed_tools: None,
             permission_mode: None,
             add_dir: None,
             no_mcp: false,
+            stderr_log: None,
             extra_args: Vec::new(),
         }
     }
@@ -49,6 +55,16 @@ impl ClaudeArgs {
     /// Disable all MCP servers (uses --strict-mcp-config with no config).
     pub fn no_mcp(mut self) -> Self {
         self.no_mcp = true;
+        self
+    }
+
+    pub fn stderr_log(mut self, path: PathBuf) -> Self {
+        self.stderr_log = Some(path);
+        self
+    }
+
+    pub fn disallowed_tools(mut self, tools: &str) -> Self {
+        self.disallowed_tools = Some(tools.to_string());
         self
     }
 
@@ -108,6 +124,10 @@ impl ClaudeArgs {
             args.push("--tools".to_string());
             args.push(tools.clone());
         }
+        if let Some(ref tools) = self.disallowed_tools {
+            args.push("--disallowed-tools".to_string());
+            args.push(tools.clone());
+        }
         if let Some(ref mode) = self.permission_mode {
             args.push("--permission-mode".to_string());
             args.push(mode.clone());
@@ -134,13 +154,24 @@ pub struct ClaudeProcess {
 impl ClaudeProcess {
     /// Spawn a new `claude` child process with the given args.
     pub fn spawn(args: ClaudeArgs, working_dir: &str) -> Result<Self> {
+        let stderr_log = args.stderr_log.clone();
         let built_args = args.build();
+        let stderr_stdio = if let Some(ref log_path) = stderr_log {
+            if let Some(parent) = log_path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            let file = fs::File::create(log_path)
+                .context("failed to create stderr log file")?;
+            Stdio::from(file)
+        } else {
+            Stdio::null()
+        };
         let mut child = Command::new("claude")
             .args(&built_args)
             .current_dir(working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr_stdio)
             .spawn()
             .context("failed to spawn claude process")?;
 
@@ -294,6 +325,23 @@ mod tests {
             .build();
         assert!(args.contains(&"--add-dir".to_string()));
         assert!(args.contains(&"/some/path".to_string()));
+    }
+
+    #[test]
+    fn test_claude_args_with_disallowed_tools() {
+        let args = ClaudeArgs::new()
+            .disallowed_tools("LSP")
+            .build();
+        assert!(args.contains(&"--disallowed-tools".to_string()));
+        assert!(args.contains(&"LSP".to_string()));
+    }
+
+    #[test]
+    fn test_claude_args_no_mcp() {
+        let args = ClaudeArgs::new()
+            .no_mcp()
+            .build();
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
     }
 
     #[test]

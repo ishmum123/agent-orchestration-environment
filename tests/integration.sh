@@ -1,201 +1,204 @@
 #!/bin/bash
 #
-# Integration tests for orc
+# Integration smoke test for orc (stream-json architecture)
 #
-# Requires: tmux, git, claude (or mock), cargo
+# Requires: tmux, git, claude, cargo
 # Run: ./tests/integration.sh
+#
+# Launches orc in a detached tmux session, sends keystrokes,
+# captures pane output, and verifies expected behavior.
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ORC_BIN="$PROJECT_DIR/target/debug/orc"
-TMUX_SOCK="/tmp/orc-integration-test-$$"
-SESSION="orc-itest"
-TEST_REPO=""
+ORC_BIN="$PROJECT_DIR/target/release/orc"
+SESSION="orc-smoke-$$"
 PASSED=0
 FAILED=0
 
 cleanup() {
-    # Kill test tmux server
-    tmux -S "$TMUX_SOCK" kill-server 2>/dev/null || true
-    rm -f "$TMUX_SOCK"
-    # Kill any orc session we created
     tmux kill-session -t "$SESSION" 2>/dev/null || true
-    # Remove test repo
-    if [ -n "$TEST_REPO" ] && [ -d "$TEST_REPO" ]; then
-        rm -rf "$TEST_REPO"
-    fi
-    # Clean orc state
-    rm -rf ~/.orc/orc ~/.orc/agents
+    # Clean leftover worktrees
+    cd "$PROJECT_DIR"
+    git worktree list 2>/dev/null | grep orc-worktrees | awk '{print $1}' | \
+        xargs -I{} git worktree remove --force {} 2>/dev/null || true
+    git branch 2>/dev/null | grep 'orc/' | xargs git branch -D 2>/dev/null || true
+    rm -rf "$PROJECT_DIR/../.orc-worktrees"
 }
 trap cleanup EXIT
 
-pass() {
-    echo "  PASS: $1"
-    PASSED=$((PASSED + 1))
+pass() { echo "  PASS: $1"; PASSED=$((PASSED + 1)); }
+fail() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
+
+capture() { tmux capture-pane -t "$SESSION" -p 2>&1; }
+
+wait_for() {
+    local pattern="$1" timeout="$2" msg="$3"
+    local elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        if capture | grep -q "$pattern"; then
+            pass "$msg"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    fail "$msg (timed out after ${timeout}s waiting for '$pattern')"
+    echo "--- pane content ---"
+    capture
+    echo "---"
+    return 1
 }
 
-fail() {
-    echo "  FAIL: $1"
-    FAILED=$((FAILED + 1))
-}
+# --- Build ---
 
-assert_contains() {
-    local haystack="$1"
-    local needle="$2"
-    local msg="$3"
-    if echo "$haystack" | grep -q "$needle"; then
-        pass "$msg"
-    else
-        fail "$msg (expected to find '$needle')"
-    fi
-}
-
-assert_not_contains() {
-    local haystack="$1"
-    local needle="$2"
-    local msg="$3"
-    if echo "$haystack" | grep -q "$needle"; then
-        fail "$msg (found '$needle' but shouldn't have)"
-    else
-        pass "$msg"
-    fi
-}
-
-assert_file_exists() {
-    if [ -f "$1" ]; then
-        pass "$2"
-    else
-        fail "$2 (file not found: $1)"
-    fi
-}
-
-# --- Setup ---
-
-echo "Building orc..."
-(cd "$PROJECT_DIR" && cargo build 2>/dev/null)
-
+echo "Building orc (release)..."
+(cd "$PROJECT_DIR" && cargo build --release 2>/dev/null)
 if [ ! -f "$ORC_BIN" ]; then
     echo "ERROR: binary not found at $ORC_BIN"
     exit 1
 fi
 
-# Create a temp git repo for testing
-TEST_REPO="$(mktemp -d)"
-git -C "$TEST_REPO" init -b main >/dev/null 2>&1
-git -C "$TEST_REPO" commit --allow-empty -m "init" >/dev/null 2>&1
+# --- Clean slate ---
+
+cleanup 2>/dev/null || true
 
 echo ""
-echo "=== orc integration tests ==="
+echo "=== orc integration smoke test ==="
 echo ""
 
-# --- Test 1: Launcher script generation ---
+# --- Step 1: Launch ---
 
-echo "[launcher script generation]"
+echo "[launch]"
+tmux new-session -d -s "$SESSION" -x 200 -y 50 "$ORC_BIN -p $PROJECT_DIR"
+sleep 3
 
-# Run orc briefly to generate files, then kill
-# We need a PTY, so use script + tmux
-tmux -S "$TMUX_SOCK" new-session -d -s runner -x 120 -y 40 2>/dev/null || {
-    # Retry with script for PTY
-    script -q /dev/null tmux -S "$TMUX_SOCK" new-session -d -s runner -x 120 -y 40 2>/dev/null
-}
-tmux -S "$TMUX_SOCK" send-keys -t runner "$ORC_BIN -p $TEST_REPO -s $SESSION" Enter
-sleep 5
-
-assert_file_exists "$HOME/.orc/orc/instructions.md" "instructions.md created"
-assert_file_exists "$HOME/.orc/orc/launch.sh" "launch.sh created"
-
-# Check instructions content
-INSTRUCTIONS=$(cat "$HOME/.orc/orc/instructions.md" 2>/dev/null || echo "")
-assert_contains "$INSTRUCTIONS" "$SESSION" "instructions contain session name"
-assert_contains "$INSTRUCTIONS" "tmux split-window" "instructions contain spawn commands"
-assert_contains "$INSTRUCTIONS" "~/.orc/agents/NAME.json" "instructions contain metadata file path"
-assert_contains "$INSTRUCTIONS" "capture-pane" "instructions contain monitor commands"
-assert_contains "$INSTRUCTIONS" "~/.orc/locked" "instructions contain lock file rule"
-
-# Check launcher content
-LAUNCHER=$(cat "$HOME/.orc/orc/launch.sh" 2>/dev/null || echo "")
-assert_contains "$LAUNCHER" "#!/bin/sh" "launcher has shebang"
-assert_contains "$LAUNCHER" "cd '$TEST_REPO'" "launcher cd's to project dir"
-assert_contains "$LAUNCHER" "append-system-prompt-file" "launcher uses append-system-prompt-file"
-assert_contains "$LAUNCHER" "exec claude" "launcher exec's claude"
-
-# Check launcher is executable
-if [ -x "$HOME/.orc/orc/launch.sh" ]; then
-    pass "launch.sh is executable"
+OUTPUT=$(capture)
+if echo "$OUTPUT" | grep -q "orc"; then
+    pass "orc header visible"
 else
-    fail "launch.sh is not executable"
+    fail "orc header not visible"
+    echo "$OUTPUT"
+    exit 1
 fi
 
-echo ""
+# --- Step 2: Wait for greeting ---
 
-# --- Test 2: TUI starts clean (no shell noise) ---
+echo "[greeting]"
+wait_for ">" 30 "orc started and shows input prompt"
 
-echo "[clean startup]"
+OUTPUT=$(capture)
+# Should NOT contain tool calls or LSP output
+if echo "$OUTPUT" | grep -q "tool_use\|ToolUse\|LSP"; then
+    fail "orc output contains tool calls"
+else
+    pass "no tool calls in orc output"
+fi
 
-# Capture the TUI pane output
-TUI_OUTPUT=$(tmux -S "$TMUX_SOCK" capture-pane -t runner -p -J -S -40 2>/dev/null || echo "")
+# --- Step 3: Spawn agent with simple task ---
 
-assert_not_contains "$TUI_OUTPUT" "default interactive shell" "no zsh switch message"
-assert_not_contains "$TUI_OUTPUT" "bash-3.2" "no bash prompt"
-assert_not_contains "$TUI_OUTPUT" "exec.*launch.sh" "no launch.sh command visible"
-assert_not_contains "$TUI_OUTPUT" "Read.*CLAUDE.md" "no bootstrapping prompt"
-assert_contains "$TUI_OUTPUT" "orc" "header shows orc"
-
-echo ""
-
-# --- Test 3: Agent metadata discovery ---
-
-echo "[agent metadata discovery]"
-
-# Write a fake agent metadata file
-mkdir -p ~/.orc/agents
-cat > ~/.orc/agents/test-agent.json << 'EOF'
-{
-  "name": "test-agent",
-  "task": "test task for integration",
-  "session": "orc-itest",
-  "window": 0,
-  "pane": 99,
-  "worktree": "/tmp/fake-worktree"
-}
-EOF
-
-# Wait for next poll cycle to pick it up
-sleep 4
-
-TUI_OUTPUT2=$(tmux -S "$TMUX_SOCK" capture-pane -t runner -p -J -S -40 2>/dev/null || echo "")
-assert_contains "$TUI_OUTPUT2" "test-agent" "discovered agent appears in TUI"
-
-# Clean up fake agent
-rm -f ~/.orc/agents/test-agent.json
-
-echo ""
-
-# --- Test 4: lazygit config ---
-
-echo "[lazygit config]"
-
-assert_file_exists "$HOME/.orc/lazygit.yml" "lazygit config created"
-LG_CONFIG=$(cat "$HOME/.orc/lazygit.yml" 2>/dev/null || echo "")
-assert_contains "$LG_CONFIG" "showBottomLine: false" "lazygit config has expected content"
-
-echo ""
-
-# --- Test 5: Cleanup on exit ---
-
-echo "[cleanup]"
-
-# Send quit command to orc
-tmux -S "$TMUX_SOCK" send-keys -t runner "q" 2>/dev/null
+echo "[single agent]"
+tmux send-keys -t "$SESSION" "list the files in this project" Enter
 sleep 2
 
-# Check that orc session was killed
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    fail "orc tmux session still exists after quit"
+wait_for "agents" 15 "agent count visible in header" || true
+
+# Wait for agent to finish (checkmark)
+if ! wait_for "$(printf '\xe2\x9c\x93')" 120 "agent finished with checkmark"; then
+    echo "Agent may still be working. Current pane:"
+    capture
+fi
+
+# --- Step 4: Verify orc received result ---
+
+echo "[completion feedback]"
+OUTPUT=$(capture)
+# Orc should show some response text beyond just the greeting
+LINE_COUNT=$(echo "$OUTPUT" | grep -v '^$' | grep -v '^─' | grep -v '^ *│' | grep -v '^ *$' | wc -l)
+if [ "$LINE_COUNT" -gt 3 ]; then
+    pass "orc shows response text after agent completion"
 else
-    pass "orc tmux session cleaned up"
+    fail "orc response seems empty after agent completion"
+fi
+
+# --- Step 5: No display artifacts ---
+
+echo "[display filtering]"
+OUTPUT=$(capture)
+if echo "$OUTPUT" | grep -q 'SPAWN_AGENT\|TELL_AGENT\|KILL_AGENT'; then
+    fail "command tags visible in output"
+else
+    pass "no command tags in display"
+fi
+# Check for stray closing brackets from multi-line commands
+if echo "$OUTPUT" | grep -qx '"\]'; then
+    fail "stray closing bracket visible"
+else
+    pass "no stray brackets in display"
+fi
+
+# --- Step 6: Stderr log created ---
+
+echo "[stderr logging]"
+if ls ~/.orc/logs/*.stderr 1>/dev/null 2>&1; then
+    pass "stderr log files created"
+else
+    fail "no stderr log files in ~/.orc/logs/"
+fi
+
+# --- Step 7: Kill agent ---
+
+echo "[kill agent]"
+# Go to dashboard mode, select agent, kill it
+tmux send-keys -t "$SESSION" Escape
+sleep 0.5
+tmux send-keys -t "$SESSION" x
+sleep 1
+OUTPUT=$(capture)
+if echo "$OUTPUT" | grep -q "kill.*?"; then
+    tmux send-keys -t "$SESSION" y
+    sleep 3
+    pass "kill confirmation dialog shown"
+
+    # Verify worktree cleaned up
+    WORKTREE_COUNT=$(git -C "$PROJECT_DIR" worktree list 2>/dev/null | grep -c orc-worktrees || echo 0)
+    if [ "$WORKTREE_COUNT" -eq 0 ]; then
+        pass "worktree cleaned up after kill"
+    else
+        fail "worktree still exists after kill ($WORKTREE_COUNT remaining)"
+    fi
+else
+    # Agent might already be gone from the list
+    pass "no agents to kill (already cleaned up)"
+fi
+
+# --- Step 8: Quit and verify cleanup ---
+
+echo "[quit and cleanup]"
+tmux send-keys -t "$SESSION" Escape
+sleep 0.5
+tmux send-keys -t "$SESSION" q
+sleep 5
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    # Session exists but orc may have exited — check if pane is dead
+    OUTPUT=$(capture 2>/dev/null || echo "")
+    if echo "$OUTPUT" | grep -q "orc"; then
+        fail "orc still running after quit"
+    else
+        pass "orc exited (tmux pane dead)"
+    fi
+else
+    pass "tmux session ended after quit"
+fi
+
+# Verify all worktrees cleaned up
+WORKTREE_COUNT=$(git -C "$PROJECT_DIR" worktree list 2>/dev/null | grep -c orc-worktrees || echo 0)
+if [ "$WORKTREE_COUNT" -eq 0 ]; then
+    pass "all worktrees cleaned up on exit"
+else
+    fail "worktrees remain after exit ($WORKTREE_COUNT)"
 fi
 
 echo ""

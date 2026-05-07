@@ -4,31 +4,44 @@ A terminal tool that wraps Claude Code with an intelligent orchestrator. You tal
 
 ## Core principle
 
-**Orc is Claude Code with a team.** The first time you open orc it should be indistinguishable from opening Claude Code. You type, orc responds. The difference: when orc decides work needs doing, it delegates to background agents instead of doing it itself. Orc keeps its own context small and dedicated to understanding you.
+**Orc is Claude Code with a team.** You type, orc responds. The difference: when orc decides work needs doing, it delegates to background agents instead of doing it itself. Orc keeps its own context small and dedicated to understanding you.
 
 ## Architecture
 
 ```
-tmux session "orc"
-├── pane 0: orc (Claude Code) ← user talks here, this IS the UI
-├── pane 1: agent "auth-fix" (Claude Code, background)
-│   └── own git worktree, invisible unless sidebar is open
-├── pane 2: agent "page-builder" (Claude Code, background)
-│   └── own git worktree, invisible unless sidebar is open
-└── ...
+┌─────────────────────────────────────────────────┐
+│              Orc TUI (ratatui)                  │
+│  ┌──────────────────┐  ┌─────────────────────┐  │
+│  │   Orc Output     │  │  Agent Sidebar      │  │
+│  │   (left panel)   │  │  ● agent-1    12s   │  │
+│  │                  │  │  ✓ agent-2    45s   │  │
+│  │                  │  │                     │  │
+│  └──────────────────┘  └─────────────────────┘  │
+│  ┌──────────────────────────────────────────┐   │
+│  │ > user input                             │   │
+│  └──────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────┘
+        │                           │
+        ▼                           ▼
+  Orc Brain Process           Agent Processes
+  (claude -p)                 (claude -p × N)
+  - no tools                  - auto permissions
+  - no MCP                    - own git worktree
+  - reasons about tasks       - does actual work
+  - emits [SPAWN_AGENT]
 ```
 
-The user's terminal shows pane 0 — the orc. Agents run in other panes but the user never sees them unless they choose to. A sidebar appears on the right when agents are active.
+The TUI owns all process lifecycle. Claude Code instances are child processes communicating via `--input-format stream-json --output-format stream-json` NDJSON pipes. No tmux dependency.
 
 ## User experience flow
 
-### 1. Launch — indistinguishable from Claude Code
+### 1. Launch
 
 ```
-$ orc
+$ orc -p /path/to/project
 ```
 
-You land in the orc's pane. It looks and feels like `claude`. You type naturally. No dashboard, no keybind bar, no empty agent list. Just a prompt.
+Orc starts, greets you. You type naturally in the input bar.
 
 ### 2. Conversation — orc clarifies before acting
 
@@ -37,217 +50,134 @@ you: the login keeps re-prompting every 50 minutes and the edit/delete
      UI needs a redesign
 
 orc: A few questions before I spin up agents:
-     1. The 50-min re-prompt — is that the session token expiring or
-        a re-auth flow? I see both patterns in src/auth/.
-     2. For the edit/delete redesign, are you thinking swipe-to-reveal
-        or a selection mode with a toolbar?
+     1. The 50-min re-prompt — session token expiring or re-auth flow?
+     2. For edit/delete redesign — swipe-to-reveal or selection mode?
 ```
 
-If orc understands the task clearly, it skips questions and goes straight to spawning. If not, it asks — just like a good colleague would.
+If orc understands clearly, it skips questions and spawns agents directly.
 
 ### 3. Agents spawn in the background
 
-Once orc knows what to do:
+Orc embeds commands in its text output:
 
 ```
-orc: Got it. Spinning up two agents:
-     • auth-fix — switch from ID token revalidation to session tokens
-     • edit-redesign — swipe-to-reveal with custom touch handler
-
-     I'll manage them and let you know when they're done.
+[SPAWN_AGENT name="auth-fix" task="Switch from ID token revalidation to session tokens in src/auth/"]
+[SPAWN_AGENT name="edit-redesign" task="Implement swipe-to-reveal for edit/delete actions"]
 ```
 
-Orc creates git worktrees, tmux panes, and launches Claude Code in each. It crafts a scoped prompt per agent with file paths, constraints, and context. The agents start working immediately.
+The TUI parses these, creates git worktrees, spawns Claude Code processes, and sends each agent its task. Commands are stripped from displayed output — the user sees clean text.
 
-At this point a **sidebar appears on the right** showing agent status.
-
-### 4. Sidebar — only visible when agents are running
+### 4. Sidebar — visible when agents exist
 
 ```
-┌─────────────────────────────────┬──────────────────┐
-│                                 │ ● auth-fix    2m │
-│  orc conversation               │ ● edit-rede.. 2m │
-│  (you keep talking here)        │                  │
-│                                 │                  │
-│                                 │                  │
-└─────────────────────────────────┴──────────────────┘
+┌──────────────────────────────────┬───────────────────┐
+│                                  │ ● auth-fix    2m  │
+│  orc conversation                │ ● edit-rede.. 2m  │
+│  (you keep talking here)         │                   │
+│                                  │                   │
+└──────────────────────────────────┴───────────────────┘
 ```
 
-- Sidebar appears automatically when agents are spawned
-- Sidebar disappears when all agents finish
-- Each entry shows: state icon, name, elapsed time
-- User can toggle sidebar visibility with a hotkey
+Sidebar appears when agents are spawned. Each entry shows state icon, name, elapsed time.
 
-### 5. Orc manages agents autonomously
+### 5. Agent completion — feedback loop
 
-While agents work, orc monitors them (~30s polling):
+When an agent finishes, the TUI sends the result back to the orc brain:
 
-- **Answers questions** — agent asks "AppCompatActivity or ComponentActivity?" Orc knows the codebase uses AppCompatActivity, types the answer into the agent's pane.
-- **Redirects** — agent starts editing wrong files, orc corrects it.
-- **Splits work** — agent hitting context limits, orc spawns a continuation agent with the remaining work and key decisions from the original.
+```
+Agent "auth-fix" finished. Result: Replaced ID token revalidation...
+```
 
-The user doesn't see any of this unless they open the sidebar or the agent's pane.
+Orc summarizes for the user. If the result triggers more work, orc can spawn additional agents.
 
 ### 6. Attention markers — orc escalates to you
 
-When orc genuinely can't handle something, it marks the agent:
-
-```
-┌─────────────────────────────────┬──────────────────┐
-│                                 │ ○ auth-fix    5m │
-│  orc: auth-fix needs your       │ ● edit-rede.. 5m │
-│  input — it wants to change     │                  │
-│  the token format from JWT to   │                  │
-│  opaque, which affects the      │                  │
-│  mobile app. Should it proceed? │                  │
-│                                 │                  │
-└─────────────────────────────────┴──────────────────┘
-```
-
-Orc does two things:
-1. Marks the agent with ○ (needs attention) in the sidebar
-2. Tells the user in the chat what happened and what decision is needed
-
-The user can either:
-- Answer orc in the chat (orc relays to agent)
-- Open the agent's pane directly to handle it themselves
-
-Escalation triggers:
-- Agent asks a question orc can't confidently answer
-- Agent wants to do something destructive or outside scope
-- Agent is stuck (looping errors, can't make progress)
-- Agent made an architectural decision that should be confirmed
-
-### 7. Opening an agent's pane
-
-From the sidebar, the user can select an agent to jump into its pane:
-
-```
-hotkey → select agent → full-screen agent pane (tmux attach)
-Esc/detach → back to orc
-```
-
-While the user is in an agent's pane, orc doesn't send to that pane (lock file). When the user detaches, orc resumes management.
-
-### 8. Agents finish — sidebar disappears
-
-When all agents complete:
-
-```
-orc: Both agents are done.
-     • auth-fix — replaced ID token revalidation with session tokens.
-       3 files changed. Tests pass.
-     • edit-redesign — implemented swipe-to-reveal with custom
-       OnTouchListener. Hit a snag with ItemTouchHelper, switched
-       approach. 5 files changed.
-
-     Want me to show the diffs or merge them?
-```
-
-Sidebar goes away. You're back to a clean Claude Code experience.
+When orc can't handle something, it tells you in the chat. You can respond to orc (who relays via `[TELL_AGENT]`) or send directly to the agent with `/`.
 
 ## Agent states
 
-- **● working** (green) — agent is actively producing output
-- **○ needs you** (yellow) — orc escalated, needs human decision
-- **─ idle** (gray) — agent finished its current task
-- **✓ done** (cyan) — work complete, review passed
-- **✗ stuck** (red) — errors/looping, orc flagged it
+| Icon | State | Meaning |
+|------|-------|---------|
+| ● | working | Agent is actively producing output |
+| ○ | needs you | Orc escalated, needs human decision |
+| ─ | idle | Agent finished current task |
+| ✓ | done | Work complete |
+| ✗ | error | Process exited with error |
 
-## Spawn protocol
+## Command protocol
 
-Orc can't directly create tmux panes or git worktrees — it's a Claude Code instance. Instead:
+Orc embeds commands in its natural language responses:
 
-1. Orc writes a spawn request to `~/.orc/spawn-queue.json`:
-   ```json
-   [
-     {"name": "auth-fix", "task": "Replace ID token revalidation with session tokens in src/auth/"},
-     {"name": "edit-redesign", "task": "Implement swipe-to-reveal for edit/delete actions"}
-   ]
-   ```
+```
+[SPAWN_AGENT name="short-slug" task="Full description of what to do"]
+[TELL_AGENT name="agent-name" message="Message to send to the agent"]
+[KILL_AGENT name="agent-name"]
+```
 
-2. The CLI polls this file every 2 seconds. When it finds requests:
-   - Creates git worktree per agent
-   - Creates tmux pane per agent
-   - Launches `claude` in each pane
-   - Sends the task prompt
-   - Notifies orc that agents are live (with pane IDs)
-   - Deletes the processed requests
+Commands can span multiple lines (task/message values may contain newlines). The TUI parser extracts these, executes them, and strips them from displayed output.
 
-3. Orc receives confirmation and begins monitoring.
+## Process architecture
 
-Similarly, orc can write kill requests to `~/.orc/kill-queue.json` to tear down agents it considers done.
+### Orc brain
+- `claude -p --tools "" --disallowed-tools LSP --strict-mcp-config`
+- System prompt instructs it to reason about tasks and emit commands
+- Cannot run tools or edit files — pure reasoning
+- Persistent for the session lifetime
 
-## Orc's CLAUDE.md
+### Worker agents
+- `claude -p --permission-mode auto`
+- Each in an isolated git worktree (branch `orc/{name}`, dir `../.orc-worktrees/{name}`)
+- Stderr captured to `~/.orc/logs/{name}.stderr`
+- Killed and cleaned up when done or on quit
 
-Generated at startup. Instructs orc to:
-
-- Act as the user's primary interface — conversational, helpful, like Claude Code
-- Never attempt implementation work itself — always delegate to agents
-- Keep context small: monitor agent panes (last ~50 lines), don't absorb full transcripts
-- Clarify ambiguous requests before spawning agents
-- Spawn agents via the queue file protocol
-- Monitor agents every ~30 seconds via `tmux capture-pane`
-- Answer agent questions when confident, escalate when not
-- Report agent completion with summaries
-- Use the lock file protocol to avoid sending to user-occupied panes
+### Communication
+- All processes use `--input-format stream-json --output-format stream-json --verbose`
+- TUI reads stdout as NDJSON (non-blocking), writes to stdin
+- Event types: `system` (init), `assistant` (content blocks), `result` (completion)
+- No polling — continuous non-blocking read in the event loop
 
 ## Keybinds
 
-Minimal — the user is in orc's pane most of the time.
-
 | Key | Action |
 |-----|--------|
-| Ctrl+O | Toggle sidebar visibility |
-| Ctrl+] | Select next agent in sidebar |
-| Ctrl+[ | Select prev agent in sidebar |
-| Enter (with agent selected) | Open agent's pane (full tmux attach) |
-| Esc / detach | Return to orc from agent pane |
+| esc | Chat mode (default — type to orc) |
+| n | Spawn new agent manually |
+| t | Tell selected agent (via orc enrichment) |
+| / | Send directly to agent (bypass orc) |
+| e | Open $EDITOR on agent's changed files |
+| x | Kill selected agent (with confirmation) |
+| s | Status overview |
+| j/k | Navigate agents |
+| Enter | Agent full output view |
+| Ctrl+U/D | Scroll output |
+| Tab | Toggle preview |
+| ? | Help overlay |
+| q / Ctrl+C | Quit (kills all, cleans up worktrees) |
 
-All other interaction happens through conversation with orc.
+## Worktree isolation
 
-## Context management
+Each agent gets its own git worktree:
 
-Orc manages agent context actively:
+```
+{repo_root_parent}/.orc-worktrees/
+├── auth-fix/         # branch: orc/auth-fix
+├── edit-redesign/    # branch: orc/edit-redesign
+└── ...
+```
 
-- **Scoped initial prompts** — agents get file paths, constraints, and relevant context, not the whole codebase
-- **Monitoring** — orc reads agent panes every ~30 seconds to track progress
-- **Compaction** — orc tells agent to /compact when approaching context cap
-- **Smart splitting** — when an agent runs out of room, orc spawns a continuation agent with remaining work and key decisions (not a transcript copy)
-
-## Review and completion
-
-When an agent signals done:
-
-1. **Fast check** — orc reads the agent's pane output. Did it touch the right files? Does the diff look proportional? Did it say it's done?
-2. **Deep review** — for large diffs or architectural decisions, orc spawns a short-lived reviewer agent with the original task + diff. Reviewer returns verdict, orc acts on it.
-3. **Report** — orc tells the user what was accomplished and asks about next steps.
-
-## Merging
-
-Agents work in separate git worktrees. When ready to integrate:
-
-1. Orc checks for file overlap between completed agents
-2. No overlap → fast-forward merge
-3. Overlap → orc spawns a short-lived merge agent with both diffs
-4. Conflict it can't resolve → escalates to user
-
-The user can also manually merge via lazygit or by attaching to the main repo.
+On agent kill or orc quit: `git worktree remove --force` + `git branch -D`.
 
 ## File layout
 
 ```
 ~/.orc/
-├── orc/              # orc's working directory with generated CLAUDE.md
-├── locked            # contains pane ID if user is attached to an agent
-├── spawn-queue.json  # orc writes spawn requests here
-├── kill-queue.json   # orc writes kill requests here
-└── lazygit.yml       # generated lazygit config for diff viewing
+└── logs/
+    ├── auth-fix.stderr
+    └── edit-redesign.stderr
 
 {repo_root_parent}/.orc-worktrees/
-├── auth-fix/         # agent worktree (branch: orc/auth-fix)
-├── edit-redesign/    # agent worktree (branch: orc/edit-redesign)
-└── ...
+├── auth-fix/
+└── edit-redesign/
 ```
 
 ## Non-goals (v1)
@@ -256,5 +186,4 @@ The user can also manually merge via lazygit or by attaching to the main repo.
 - Web UI or desktop app (terminal-first)
 - Non-Claude agents (Claude Code only)
 - Persisting across machine restarts
-- Restoring orc state from checkpoints
-- User interacting with sub-agents (agents can spawn their own sub-agents, invisible to user)
+- API cost tracking (subscription-based usage assumed)

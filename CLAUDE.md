@@ -8,7 +8,7 @@ Rust TUI tool for running parallel Claude Code agents with an intelligent orches
 cargo build            # debug build
 cargo build --release  # release build
 cargo run              # run with defaults
-cargo run -- -p /path/to/project -s my-session  # custom project dir and session name
+cargo run -- -p /path/to/project  # custom project directory
 cargo test             # run tests
 ```
 
@@ -22,6 +22,15 @@ cargo test             # run tests
 - `src/orc.rs` — Orchestrator system prompt generation and spawning
 - `src/worktree.rs` — git worktree creation/removal for agent isolation
 - `src/ui.rs` — Ratatui dashboard, status view, agent detail, help/confirm overlays
+
+## Testing
+
+```bash
+cargo test                    # unit tests (56 tests)
+./tests/integration.sh        # smoke test: launches orc in tmux, spawns agents, verifies lifecycle
+```
+
+The integration test covers: orc greeting, agent spawn/finish, completion feedback, display filtering (no command tag leaks), stderr logging, agent kill + worktree cleanup, and quit cleanup. Requires tmux + claude CLI.
 
 ## Conventions
 

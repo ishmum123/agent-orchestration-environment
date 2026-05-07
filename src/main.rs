@@ -19,7 +19,7 @@ mod orc;
 mod ui;
 mod worktree;
 
-use app::{App, AppMode, ConfirmCallback, InputCallback, OrcCommand, parse_orc_commands};
+use app::{App, AppMode, ConfirmCallback, InputCallback, OrcCommand};
 
 #[derive(Parser)]
 #[command(
@@ -85,7 +85,22 @@ fn run_loop(
 ) -> Result<()> {
     loop {
         // Drain events from all processes (non-blocking)
-        app.drain_events();
+        let completions = app.drain_events();
+
+        // Notify orc about agent completions
+        for (name, result, is_error) in &completions {
+            if let Some(ref mut orc) = app.orc {
+                let status = if *is_error { "failed" } else { "finished" };
+                let msg = if result.is_empty() {
+                    format!("Agent \"{}\" {}.", name, status)
+                } else {
+                    // Truncate long results to avoid blowing up context
+                    let truncated = if result.len() > 2000 { &result[..2000] } else { result.as_str() };
+                    format!("Agent \"{}\" {}. Result:\n{}", name, status, truncated)
+                };
+                orc.send(&msg).ok();
+            }
+        }
 
         // Process orc commands from latest output
         process_orc_commands(app)?;
@@ -95,18 +110,23 @@ fn run_loop(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
-                    match &app.mode {
-                        AppMode::Dashboard => {
-                            handle_dashboard_key(app, key.code, key.modifiers)?
-                        }
-                        AppMode::Input { .. } => handle_input_key(app, key.code)?,
-                        AppMode::Status => handle_status_key(app, key.code)?,
-                        AppMode::AgentDetail { .. } => handle_detail_key(app, key.code, key.modifiers)?,
-                        AppMode::Help => {
-                            app.mode = AppMode::Dashboard;
-                        }
-                        AppMode::Confirm { .. } => {
-                            handle_confirm_key(app, key.code)?;
+                    // Global Ctrl+C handling — works in all modes
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.should_quit = true;
+                    } else {
+                        match &app.mode {
+                            AppMode::Dashboard => {
+                                handle_dashboard_key(app, key.code, key.modifiers)?
+                            }
+                            AppMode::Input { .. } => handle_input_key(app, key.code)?,
+                            AppMode::Status => handle_status_key(app, key.code)?,
+                            AppMode::AgentDetail { .. } => handle_detail_key(app, key.code, key.modifiers)?,
+                            AppMode::Help => {
+                                app.mode = AppMode::Dashboard;
+                            }
+                            AppMode::Confirm { .. } => {
+                                handle_confirm_key(app, key.code)?;
+                            }
                         }
                     }
                 }
@@ -138,26 +158,12 @@ fn run_loop(
 
 /// Check latest orc output for [SPAWN_AGENT], [TELL_AGENT], [KILL_AGENT] commands.
 fn process_orc_commands(app: &mut App) -> Result<()> {
-    let total = app.orc_output.len();
-    if total <= app.orc_cmds_processed {
+    if app.orc_pending_cmds.is_empty() {
         return Ok(());
     }
 
-    // Collect text from new (unprocessed) entries only
-    let new_text: String = app.orc_output[app.orc_cmds_processed..total]
-        .iter()
-        .filter_map(|e| match e {
-            agent::OutputEntry::Text(t) => Some(t.as_str()),
-            agent::OutputEntry::Result { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Mark as processed BEFORE executing (prevents re-entry if spawn triggers more events)
-    app.orc_cmds_processed = total;
-
-    let cmds = parse_orc_commands(&new_text);
+    // Drain all pending commands (parsed during event ingestion)
+    let cmds: Vec<OrcCommand> = std::mem::take(&mut app.orc_pending_cmds);
     for cmd in cmds {
         match cmd {
             OrcCommand::Spawn { name, task } => {
@@ -190,7 +196,6 @@ fn handle_dashboard_key(
     match code {
         KeyCode::Esc => enter_chat_mode(app),
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.select_next(),
         KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
         KeyCode::Enter => {
@@ -439,6 +444,10 @@ fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
     Ok(())
 }
 
+fn stderr_log_path(agent_name: &str) -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".orc").join("logs").join(format!("{}.stderr", agent_name)))
+}
+
 fn spawn_new_agent_by_name(app: &mut App, name: &str, task: &str) -> Result<()> {
     let name = dedupe_name(name, &app.agents);
 
@@ -446,8 +455,11 @@ fn spawn_new_agent_by_name(app: &mut App, name: &str, task: &str) -> Result<()> 
     let worktree_path = worktree::create_worktree(&app.project_dir, &name)?;
 
     // Spawn Claude Code process
-    let args = claude::ClaudeArgs::new()
+    let mut args = claude::ClaudeArgs::new()
         .permission_mode("auto");
+    if let Some(log_path) = stderr_log_path(&name) {
+        args = args.stderr_log(log_path);
+    }
 
     let mut process = claude::ClaudeProcess::spawn(args, worktree_path.to_str().unwrap())?;
 
