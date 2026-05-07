@@ -43,18 +43,12 @@ fn main() -> Result<()> {
 
     check_dependencies()?;
 
-    let mut app = App::new(&cli.session, &cli.project);
-
-    // Kill existing session if any
-    if app.session.exists() {
-        app.session.kill()?;
-    }
+    let mut app = App::new(&cli.project);
 
     // Generate lazygit config
     ensure_lazygit_config()?;
 
-    // Spawn orc — creates tmux session with claude directly in pane 0
-    app.orc_pane = Some(orc::spawn_orc(&cli.project)?);
+    // TODO(task-7): spawn orc via ClaudeProcess
     app.set_status("orc started".to_string());
 
     // Setup terminal
@@ -72,7 +66,6 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     // Cleanup
-    app.session.kill().ok();
     for agent in &app.agents {
         worktree::remove_worktree(&app.project_dir, &agent.name).ok();
     }
@@ -132,7 +125,7 @@ fn run_loop(
 
         // Periodic polling (orc + agents)
         if app.last_poll.elapsed() > poll_interval {
-            app.poll_agents().ok();
+            app.drain_events();
         }
 
         if app.should_quit {
@@ -364,8 +357,8 @@ fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
 }
 
 fn chat_orc(app: &mut App, message: &str) -> Result<()> {
-    // TODO(task-5): send message to orc via ClaudeProcess stdin
-    if app.orc_pane.is_some() {
+    // TODO(task-7): send message to orc via ClaudeProcess stdin
+    if app.orc.is_some() {
         let _ = message;
         app.set_status("sent to orc".to_string());
     }
@@ -393,8 +386,8 @@ fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
 }
 
 fn tell_agent(app: &mut App, message: &str) -> Result<()> {
-    // TODO(task-5): relay message via ClaudeProcess
-    if app.orc_pane.is_some() && !app.agents.is_empty() {
+    // TODO(task-7): relay message via ClaudeProcess
+    if app.orc.is_some() && !app.agents.is_empty() {
         let agent_name = app.agents[app.selected].name.clone();
         let _ = message;
         app.set_status(format!("told {} (via orc)", agent_name));

@@ -134,7 +134,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
     let output = &app.orc_output;
 
-    if output.trim().is_empty() {
+    if output.is_empty() {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -147,9 +147,14 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Claude Code layout: banner at top (~5 lines), status bar at bottom (~3 lines).
-    // Strip those by position rather than content matching to avoid false positives.
-    let all_lines: Vec<&str> = output.lines().collect();
+    use crate::agent::OutputEntry;
+    let combined: String = output.iter().map(|e| match e {
+        OutputEntry::Text(t) => t.clone(),
+        OutputEntry::ToolUse { name, input } => format!("[tool: {}] {}", name, input),
+        OutputEntry::Result { text, .. } => text.clone(),
+    }).collect::<Vec<_>>().join("\n");
+
+    let all_lines: Vec<&str> = combined.lines().collect();
     let content_lines = strip_claude_chrome(&all_lines);
 
     let visible_lines: Vec<Line> = content_lines

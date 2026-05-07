@@ -1,37 +1,28 @@
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentState, OutputEntry};
 use crate::claude::ClaudeProcess;
-#[allow(unused_imports)]
-use crate::tmux::{self, TmuxPane, TmuxSession};
-use anyhow::Result;
+use crate::events::{ContentBlock, StreamEvent};
 use std::path::PathBuf;
 use std::time::Instant;
 
 /// Dashboard interaction modes
 pub enum AppMode {
-    /// Main view — orc conversation + agent sidebar
     Dashboard,
-    /// Typing an inline prompt
     Input {
         prompt_label: String,
         callback: InputCallback,
     },
-    /// Viewing layered status summaries
     Status,
-    /// Viewing full output of a single agent
     AgentDetail {
         agent_idx: usize,
         scroll: usize,
     },
-    /// Help overlay showing all keybinds
     Help,
-    /// Confirming a destructive action
     Confirm {
         message: String,
         callback: ConfirmCallback,
     },
 }
 
-/// What to do with inline input after Enter
 pub enum InputCallback {
     ChatOrc,
     TellAgent,
@@ -39,13 +30,58 @@ pub enum InputCallback {
     DirectSend,
 }
 
-/// What to do after confirming
 pub enum ConfirmCallback {
     KillAgent(usize),
 }
 
+/// Commands the orc brain can embed in its responses.
+pub enum OrcCommand {
+    Spawn { name: String, task: String },
+    Tell { name: String, message: String },
+    Kill { name: String },
+}
+
+/// Parse [SPAWN_AGENT ...], [TELL_AGENT ...], [KILL_AGENT ...] from orc output.
+pub fn parse_orc_commands(text: &str) -> Vec<OrcCommand> {
+    let mut cmds = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("[SPAWN_AGENT") {
+            if let (Some(name), Some(task)) = (
+                extract_attr(trimmed, "name"),
+                extract_attr(trimmed, "task"),
+            ) {
+                cmds.push(OrcCommand::Spawn { name, task });
+            }
+        } else if trimmed.starts_with("[TELL_AGENT") {
+            if let (Some(name), Some(message)) = (
+                extract_attr(trimmed, "name"),
+                extract_attr(trimmed, "message"),
+            ) {
+                cmds.push(OrcCommand::Tell { name, message });
+            }
+        } else if trimmed.starts_with("[KILL_AGENT") {
+            if let Some(name) = extract_attr(trimmed, "name") {
+                cmds.push(OrcCommand::Kill { name });
+            }
+        }
+    }
+
+    cmds
+}
+
+/// Extract a named attribute value from a string like `name="value"`.
+fn extract_attr(s: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr);
+    let start = s.find(&pattern)? + pattern.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 pub struct App {
-    pub session: TmuxSession,
     pub agents: Vec<Agent>,
     pub selected: usize,
     pub mode: AppMode,
@@ -55,8 +91,9 @@ pub struct App {
     pub last_poll: Instant,
     pub status_line: String,
     pub status_line_at: Instant,
-    pub orc_pane: Option<ClaudeProcess>,
-    pub orc_output: String,
+    pub orc: Option<ClaudeProcess>,
+    pub orc_output: Vec<OutputEntry>,
+    pub orc_session_id: Option<String>,
     pub show_preview: bool,
     pub scroll_offset: usize,
     pub status_selected: usize,
@@ -65,9 +102,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session_name: &str, project_dir: &str) -> Self {
+    pub fn new(project_dir: &str) -> Self {
         Self {
-            session: TmuxSession::new(session_name),
             agents: Vec::new(),
             selected: 0,
             mode: AppMode::Input {
@@ -80,8 +116,9 @@ impl App {
             last_poll: Instant::now(),
             status_line: String::new(),
             status_line_at: Instant::now(),
-            orc_pane: None,
-            orc_output: String::new(),
+            orc: None,
+            orc_output: Vec::new(),
+            orc_session_id: None,
             show_preview: true,
             scroll_offset: 0,
             status_selected: 0,
@@ -134,72 +171,146 @@ impl App {
         }
     }
 
-    /// Poll orc pane and all agent panes for state updates
-    pub fn poll_agents(&mut self) -> Result<()> {
-        // TODO(task-5): poll orc output via ClaudeProcess events
+    /// Drain available events from the orc process and all agent processes.
+    /// Non-blocking: reads only what's available, doesn't wait.
+    pub fn drain_events(&mut self) {
+        self.drain_orc_events();
 
-        // Discover orc-spawned agents
-        self.discover_orc_agents();
+        for agent in &mut self.agents {
+            drain_agent_events(agent);
+        }
 
-        // TODO(task-5): poll agents via ClaudeProcess events
         self.last_poll = Instant::now();
-        Ok(())
     }
 
-    #[cfg(test)]
-    pub fn discover_orc_agents_from(&mut self, agents_dir: &std::path::Path) {
-        self._discover_orc_agents(Some(agents_dir));
-    }
-
-    /// Scan ~/.orc/agents/ for metadata files written by the orchestrator
-    fn discover_orc_agents(&mut self) {
-        self._discover_orc_agents(None);
-    }
-
-    fn _discover_orc_agents(&mut self, override_dir: Option<&std::path::Path>) {
-        let default_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".orc/agents");
-        let agents_dir = override_dir.unwrap_or(&default_dir);
-
-        let entries = match std::fs::read_dir(agents_dir) {
-            Ok(e) => e,
-            Err(_) => return,
+    fn drain_orc_events(&mut self) {
+        let orc = match self.orc.as_mut() {
+            Some(o) => o,
+            None => return,
         };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+        loop {
+            match orc.try_read_event() {
+                Ok(Some(event)) => {
+                    match &event {
+                        StreamEvent::System { subtype, session_id, .. } => {
+                            if subtype == "init" {
+                                if let Some(sid) = session_id {
+                                    self.orc_session_id = Some(sid.clone());
+                                }
+                            }
+                        }
+                        StreamEvent::Assistant { message, .. } => {
+                            for block in &message.content {
+                                match block {
+                                    ContentBlock::Text { text } => {
+                                        self.orc_output.push(OutputEntry::Text(text.clone()));
+                                    }
+                                    ContentBlock::ToolUse { name, input, .. } => {
+                                        let input_str = input.to_string();
+                                        self.orc_output.push(OutputEntry::ToolUse {
+                                            name: name.clone(),
+                                            input: input_str,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        StreamEvent::Result { result, is_error, .. } => {
+                            if let Some(text) = result {
+                                self.orc_output.push(OutputEntry::Result {
+                                    text: text.clone(),
+                                    is_error: *is_error,
+                                });
+                            }
+                        }
+                        StreamEvent::Other => {}
+                    }
+                }
+                Ok(None) | Err(_) => break,
             }
-
-            let contents = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // TODO(task-5): parse new agent metadata format
-            let _ = contents; // suppress unused warning
         }
+    }
+}
+
+fn drain_agent_events(agent: &mut Agent) {
+    let proc = match agent.process.as_mut() {
+        Some(p) => p,
+        None => return,
+    };
+
+    loop {
+        match proc.try_read_event() {
+            Ok(Some(event)) => {
+                match &event {
+                    StreamEvent::System { subtype, session_id, .. } => {
+                        if subtype == "init" {
+                            if let Some(sid) = session_id {
+                                agent.session_id = Some(sid.clone());
+                            }
+                        }
+                    }
+                    StreamEvent::Assistant { message, .. } => {
+                        agent.state = AgentState::Working;
+                        for block in &message.content {
+                            match block {
+                                ContentBlock::Text { text } => {
+                                    agent.output.push_text(text);
+                                }
+                                ContentBlock::ToolUse { name, input, .. } => {
+                                    agent.output.push_tool_use(name, &input.to_string());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    StreamEvent::Result { result, is_error, total_cost_usd, .. } => {
+                        if let Some(cost) = total_cost_usd {
+                            agent.cost_usd += cost;
+                        }
+                        if *is_error {
+                            agent.state = AgentState::Error;
+                            if let Some(text) = result {
+                                agent.output.push_result(text, true);
+                            }
+                        } else {
+                            agent.state = AgentState::Done;
+                            if let Some(text) = result {
+                                agent.output.push_result(text, false);
+                            }
+                        }
+                    }
+                    StreamEvent::Other => {}
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    // Check if process died unexpectedly
+    if !proc.is_alive() && agent.state == AgentState::Working {
+        agent.state = AgentState::Error;
+        agent.output.push_result("process exited unexpectedly", true);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
     fn make_app() -> App {
-        App::new("test-session", "/tmp")
+        App::new("/tmp")
     }
 
-    #[cfg(any())]
-    fn make_agent(_name: &str) -> Agent {
-        unimplemented!("TODO(task-5): update to new Agent API")
+    fn make_agent(name: &str) -> Agent {
+        Agent::new_without_process(
+            name.to_string(),
+            "task".to_string(),
+            PathBuf::from("/tmp"),
+        )
     }
 
-    #[cfg(any())]
     #[test]
     fn test_select_next_wraps() {
         let mut app = make_app();
@@ -210,7 +321,6 @@ mod tests {
         assert_eq!(app.selected, 0);
     }
 
-    #[cfg(any())]
     #[test]
     fn test_select_prev_wraps() {
         let mut app = make_app();
@@ -224,11 +334,10 @@ mod tests {
     #[test]
     fn test_select_next_empty() {
         let mut app = make_app();
-        app.select_next(); // should not panic
+        app.select_next();
         assert_eq!(app.selected, 0);
     }
 
-    #[cfg(any())]
     #[test]
     fn test_select_resets_scroll() {
         let mut app = make_app();
@@ -258,7 +367,6 @@ mod tests {
         assert!(app.selected_agent().is_none());
     }
 
-    #[cfg(any())]
     #[test]
     fn test_selected_agent_some() {
         let mut app = make_app();
@@ -266,73 +374,58 @@ mod tests {
         assert_eq!(app.selected_agent().unwrap().name, "test");
     }
 
-    #[cfg(any())]
     #[test]
-    fn test_discover_orc_agents() {
-        let dir = TempDir::new().unwrap();
-        let meta = r#"{
-            "name": "discovered",
-            "task": "do stuff",
-            "session": "orc",
-            "window": 0,
-            "pane": 5,
-            "worktree": "/tmp/wt"
-        }"#;
-        fs::write(dir.path().join("discovered.json"), meta).unwrap();
-
-        let mut app = make_app();
-        app.discover_orc_agents_from(dir.path());
-
-        assert_eq!(app.agents.len(), 1);
-        assert_eq!(app.agents[0].name, "discovered");
-        assert_eq!(app.agents[0].task_description, "do stuff");
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn test_discover_skips_existing() {
-        let dir = TempDir::new().unwrap();
-        let meta = r#"{
-            "name": "existing",
-            "task": "task",
-            "session": "orc",
-            "window": 0,
-            "pane": 1,
-            "worktree": "/tmp/wt"
-        }"#;
-        fs::write(dir.path().join("existing.json"), meta).unwrap();
-
-        let mut app = make_app();
-        app.agents.push(make_agent("existing"));
-        app.discover_orc_agents_from(dir.path());
-
-        assert_eq!(app.agents.len(), 1); // not duplicated
+    fn test_parse_orc_commands_spawn() {
+        let text = r#"I'll spawn an agent for this.
+[SPAWN_AGENT name="fix-bug" task="Fix the login bug in src/auth.rs"]
+"#;
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            OrcCommand::Spawn { name, task } => {
+                assert_eq!(name, "fix-bug");
+                assert_eq!(task, "Fix the login bug in src/auth.rs");
+            }
+            _ => panic!("expected Spawn"),
+        }
     }
 
     #[test]
-    fn test_discover_skips_invalid_json() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("bad.json"), "not json").unwrap();
-        fs::write(dir.path().join("readme.txt"), "ignored").unwrap();
-
-        let mut app = make_app();
-        app.discover_orc_agents_from(dir.path());
-
-        assert_eq!(app.agents.len(), 0);
+    fn test_parse_orc_commands_tell() {
+        let text = r#"[TELL_AGENT name="fix-bug" message="Also check the tests"]"#;
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            OrcCommand::Tell { name, message } => {
+                assert_eq!(name, "fix-bug");
+                assert_eq!(message, "Also check the tests");
+            }
+            _ => panic!("expected Tell"),
+        }
     }
 
     #[test]
-    fn test_discover_empty_dir() {
-        let dir = TempDir::new().unwrap();
-        let mut app = make_app();
-        app.discover_orc_agents_from(dir.path());
-        assert_eq!(app.agents.len(), 0);
+    fn test_parse_orc_commands_kill() {
+        let text = r#"[KILL_AGENT name="old-agent"]"#;
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], OrcCommand::Kill { .. }));
     }
 
     #[test]
-    fn test_discover_nonexistent_dir() {
-        let mut app = make_app();
-        app.discover_orc_agents_from(std::path::Path::new("/nonexistent/path"));
-        assert_eq!(app.agents.len(), 0); // should not panic
+    fn test_parse_orc_commands_multiple() {
+        let text = r#"Let me spawn two agents:
+[SPAWN_AGENT name="frontend" task="Build the UI"]
+[SPAWN_AGENT name="backend" task="Build the API"]
+"#;
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_orc_commands_none() {
+        let text = "Just some regular text, no commands here.";
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 0);
     }
 }
