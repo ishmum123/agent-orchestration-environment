@@ -321,7 +321,7 @@ impl App {
         let worktree_path = worktree::create_worktree(&self.project_dir, &name)?;
 
         let mut args = claude::ClaudeArgs::new()
-            .permission_mode("auto");
+            .permission_mode("dangerously-skip-permissions");
         if let Some(log_path) = stderr_log_path(&name) {
             args = args.stderr_log(log_path);
         }
