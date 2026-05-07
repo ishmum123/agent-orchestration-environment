@@ -28,6 +28,7 @@ pub struct ClaudeArgs {
     tools: Option<String>,
     permission_mode: Option<String>,
     add_dir: Option<String>,
+    no_mcp: bool,
     extra_args: Vec<String>,
 }
 
@@ -40,8 +41,15 @@ impl ClaudeArgs {
             tools: None,
             permission_mode: None,
             add_dir: None,
+            no_mcp: false,
             extra_args: Vec::new(),
         }
+    }
+
+    /// Disable all MCP servers (uses --strict-mcp-config with no config).
+    pub fn no_mcp(mut self) -> Self {
+        self.no_mcp = true;
+        self
     }
 
     pub fn system_prompt(mut self, prompt: &str) -> Self {
@@ -107,6 +115,9 @@ impl ClaudeArgs {
         if let Some(ref dir) = self.add_dir {
             args.push("--add-dir".to_string());
             args.push(dir.clone());
+        }
+        if self.no_mcp {
+            args.push("--strict-mcp-config".to_string());
         }
         args.extend(self.extra_args);
         args

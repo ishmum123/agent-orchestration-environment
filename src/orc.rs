@@ -61,7 +61,8 @@ pub fn spawn_orc(project_dir: &str) -> Result<ClaudeProcess> {
     let prompt = orc_system_prompt(project_dir);
     let args = ClaudeArgs::new()
         .system_prompt(&prompt)
-        .tools("");
+        .tools("")
+        .no_mcp();
     ClaudeProcess::spawn(args, project_dir)
 }
 
