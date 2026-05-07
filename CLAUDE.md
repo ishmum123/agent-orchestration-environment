@@ -14,17 +14,19 @@ cargo test             # run tests
 
 ## Architecture
 
-- `src/main.rs` — CLI entry, terminal setup, event loop, keybind handlers
-- `src/app.rs` — App state machine (Dashboard/Input/Attached/Status/AgentDetail/Help/Confirm modes)
-- `src/tmux.rs` — tmux session/pane management (create, kill, send-keys, capture-pane)
+- `src/main.rs` — CLI entry, terminal setup, event loop, keybind handlers, agent spawn/kill
+- `src/app.rs` — App state machine, orc command parsing (SPAWN_AGENT/TELL_AGENT/KILL_AGENT), event draining
+- `src/claude.rs` — ClaudeProcess: spawn `claude -p` with stream-json pipes, send/receive NDJSON
+- `src/events.rs` — Typed serde structs for stream-json NDJSON events (system, assistant, result)
+- `src/agent.rs` — Agent struct, AgentState enum, OutputLog for structured event history
+- `src/orc.rs` — Orchestrator system prompt generation and spawning
 - `src/worktree.rs` — git worktree creation/removal for agent isolation
-- `src/agent.rs` — Agent struct, AgentState enum, heuristic state detection, slug auto-naming
-- `src/orc.rs` — Orchestrator CLAUDE.md generation and spawning
-- `src/ui.rs` — Ratatui split-pane dashboard, status view, agent detail, help/confirm overlays
+- `src/ui.rs` — Ratatui dashboard, status view, agent detail, help/confirm overlays
 
 ## Conventions
 
 - No async runtime — synchronous event loop with crossterm polling
-- Shell out to `tmux` and `git` via `std::process::Command` (no library bindings)
-- Orc is a Claude Code instance with a generated CLAUDE.md, communicates via tmux
-- Agent state detected from pane output heuristics, not IPC
+- Shell out to `git` via `std::process::Command` for worktree management
+- Claude Code instances are child processes with `--input-format stream-json --output-format stream-json`
+- Communication via stdin/stdout NDJSON pipes (no tmux)
+- Agent state derived from stream events, not heuristics
