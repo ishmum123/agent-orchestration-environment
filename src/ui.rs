@@ -8,6 +8,12 @@ use ratatui::{
     Frame,
 };
 
+const SPINNER: &[&str] = &["\u{2801}", "\u{2809}", "\u{2819}", "\u{2838}", "\u{2830}", "\u{2820}", "\u{2824}", "\u{2826}", "\u{2807}", "\u{2803}"];
+
+fn spinner_frame(tick: u64) -> &'static str {
+    SPINNER[(tick as usize / 2) % SPINNER.len()]
+}
+
 pub fn render(f: &mut Frame, app: &App) {
     match &app.mode {
         AppMode::Help => {
@@ -18,15 +24,18 @@ pub fn render(f: &mut Frame, app: &App) {
             render_dashboard(f, app);
             render_confirm_overlay(f, message);
         }
-        AppMode::AgentDetail { agent_idx, scroll, browsing } => {
-            render_agent_detail(f, app, *agent_idx, *scroll, *browsing);
+        AppMode::AgentDashboard { agent_idx, scroll } => {
+            render_agent_detail(f, app, *agent_idx, *scroll, true);
+        }
+        AppMode::AgentInput { agent_idx, scroll } => {
+            render_agent_detail(f, app, *agent_idx, *scroll, false);
         }
         _ => render_dashboard(f, app),
     }
 }
 
 fn input_height(app: &App, width: u16) -> u16 {
-    if !matches!(app.mode, AppMode::Input { .. }) {
+    if !app.mode.is_text_input() {
         return 3;
     }
     let line_count = app.input_buf.lines().count().max(1) as u16;
@@ -86,6 +95,13 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("orc", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ];
 
+    if app.orc_waiting {
+        parts.push(Span::styled(
+            format!(" {}", spinner_frame(app.tick)),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
     if !app.agents.is_empty() {
         parts.push(Span::styled(
             format!("  {} agents", app.agents.len()),
@@ -95,7 +111,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     if working > 0 {
         parts.push(Span::styled(
-            format!("  \u{25cf} {}", working),
+            format!("  {} {}", spinner_frame(app.tick), working),
             Style::default().fg(Color::Green),
         ));
     }
@@ -126,19 +142,20 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Render all entries into lines, then show the tail (adjusted by scroll_offset)
     let all_lines: Vec<Line> = app.orc_output.iter()
         .flat_map(|entry| style_output_entry(entry))
         .collect();
 
     let height = area.height as usize;
-    let total = all_lines.len();
-    // scroll_offset=0 means show the bottom; higher values scroll up
-    let end = total.saturating_sub(app.scroll_offset);
-    let start = end.saturating_sub(height);
-    let visible: Vec<Line> = all_lines.into_iter().skip(start).take(end - start).collect();
+    let total_effective = effective_line_count(&all_lines, area.width);
+    let max_scroll = total_effective.saturating_sub(height);
+    // scroll_offset=0 means bottom; clamp to max
+    let clamped_offset = app.scroll_offset.min(max_scroll);
+    let scroll_from_top = max_scroll.saturating_sub(clamped_offset);
 
-    let output = Paragraph::new(visible).wrap(Wrap { trim: false });
+    let output = Paragraph::new(all_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_from_top as u16, 0));
     f.render_widget(output, area);
 }
 
@@ -164,6 +181,8 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 if agent.prune_after_orc_prompt.is_some() {
                     Span::styled("\u{25cc}", Style::default().fg(Color::DarkGray)) // ◌ prune candidate
+                } else if matches!(agent.state, crate::agent::AgentState::Working) {
+                    Span::styled(spinner_frame(app.tick), Style::default().fg(Color::Green))
                 } else {
                     Span::styled(agent.state.icon(), Style::default().fg(agent.state.color()))
                 },
@@ -188,8 +207,8 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
-    match &app.mode {
-        AppMode::Input { prompt_label, .. } => {
+    if app.mode.is_text_input() {
+            let prompt_label = app.mode.prompt_label();
             let border = Paragraph::new("")
                 .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
             f.render_widget(border, Rect { height: 1, ..area });
@@ -225,8 +244,7 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
             let input = Paragraph::new(display_lines)
                 .style(Style::default().fg(Color::Yellow));
             f.render_widget(input, text_area);
-        }
-        _ => {
+    } else {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
@@ -281,7 +299,6 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
                     .style(Style::default().fg(Color::DarkGray));
                 f.render_widget(status, chunks[2]);
             }
-        }
     }
 }
 
@@ -313,13 +330,18 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
     // Header
     let mode_label = if browsing { " BROWSE " } else { " INPUT " };
     let mode_color = if browsing { Color::Cyan } else { Color::Green };
+    let state_indicator = if matches!(agent.state, crate::agent::AgentState::Working) {
+        format!("[{} {}]", spinner_frame(app.tick), agent.state.label())
+    } else {
+        format!("[{}]", agent.state.label())
+    };
     let header_lines = vec![
         Line::from(vec![
             Span::styled(
                 format!(" {} ", agent.name),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("[{}]", agent.state.label()), Style::default().fg(agent.state.color())),
+            Span::styled(state_indicator, Style::default().fg(agent.state.color())),
             Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("  {}", mode_label), Style::default().fg(Color::Black).bg(mode_color)),
         ]),
@@ -332,19 +354,20 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(header, chunks[0]);
 
-    // Output — render all entries then window into them using scroll offset.
-    // scroll=0 shows the bottom; higher values scroll toward older content.
+    // Output — scroll=0 shows bottom; higher values scroll toward older content.
     let all_lines: Vec<Line> = agent.output.all_entries().iter()
         .flat_map(|e| style_output_entry(e))
         .collect();
 
     let height = chunks[1].height as usize;
-    let total = all_lines.len();
-    let end = total.saturating_sub(scroll);
-    let start = end.saturating_sub(height);
-    let visible: Vec<Line> = all_lines.into_iter().skip(start).take(end - start).collect();
+    let total_effective = effective_line_count(&all_lines, chunks[1].width);
+    let max_scroll = total_effective.saturating_sub(height);
+    let clamped_scroll = scroll.min(max_scroll);
+    let scroll_from_top = max_scroll.saturating_sub(clamped_scroll);
 
-    let output = Paragraph::new(visible).wrap(Wrap { trim: false });
+    let output = Paragraph::new(all_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_from_top as u16, 0));
     f.render_widget(output, chunks[1]);
 
     // Input box
@@ -666,6 +689,18 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+/// Calculate total rendered line count accounting for line wrapping at given width.
+fn effective_line_count(lines: &[Line], width: u16) -> usize {
+    if width == 0 {
+        return lines.len();
+    }
+    let w = width as usize;
+    lines.iter().map(|line| {
+        let lw = line.width();
+        if lw <= w { 1 } else { (lw + w - 1) / w }
+    }).sum()
 }
 
 fn truncate(s: &str, max: usize) -> String {

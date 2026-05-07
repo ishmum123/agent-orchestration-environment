@@ -6,19 +6,22 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Dashboard interaction modes
+/// Explicit UI modes — each mode defines its own keybindings, rendering, and transitions.
+///
+/// Hierarchy:
+///   OrcDashboard ←→ OrcInput
+///   OrcDashboard → AgentPanel → AgentDashboard ←→ AgentInput
+///   AgentPanel → TellInput / DirectSendInput / Confirm
+///   OrcDashboard → SpawnInput
 pub enum AppMode {
-    Dashboard,
+    OrcDashboard,
+    OrcInput,
     AgentPanel,
-    Input {
-        prompt_label: String,
-        callback: InputCallback,
-    },
-    AgentDetail {
-        agent_idx: usize,
-        scroll: usize,
-        browsing: bool,
-    },
+    AgentDashboard { agent_idx: usize, scroll: usize },
+    AgentInput { agent_idx: usize, scroll: usize },
+    SpawnInput,
+    TellInput { agent_name: String },
+    DirectSendInput { agent_name: String },
     Help,
     Confirm {
         message: String,
@@ -26,11 +29,21 @@ pub enum AppMode {
     },
 }
 
-pub enum InputCallback {
-    ChatOrc,
-    TellAgent,
-    NewAgent,
-    DirectSend,
+impl AppMode {
+    pub fn is_text_input(&self) -> bool {
+        matches!(self, AppMode::OrcInput | AppMode::SpawnInput | AppMode::TellInput { .. } | AppMode::DirectSendInput { .. })
+    }
+
+    /// Prompt label shown in the input box for text-input modes.
+    pub fn prompt_label(&self) -> String {
+        match self {
+            AppMode::OrcInput => "> ".to_string(),
+            AppMode::SpawnInput => "task> ".to_string(),
+            AppMode::TellInput { agent_name } => format!("tell {}> ", agent_name),
+            AppMode::DirectSendInput { agent_name } => format!("{}> ", agent_name),
+            _ => "> ".to_string(),
+        }
+    }
 }
 
 pub enum ConfirmCallback {
@@ -189,6 +202,8 @@ pub struct App {
     pub agent_input_buf: String,
     pub agent_input_name: String,
     pub orc_prompt_count: u64,
+    pub tick: u64,
+    pub orc_waiting: bool,
 }
 
 impl App {
@@ -196,10 +211,7 @@ impl App {
         Self {
             agents: Vec::new(),
             selected: 0,
-            mode: AppMode::Input {
-                prompt_label: "> ".to_string(),
-                callback: InputCallback::ChatOrc,
-            },
+            mode: AppMode::OrcInput,
             input_buf: String::new(),
             should_quit: false,
             project_dir: project_dir.to_string(),
@@ -213,6 +225,8 @@ impl App {
             agent_input_buf: String::new(),
             agent_input_name: String::new(),
             orc_prompt_count: 0,
+            tick: 0,
+            orc_waiting: false,
         }
     }
 
@@ -267,6 +281,7 @@ impl App {
             orc.send(message)?;
             self.orc_output.push(OutputEntry::UserInput(message.to_string()));
             self.orc_prompt_count += 1;
+            self.orc_waiting = true;
             self.set_status("sent to orc".to_string());
         }
         Ok(())
@@ -319,6 +334,9 @@ impl App {
 
         let agent = Agent::new(name.clone(), task.to_string(), process, worktree_path);
         self.agents.push(agent);
+        self.orc_output.push(OutputEntry::Text(
+            format!("spawning **{}** to: {}", name, truncate_str(task, 120))
+        ));
         self.set_status(format!("spawned '{}'", name));
 
         Ok(())
@@ -506,6 +524,7 @@ impl App {
         loop {
             match orc.try_read_event() {
                 Ok(Some(event)) => {
+                    self.orc_waiting = false;
                     match &event {
                         StreamEvent::System { .. } => {}
                         StreamEvent::Assistant { message, .. } => {
@@ -572,6 +591,16 @@ fn dedupe_name(base: &str, agents: &[Agent]) -> String {
     base.to_string()
 }
 
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max <= 3 {
+        s[..max].to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
+}
+
 fn stderr_log_path(agent_name: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".orc").join("logs").join(format!("{}.stderr", agent_name)))
 }
@@ -589,6 +618,8 @@ fn drain_agent_events(agent: &mut Agent) {
                     StreamEvent::System { .. } => {}
                     StreamEvent::Assistant { message, .. } => {
                         agent.state = AgentState::Working;
+                        agent.prune_after_orc_prompt = None;
+                        agent.done_at = None;
                         for block in &message.content {
                             match block {
                                 ContentBlock::Text { text } => {

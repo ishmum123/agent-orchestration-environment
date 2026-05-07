@@ -19,7 +19,8 @@ mod orc;
 mod ui;
 mod worktree;
 
-use app::{App, AppMode, ConfirmCallback, InputCallback};
+use agent::OutputEntry;
+use app::{App, AppMode, ConfirmCallback};
 
 #[derive(Parser)]
 #[command(
@@ -41,9 +42,11 @@ fn main() -> Result<()> {
 
     // Spawn orc brain
     match orc::spawn_orc(&cli.project) {
-        Ok(mut proc) => {
-            proc.send("Ready. Greet the user briefly.").ok();
+        Ok(proc) => {
             app.orc = Some(proc);
+            app.orc_output.push(OutputEntry::Text(
+                "ready. type below to chat, or press **n** to spawn an agent directly.".to_string()
+            ));
             app.set_status("orc started".to_string());
         }
         Err(e) => {
@@ -94,6 +97,7 @@ fn run_loop(
 
         app.process_orc_commands()?;
         app.prune_dead_agents()?;
+        app.tick = app.tick.wrapping_add(1);
 
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -104,14 +108,16 @@ fn run_loop(
                         app.should_quit = true;
                     } else {
                         match &app.mode {
-                            AppMode::Dashboard => {
-                                handle_dashboard_key(app, key.code, key.modifiers)?
-                            }
+                            AppMode::OrcDashboard => handle_dashboard_key(app, key.code, key.modifiers)?,
                             AppMode::AgentPanel => handle_agent_panel_key(app, key.code)?,
-                            AppMode::Input { .. } => handle_input_key(app, key.code)?,
-                            AppMode::AgentDetail { .. } => handle_detail_key(app, key.code, key.modifiers)?,
+                            AppMode::OrcInput | AppMode::SpawnInput
+                                | AppMode::TellInput { .. } | AppMode::DirectSendInput { .. } => {
+                                handle_input_key(app, key.code)?
+                            }
+                            AppMode::AgentDashboard { .. } => handle_agent_browse_key(app, key.code, key.modifiers)?,
+                            AppMode::AgentInput { .. } => handle_agent_input_key(app, key.code, key.modifiers)?,
                             AppMode::Help => {
-                                app.mode = AppMode::Dashboard;
+                                app.mode = AppMode::OrcDashboard;
                             }
                             AppMode::Confirm { .. } => {
                                 handle_confirm_key(app, key.code)?;
@@ -121,14 +127,11 @@ fn run_loop(
                 }
                 Event::Paste(text) => {
                     let cleaned = text.replace('\r', "");
-                    if matches!(app.mode, AppMode::AgentDetail { .. }) {
+                    if matches!(app.mode, AppMode::AgentInput { .. }) {
                         app.agent_input_buf.push_str(&cleaned);
                     } else {
-                        if !matches!(app.mode, AppMode::Input { .. }) {
-                            app.mode = AppMode::Input {
-                                prompt_label: "> ".to_string(),
-                                callback: InputCallback::ChatOrc,
-                            };
+                        if !app.mode.is_text_input() {
+                            app.mode = AppMode::OrcInput;
                             app.input_buf.clear();
                         }
                         app.input_buf.push_str(&cleaned);
@@ -168,10 +171,7 @@ fn handle_dashboard_key(
             }
         }
         KeyCode::Char('n') => {
-            app.mode = AppMode::Input {
-                prompt_label: "task> ".to_string(),
-                callback: InputCallback::NewAgent,
-            };
+            app.mode = AppMode::SpawnInput;
             app.input_buf.clear();
         }
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -191,7 +191,7 @@ fn handle_dashboard_key(
 fn handle_agent_panel_key(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         KeyCode::Esc => {
-            app.mode = AppMode::Dashboard;
+            app.mode = AppMode::OrcDashboard;
         }
         KeyCode::Char('j') | KeyCode::Down => app.select_next(),
         KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
@@ -203,20 +203,14 @@ fn handle_agent_panel_key(app: &mut App, code: KeyCode) -> Result<()> {
         KeyCode::Char('t') => {
             if app.selected_agent().is_some() {
                 let name = app.agents[app.selected].name.clone();
-                app.mode = AppMode::Input {
-                    prompt_label: format!("tell {}> ", name),
-                    callback: InputCallback::TellAgent,
-                };
+                app.mode = AppMode::TellInput { agent_name: name };
                 app.input_buf.clear();
             }
         }
         KeyCode::Char('/') => {
             if app.selected_agent().is_some() {
                 let name = app.agents[app.selected].name.clone();
-                app.mode = AppMode::Input {
-                    prompt_label: format!("{}> ", name),
-                    callback: InputCallback::DirectSend,
-                };
+                app.mode = AppMode::DirectSendInput { agent_name: name };
                 app.input_buf.clear();
             }
         }
@@ -235,20 +229,16 @@ fn handle_agent_panel_key(app: &mut App, code: KeyCode) -> Result<()> {
 }
 
 fn enter_chat_mode(app: &mut App) {
-    app.mode = AppMode::Input {
-        prompt_label: "> ".to_string(),
-        callback: InputCallback::ChatOrc,
-    };
+    app.mode = AppMode::OrcInput;
     app.input_buf.clear();
 }
 
 fn enter_agent_mode(app: &mut App, idx: usize) {
     if let Some(agent) = app.agents.get(idx) {
         let name = agent.name.clone();
-        app.mode = AppMode::AgentDetail {
+        app.mode = AppMode::AgentInput {
             agent_idx: idx,
             scroll: 0,
-            browsing: false,
         };
         app.agent_input_buf.clear();
         app.agent_input_name = name;
@@ -262,14 +252,13 @@ fn handle_input_key(app: &mut App, code: KeyCode) -> Result<()> {
             if input.is_empty() {
                 return Ok(());
             }
-            let mode = std::mem::replace(&mut app.mode, AppMode::Dashboard);
-            if let AppMode::Input { callback, .. } = mode {
-                match callback {
-                    InputCallback::NewAgent => app.spawn_agent(&input)?,
-                    InputCallback::TellAgent => app.tell_agent(&input)?,
-                    InputCallback::DirectSend => app.direct_send(&input)?,
-                    InputCallback::ChatOrc => app.chat_orc(&input)?,
-                }
+            let mode = std::mem::replace(&mut app.mode, AppMode::OrcDashboard);
+            match mode {
+                AppMode::SpawnInput => app.spawn_agent(&input)?,
+                AppMode::TellInput { .. } => app.tell_agent(&input)?,
+                AppMode::DirectSendInput { .. } => app.direct_send(&input)?,
+                AppMode::OrcInput => app.chat_orc(&input)?,
+                _ => {}
             }
             enter_chat_mode(app);
             Ok(())
@@ -283,100 +272,99 @@ fn handle_input_key(app: &mut App, code: KeyCode) -> Result<()> {
             Ok(())
         }
         KeyCode::Esc => {
-            app.mode = AppMode::Dashboard;
+            app.mode = AppMode::OrcDashboard;
             Ok(())
         }
         _ => Ok(()),
     }
 }
 
-fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
-    let browsing = matches!(app.mode, AppMode::AgentDetail { browsing: true, .. });
+fn handle_agent_browse_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    match code {
+        KeyCode::Esc => {
+            app.mode = AppMode::AgentPanel;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let AppMode::AgentDashboard { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let AppMode::AgentDashboard { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_add(1);
+            }
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let AppMode::AgentDashboard { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_add(10);
+            }
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let AppMode::AgentDashboard { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_sub(10);
+            }
+        }
+        KeyCode::Char('i') | KeyCode::Enter => {
+            if let AppMode::AgentDashboard { agent_idx, scroll } = app.mode {
+                app.mode = AppMode::AgentInput { agent_idx, scroll };
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
-    if browsing {
-        match code {
-            KeyCode::Esc => {
-                app.mode = AppMode::Dashboard;
+fn handle_agent_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    match code {
+        KeyCode::Esc => {
+            app.agent_input_buf.clear();
+            if let AppMode::AgentInput { agent_idx, scroll } = app.mode {
+                app.mode = AppMode::AgentDashboard { agent_idx, scroll };
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                    *scroll = scroll.saturating_sub(1);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                    *scroll = scroll.saturating_add(1);
-                }
-            }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                    *scroll = scroll.saturating_add(10);
-                }
-            }
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                    *scroll = scroll.saturating_sub(10);
-                }
-            }
-            KeyCode::Char('i') | KeyCode::Enter => {
-                if let AppMode::AgentDetail { browsing, .. } = &mut app.mode {
-                    *browsing = false;
-                }
-            }
-            _ => {}
         }
-    } else {
-        match code {
-            KeyCode::Esc => {
-                app.agent_input_buf.clear();
-                if let AppMode::AgentDetail { browsing, .. } = &mut app.mode {
-                    *browsing = true;
-                }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let AppMode::AgentInput { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_add(5);
             }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                    *scroll = scroll.saturating_add(5);
-                }
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let AppMode::AgentInput { scroll, .. } = &mut app.mode {
+                *scroll = scroll.saturating_sub(5);
             }
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
-                    *scroll = scroll.saturating_sub(5);
-                }
-            }
-            KeyCode::Enter => {
-                if !app.agent_input_buf.is_empty() {
-                    let input = app.agent_input_buf.clone();
-                    if let AppMode::AgentDetail { agent_idx, .. } = &app.mode {
-                        let idx = *agent_idx;
-                        let agent_name = app.agents.get(idx).map(|a| a.name.clone());
-                        if let Some(agent) = app.agents.get_mut(idx) {
-                            if let Some(ref mut proc) = agent.process {
-                                proc.send(&input).ok();
-                            }
-                            agent.output.push_user_input(&input);
-                            agent.prune_after_orc_prompt = None;
+        }
+        KeyCode::Enter => {
+            if !app.agent_input_buf.is_empty() {
+                let input = app.agent_input_buf.clone();
+                if let AppMode::AgentInput { agent_idx, .. } = &app.mode {
+                    let idx = *agent_idx;
+                    let agent_name = app.agents.get(idx).map(|a| a.name.clone());
+                    if let Some(agent) = app.agents.get_mut(idx) {
+                        if let Some(ref mut proc) = agent.process {
+                            proc.send(&input).ok();
                         }
-                        if let Some(name) = agent_name {
-                            app.set_status(format!("sent to {}", name));
-                        }
+                        agent.output.push_user_input(&input);
+                        agent.prune_after_orc_prompt = None;
                     }
-                    app.agent_input_buf.clear();
+                    if let Some(name) = agent_name {
+                        app.set_status(format!("sent to {}", name));
+                    }
                 }
+                app.agent_input_buf.clear();
             }
-            KeyCode::Char(c) => {
-                app.agent_input_buf.push(c);
-            }
-            KeyCode::Backspace => {
-                app.agent_input_buf.pop();
-            }
-            _ => {}
         }
+        KeyCode::Char(c) => {
+            app.agent_input_buf.push(c);
+        }
+        KeyCode::Backspace => {
+            app.agent_input_buf.pop();
+        }
+        _ => {}
     }
     Ok(())
 }
 
 fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
-    let mode = std::mem::replace(&mut app.mode, AppMode::Dashboard);
+    let mode = std::mem::replace(&mut app.mode, AppMode::OrcDashboard);
     if let AppMode::Confirm { callback, .. } = mode {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => match callback {
