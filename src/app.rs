@@ -10,10 +10,10 @@ pub enum AppMode {
         prompt_label: String,
         callback: InputCallback,
     },
-    Status,
     AgentDetail {
         agent_idx: usize,
         scroll: usize,
+        browsing: bool,
     },
     Help,
     Confirm {
@@ -184,7 +184,6 @@ pub struct App {
     pub orc_session_id: Option<String>,
     pub show_preview: bool,
     pub scroll_offset: usize,
-    pub status_selected: usize,
     pub agent_input_buf: String,
     pub agent_input_name: String,
 }
@@ -210,7 +209,6 @@ impl App {
             orc_session_id: None,
             show_preview: true,
             scroll_offset: 0,
-            status_selected: 0,
             agent_input_buf: String::new(),
             agent_input_name: String::new(),
         }

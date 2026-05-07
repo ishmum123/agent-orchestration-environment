@@ -18,9 +18,8 @@ pub fn render(f: &mut Frame, app: &App) {
             render_dashboard(f, app);
             render_confirm_overlay(f, message);
         }
-        AppMode::Status => render_status(f, app),
-        AppMode::AgentDetail { agent_idx, scroll } => {
-            render_agent_detail(f, app, *agent_idx, *scroll);
+        AppMode::AgentDetail { agent_idx, scroll, browsing } => {
+            render_agent_detail(f, app, *agent_idx, *scroll, *browsing);
         }
         _ => render_dashboard(f, app),
     }
@@ -136,16 +135,19 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let max_entries = (area.height as usize) + app.scroll_offset;
-    let end = app.orc_output.len().saturating_sub(app.scroll_offset);
-    let start = end.saturating_sub(max_entries);
-    let visible = &app.orc_output[start..end];
-
-    let lines: Vec<Line> = visible.iter()
+    // Render all entries into lines, then show the tail (adjusted by scroll_offset)
+    let all_lines: Vec<Line> = app.orc_output.iter()
         .flat_map(|entry| style_output_entry(entry))
         .collect();
 
-    let output = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = area.height as usize;
+    let total = all_lines.len();
+    // scroll_offset=0 means show the bottom; higher values scroll up
+    let end = total.saturating_sub(app.scroll_offset);
+    let start = end.saturating_sub(height);
+    let visible: Vec<Line> = all_lines.into_iter().skip(start).take(end - start).collect();
+
+    let output = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(output, area);
 }
 
@@ -281,101 +283,6 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_status(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " status",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {} agents", app.agents.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
-    f.render_widget(header, chunks[0]);
-
-    if app.agents.is_empty() {
-        let msg = Paragraph::new(Line::styled(
-            " no agents",
-            Style::default().fg(Color::DarkGray),
-        ));
-        f.render_widget(msg, chunks[1]);
-    } else {
-        let items: Vec<ListItem> = app.agents.iter()
-            .enumerate()
-            .map(|(i, agent)| {
-                let is_selected = i == app.status_selected;
-                let marker = if is_selected { "\u{25b8}" } else { " " };
-                let name_style = if is_selected {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-
-                let mut lines = vec![
-                    Line::from(vec![
-                        Span::styled(
-                            format!(" {} ", marker),
-                            if is_selected { Style::default().fg(Color::White) }
-                            else { Style::default().fg(Color::DarkGray) },
-                        ),
-                        Span::styled(format!("{} ", agent.state.icon()), Style::default().fg(agent.state.color())),
-                        Span::styled(&agent.name, name_style),
-                        Span::styled(format!("  [{}]", agent.state.label()), Style::default().fg(agent.state.color())),
-                        Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("     {}", truncate(&agent.task_description, 60)),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]),
-                ];
-
-                // Show recent output entries
-                for entry in agent.output.recent(3) {
-                    let (prefix, text, color) = match entry {
-                        OutputEntry::Text(t) => ("\u{2502} ", truncate(t, 70), Color::Gray),
-                        OutputEntry::ToolUse { name, .. } => ("\u{2502} ", format!("[{}]", name), Color::Cyan),
-                        OutputEntry::Result { text, is_error } => {
-                            ("\u{2502} ", truncate(text, 70), if *is_error { Color::Red } else { Color::Green })
-                        }
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("     {}{}", prefix, text), Style::default().fg(color)),
-                    ]));
-                }
-
-                lines.push(Line::from(""));
-                ListItem::new(lines)
-            })
-            .collect();
-
-        let list = List::new(items);
-        f.render_widget(list, chunks[1]);
-    }
-
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" j/k", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("enter", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" full output  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("esc", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" back", Style::default().fg(Color::DarkGray)),
-    ]));
-    f.render_widget(hint, chunks[2]);
-}
-
 fn agent_input_height(app: &App) -> u16 {
     let buf = &app.agent_input_buf;
     if buf.is_empty() {
@@ -385,7 +292,7 @@ fn agent_input_height(app: &App) -> u16 {
     (1 + line_count).min(10).max(2)
 }
 
-fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize) {
+fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize, browsing: bool) {
     let agent = match app.agents.get(agent_idx) {
         Some(a) => a,
         None => return,
@@ -402,6 +309,8 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         .split(f.area());
 
     // Header
+    let mode_label = if browsing { " BROWSE " } else { " INPUT " };
+    let mode_color = if browsing { Color::Cyan } else { Color::Green };
     let header_lines = vec![
         Line::from(vec![
             Span::styled(
@@ -410,6 +319,7 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
             ),
             Span::styled(format!("[{}]", agent.state.label()), Style::default().fg(agent.state.color())),
             Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {}", mode_label), Style::default().fg(Color::Black).bg(mode_color)),
         ]),
         Line::from(vec![
             Span::styled(format!(" {}", agent.task_description), Style::default().fg(Color::DarkGray)),
@@ -451,23 +361,30 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         ..input_area
     };
 
-    let prompt = format!("{}> ", agent.name);
-    let buf_lines: Vec<&str> = if app.agent_input_buf.is_empty() {
-        vec![""]
-    } else {
-        app.agent_input_buf.lines().collect()
-    };
-
     let mut display_lines: Vec<Line> = Vec::new();
-    for (i, line) in buf_lines.iter().enumerate() {
-        let prefix = if i == 0 { format!(" {}", prompt) } else { " .. ".to_string() };
-        let is_last = i == buf_lines.len() - 1;
-        let text = if is_last {
-            format!("{}{}\u{2588}", prefix, line)
+    if browsing {
+        display_lines.push(Line::from(Span::styled(
+            " j/k scroll  Ctrl+U/D page  i or Enter → input  Esc → back",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let prompt = format!("{}> ", agent.name);
+        let buf_lines: Vec<&str> = if app.agent_input_buf.is_empty() {
+            vec![""]
         } else {
-            format!("{}{}", prefix, line)
+            app.agent_input_buf.lines().collect()
         };
-        display_lines.push(Line::from(text));
+
+        for (i, line) in buf_lines.iter().enumerate() {
+            let prefix = if i == 0 { format!(" {}", prompt) } else { " .. ".to_string() };
+            let is_last = i == buf_lines.len() - 1;
+            let text = if is_last {
+                format!("{}{}\u{2588}", prefix, line)
+            } else {
+                format!("{}{}", prefix, line)
+            };
+            display_lines.push(Line::from(text));
+        }
     }
 
     let input = Paragraph::new(display_lines)
@@ -495,7 +412,6 @@ fn render_help_overlay(f: &mut Frame) {
         help_line("/", "send directly to agent"),
         help_line("e", "edit changed files ($EDITOR)"),
         help_line("x", "kill agent"),
-        help_line("s", "status overview"),
         Line::from(""),
         help_line("j / k", "navigate agents"),
         help_line("enter", "agent full output"),
@@ -542,12 +458,28 @@ fn render_confirm_overlay(f: &mut Frame, message: &str) {
 fn style_output_entry(entry: &OutputEntry) -> Vec<Line<'static>> {
     match entry {
         OutputEntry::Text(text) => {
-            text.lines().map(|line| {
-                Line::from(Span::styled(
-                    format!(" {}", line),
-                    Style::default().fg(Color::Rgb(180, 180, 195)),
-                ))
-            }).collect()
+            let mut lines = Vec::new();
+            let mut in_code_block = false;
+            for line in text.lines() {
+                if line.trim_start().starts_with("```") {
+                    in_code_block = !in_code_block;
+                    continue;
+                }
+                if in_code_block {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(Color::Rgb(140, 170, 140)).add_modifier(Modifier::DIM),
+                    )));
+                } else if is_table_separator(line) {
+                    // Skip |---|---| lines
+                    continue;
+                } else if is_table_row(line) {
+                    lines.push(style_table_row(line));
+                } else {
+                    lines.push(style_markdown_line(line));
+                }
+            }
+            lines
         }
         OutputEntry::ToolUse { name, input } => {
             let summary = truncate(input, 60);
@@ -569,7 +501,148 @@ fn style_output_entry(entry: &OutputEntry) -> Vec<Line<'static>> {
                 ))
             }).collect()
         }
+        OutputEntry::UserInput(text) => {
+            text.lines().map(|line| {
+                Line::from(Span::styled(
+                    format!(" \u{25b8} {}", line),
+                    Style::default().fg(Color::Yellow),
+                ))
+            }).collect()
+        }
     }
+}
+
+/// Parse a single line of markdown into styled spans.
+fn style_markdown_line(line: &str) -> Line<'static> {
+    // Headers
+    if let Some(rest) = line.strip_prefix("### ") {
+        return Line::from(Span::styled(
+            format!(" {}", rest),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(rest) = line.strip_prefix("## ") {
+        return Line::from(Span::styled(
+            format!(" {}", rest),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(rest) = line.strip_prefix("# ") {
+        return Line::from(Span::styled(
+            format!(" {}", rest),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+    }
+
+    // List items: keep the bullet/dash
+    let (prefix, content) = if line.starts_with("- ") || line.starts_with("* ") {
+        (" \u{2022} ".to_string(), &line[2..])
+    } else if line.starts_with("  - ") || line.starts_with("  * ") {
+        ("   \u{2022} ".to_string(), &line[4..])
+    } else {
+        (" ".to_string(), line)
+    };
+
+    // Parse inline formatting: **bold**, `code`
+    let spans = parse_inline_markdown(content);
+    let mut result = vec![Span::styled(prefix, Style::default().fg(Color::Rgb(180, 180, 195)))];
+    result.extend(spans);
+    Line::from(result)
+}
+
+/// Parse inline **bold** and `code` spans from text.
+fn parse_inline_markdown(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        // Find the next marker
+        let bold_pos = remaining.find("**");
+        let code_pos = remaining.find('`');
+
+        let next = match (bold_pos, code_pos) {
+            (Some(b), Some(c)) => {
+                if b <= c { Some(("**", b)) } else { Some(("`", c)) }
+            }
+            (Some(b), None) => Some(("**", b)),
+            (None, Some(c)) => Some(("`", c)),
+            (None, None) => None,
+        };
+
+        match next {
+            Some((marker, pos)) => {
+                // Text before the marker
+                if pos > 0 {
+                    spans.push(Span::styled(
+                        remaining[..pos].to_string(),
+                        Style::default().fg(Color::Rgb(180, 180, 195)),
+                    ));
+                }
+                let after_open = &remaining[pos + marker.len()..];
+                if let Some(end) = after_open.find(marker) {
+                    let content = &after_open[..end];
+                    let style = if marker == "**" {
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(140, 170, 140))
+                    };
+                    spans.push(Span::styled(content.to_string(), style));
+                    remaining = &after_open[end + marker.len()..];
+                } else {
+                    // No closing marker, treat as plain text
+                    spans.push(Span::styled(
+                        remaining[pos..pos + marker.len()].to_string(),
+                        Style::default().fg(Color::Rgb(180, 180, 195)),
+                    ));
+                    remaining = after_open;
+                }
+            }
+            None => {
+                spans.push(Span::styled(
+                    remaining.to_string(),
+                    Style::default().fg(Color::Rgb(180, 180, 195)),
+                ));
+                break;
+            }
+        }
+    }
+
+    spans
+}
+
+/// Check if a line is a table separator (e.g. |---|---|)
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && trimmed.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+/// Check if a line is a table row (e.g. | foo | bar |)
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2
+}
+
+/// Render a table row with cells separated by dim pipes.
+fn style_table_row(line: &str) -> Line<'static> {
+    let trimmed = line.trim();
+    // Strip outer pipes and split into cells
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let cells: Vec<&str> = inner.split('|').map(|c| c.trim()).collect();
+
+    let mut spans = vec![Span::styled(" ", Style::default())];
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                " \u{2502} ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        // Apply inline markdown within cells
+        spans.extend(parse_inline_markdown(cell));
+    }
+    Line::from(spans)
 }
 
 fn help_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {

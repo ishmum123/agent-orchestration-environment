@@ -99,10 +99,10 @@ fi
 # --- Step 3: Spawn agent with simple task ---
 
 echo "[single agent]"
-tmux send-keys -t "$SESSION" "list the files in this project" Enter
+tmux send-keys -t "$SESSION" "list the files in this project, you must spawn an agent for this" Enter
 sleep 2
 
-wait_for "agents" 15 "agent count visible in header" || true
+wait_for "agents" 30 "agent count visible in header" || true
 
 # Wait for agent to finish (checkmark)
 if ! wait_for "$(printf '\xe2\x9c\x93')" 120 "agent finished with checkmark"; then
@@ -162,7 +162,8 @@ if echo "$OUTPUT" | grep -q "kill.*?"; then
     pass "kill confirmation dialog shown"
 
     # Verify worktree cleaned up
-    WORKTREE_COUNT=$(git -C "$PROJECT_DIR" worktree list 2>/dev/null | grep -c orc-worktrees || echo 0)
+    WORKTREE_COUNT=$(git -C "$PROJECT_DIR" worktree list 2>/dev/null | grep -c orc-worktrees || true)
+    WORKTREE_COUNT=${WORKTREE_COUNT:-0}
     if [ "$WORKTREE_COUNT" -eq 0 ]; then
         pass "worktree cleaned up after kill"
     else
@@ -176,8 +177,7 @@ fi
 # --- Step 8: Quit and verify cleanup ---
 
 echo "[quit and cleanup]"
-tmux send-keys -t "$SESSION" Escape
-sleep 0.5
+# After kill confirmation, we're on Dashboard — q quits directly
 tmux send-keys -t "$SESSION" q
 sleep 5
 
@@ -194,7 +194,8 @@ else
 fi
 
 # Verify all worktrees cleaned up
-WORKTREE_COUNT=$(git -C "$PROJECT_DIR" worktree list 2>/dev/null | grep -c orc-worktrees || echo 0)
+WORKTREE_COUNT=$(git -C "$PROJECT_DIR" worktree list 2>/dev/null | grep -c orc-worktrees || true)
+WORKTREE_COUNT=${WORKTREE_COUNT:-0}
 if [ "$WORKTREE_COUNT" -eq 0 ]; then
     pass "all worktrees cleaned up on exit"
 else

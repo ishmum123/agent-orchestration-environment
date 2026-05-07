@@ -51,6 +51,7 @@ pub enum OutputEntry {
     Text(String),
     ToolUse { name: String, input: String },
     Result { text: String, is_error: bool },
+    UserInput(String),
 }
 
 /// Structured output log, replacing raw terminal capture.
@@ -79,6 +80,10 @@ impl OutputLog {
             text: text.to_string(),
             is_error,
         });
+    }
+
+    pub fn push_user_input(&mut self, text: &str) {
+        self.entries.push(OutputEntry::UserInput(text.to_string()));
     }
 
     pub fn last_text(&self) -> Option<&str> {
