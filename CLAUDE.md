@@ -15,12 +15,12 @@ cargo test             # run tests
 ## Architecture
 
 - `src/main.rs` — CLI entry, terminal setup, event loop, keybind handlers
-- `src/app.rs` — App state machine (Dashboard/Input/Attached/Status modes)
+- `src/app.rs` — App state machine (Dashboard/Input/Attached/Status/AgentDetail/Help/Confirm modes)
 - `src/tmux.rs` — tmux session/pane management (create, kill, send-keys, capture-pane)
 - `src/worktree.rs` — git worktree creation/removal for agent isolation
-- `src/agent.rs` — Agent struct, AgentState enum, heuristic state detection
+- `src/agent.rs` — Agent struct, AgentState enum, heuristic state detection, slug auto-naming
 - `src/orc.rs` — Orchestrator CLAUDE.md generation and spawning
-- `src/ui.rs` — Ratatui dashboard rendering
+- `src/ui.rs` — Ratatui split-pane dashboard, status view, agent detail, help/confirm overlays
 
 ## Conventions
 

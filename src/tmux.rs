@@ -25,9 +25,21 @@ impl TmuxSession {
         }
     }
 
+    /// Create session with default shell
     pub fn create(&self) -> Result<()> {
         Command::new("tmux")
             .args(["new-session", "-d", "-s", &self.name, "-x", "200", "-y", "50"])
+            .status()
+            .context(format!("failed to create tmux session '{}'", self.name))?
+            .success()
+            .then_some(())
+            .context(format!("tmux new-session failed for '{}'", self.name))
+    }
+
+    /// Create session with a specific command in pane 0 (no shell)
+    pub fn create_with_cmd(&self, cmd: &str) -> Result<()> {
+        Command::new("tmux")
+            .args(["new-session", "-d", "-s", &self.name, "-x", "200", "-y", "50", cmd])
             .status()
             .context(format!("failed to create tmux session '{}'", self.name))?
             .success()
