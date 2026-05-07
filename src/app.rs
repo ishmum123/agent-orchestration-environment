@@ -217,12 +217,16 @@ impl App {
                                 }
                             }
                         }
-                        StreamEvent::Result { result, is_error, .. } => {
-                            if let Some(text) = result {
-                                self.orc_output.push(OutputEntry::Result {
-                                    text: text.clone(),
-                                    is_error: *is_error,
-                                });
+                        StreamEvent::Result { is_error, .. } => {
+                            // Don't push result text — it duplicates the assistant text
+                            // already streamed. Only track errors.
+                            if *is_error {
+                                if let StreamEvent::Result { result: Some(text), .. } = &event {
+                                    self.orc_output.push(OutputEntry::Result {
+                                        text: text.clone(),
+                                        is_error: true,
+                                    });
+                                }
                             }
                         }
                         StreamEvent::Other => {}
