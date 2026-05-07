@@ -6,6 +6,7 @@ use std::time::Instant;
 /// Dashboard interaction modes
 pub enum AppMode {
     Dashboard,
+    AgentPanel,
     Input {
         prompt_label: String,
         callback: InputCallback,
@@ -186,6 +187,7 @@ pub struct App {
     pub scroll_offset: usize,
     pub agent_input_buf: String,
     pub agent_input_name: String,
+    pub orc_prompt_count: u64,
 }
 
 impl App {
@@ -211,6 +213,7 @@ impl App {
             scroll_offset: 0,
             agent_input_buf: String::new(),
             agent_input_name: String::new(),
+            orc_prompt_count: 0,
         }
     }
 
@@ -397,6 +400,9 @@ fn drain_agent_events(agent: &mut Agent) {
                                 agent.output.push_result(text, false);
                             }
                         }
+                        if agent.done_at.is_none() {
+                            agent.done_at = Some(Instant::now());
+                        }
                     }
                     StreamEvent::Other => {}
                 }
@@ -409,6 +415,9 @@ fn drain_agent_events(agent: &mut Agent) {
     if !proc.is_alive() && agent.state == AgentState::Working {
         agent.state = AgentState::Error;
         agent.output.push_result("process exited unexpectedly", true);
+        if agent.done_at.is_none() {
+            agent.done_at = Some(Instant::now());
+        }
     }
 }
 

@@ -150,8 +150,10 @@ fi
 # --- Step 7: Kill agent ---
 
 echo "[kill agent]"
-# Go to dashboard mode, select agent, kill it
+# Go to dashboard, then agent panel, then kill
 tmux send-keys -t "$SESSION" Escape
+sleep 0.5
+tmux send-keys -t "$SESSION" a
 sleep 0.5
 tmux send-keys -t "$SESSION" x
 sleep 1

@@ -108,6 +108,11 @@ pub struct Agent {
     pub session_id: Option<String>,
     pub created_at: Instant,
     pub cost_usd: f64,
+    /// When the agent finished (Done/Error). Used for pruning.
+    pub done_at: Option<Instant>,
+    /// orc_prompt_count snapshot when this agent became a prune candidate.
+    /// Agent is pruned when orc_prompt_count exceeds this value.
+    pub prune_after_orc_prompt: Option<u64>,
 }
 
 impl Agent {
@@ -128,6 +133,8 @@ impl Agent {
             session_id,
             created_at: Instant::now(),
             cost_usd: 0.0,
+            done_at: None,
+            prune_after_orc_prompt: None,
         }
     }
 
@@ -148,6 +155,8 @@ impl Agent {
             session_id: None,
             created_at: Instant::now(),
             cost_usd: 0.0,
+            done_at: None,
+            prune_after_orc_prompt: None,
         }
     }
 

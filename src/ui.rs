@@ -152,10 +152,11 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    let in_agent_panel = matches!(app.mode, AppMode::AgentPanel);
     let items: Vec<ListItem> = app.agents.iter()
         .enumerate()
         .map(|(i, agent)| {
-            let is_selected = i == app.selected;
+            let is_selected = in_agent_panel && i == app.selected;
             let marker = if is_selected { "\u{25b8}" } else { " " };
 
             let name_style = if is_selected {
@@ -170,7 +171,11 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
                     if is_selected { Style::default().fg(Color::White) }
                     else { Style::default().fg(Color::DarkGray) },
                 ),
-                Span::styled(agent.state.icon(), Style::default().fg(agent.state.color())),
+                if agent.prune_after_orc_prompt.is_some() {
+                    Span::styled("\u{25cc}", Style::default().fg(Color::DarkGray)) // ◌ prune candidate
+                } else {
+                    Span::styled(agent.state.icon(), Style::default().fg(agent.state.color()))
+                },
                 Span::raw(" "),
                 Span::styled(truncate(&agent.name, 12), name_style),
                 Span::styled(
@@ -241,6 +246,7 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(border, chunks[0]);
 
             let has_agents = !app.agents.is_empty();
+            let in_agent_panel = matches!(app.mode, AppMode::AgentPanel);
             let mut hints = vec![
                 Span::styled(" esc", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::styled(" chat  ", Style::default().fg(Color::DarkGray)),
@@ -249,6 +255,13 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
             ];
 
             if has_agents {
+                hints.extend_from_slice(&[
+                    Span::styled("a", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled("gents  ", Style::default().fg(Color::DarkGray)),
+                ]);
+            }
+
+            if in_agent_panel && has_agents {
                 hints.extend_from_slice(&[
                     Span::styled("t", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                     Span::styled("ell  ", Style::default().fg(Color::DarkGray)),
@@ -262,8 +275,6 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
             }
 
             hints.extend_from_slice(&[
-                Span::styled("s", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled("tatus  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("?", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::styled("help  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("q", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -406,17 +417,21 @@ fn render_help_overlay(f: &mut Frame) {
 
     let help_lines = vec![
         Line::from(""),
-        help_line("esc", "back to chat (default mode)"),
+        help_line("esc", "dashboard (from chat/agents)"),
+        help_line("enter / esc", "chat mode"),
+        help_line("j / k", "scroll orc output"),
+        help_line("a", "agents panel"),
         help_line("n", "spawn new agent"),
+        help_line("e", "edit changed files ($EDITOR)"),
+        Line::from(""),
+        Line::from(Span::styled("  agents panel:", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+        help_line("j / k", "navigate agents"),
+        help_line("enter", "open agent detail"),
         help_line("t", "tell agent (via orc)"),
         help_line("/", "send directly to agent"),
-        help_line("e", "edit changed files ($EDITOR)"),
         help_line("x", "kill agent"),
         Line::from(""),
-        help_line("j / k", "navigate agents"),
-        help_line("enter", "agent full output"),
         help_line("ctrl+u / ctrl+d", "scroll output"),
-        Line::from(""),
         help_line("q / ctrl+c", "quit (kills all)"),
         help_line("?", "this help"),
         Line::from(""),

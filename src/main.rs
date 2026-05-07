@@ -1,4 +1,4 @@
-use agent::OutputEntry;
+use agent::{AgentState, OutputEntry};
 use anyhow::{bail, Result};
 use clap::Parser;
 use crossterm::{
@@ -10,7 +10,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
 use std::io;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod agent;
 mod app;
@@ -106,6 +106,9 @@ fn run_loop(
         // Process orc commands from latest output
         process_orc_commands(app)?;
 
+        // Prune dead agents
+        prune_dead_agents(app)?;
+
         terminal.draw(|f| ui::render(f, app))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -119,6 +122,7 @@ fn run_loop(
                             AppMode::Dashboard => {
                                 handle_dashboard_key(app, key.code, key.modifiers)?
                             }
+                            AppMode::AgentPanel => handle_agent_panel_key(app, key.code)?,
                             AppMode::Input { .. } => handle_input_key(app, key.code)?,
                             AppMode::AgentDetail { .. } => handle_detail_key(app, key.code, key.modifiers)?,
                             AppMode::Help => {
@@ -174,6 +178,7 @@ fn process_orc_commands(app: &mut App) -> Result<()> {
                     if let Some(ref mut proc) = agent.process {
                         proc.send(&message).ok();
                         agent.output.push_user_input(&format!("[orc] {}", message));
+                        agent.prune_after_orc_prompt = None;
                         app.set_status(format!("orc told {}", name));
                     }
                 }
@@ -189,6 +194,57 @@ fn process_orc_commands(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+const PRUNE_CANDIDATE_SECS: u64 = 5 * 60;  // 5 minutes after done
+const PRUNE_REMOVE_SECS: u64 = 10 * 60;    // 10 more minutes as candidate
+
+fn prune_dead_agents(app: &mut App) -> Result<()> {
+    let now = Instant::now();
+    let orc_prompts = app.orc_prompt_count;
+    let project_dir = app.project_dir.clone();
+
+    // First pass: mark prune candidates (done for 5+ minutes)
+    for agent in &mut app.agents {
+        if matches!(agent.state, AgentState::Done | AgentState::Error) {
+            if let Some(done_at) = agent.done_at {
+                let elapsed = now.duration_since(done_at).as_secs();
+                if elapsed >= PRUNE_CANDIDATE_SECS && agent.prune_after_orc_prompt.is_none() {
+                    // Becomes prune candidate; record current orc prompt count
+                    agent.prune_after_orc_prompt = Some(orc_prompts);
+                }
+            }
+        }
+    }
+
+    // Second pass: remove agents that have been candidates for 10+ min
+    // AND user has sent at least one orc prompt since they became candidates
+    let mut i = 0;
+    while i < app.agents.len() {
+        let should_prune = {
+            let agent = &app.agents[i];
+            if let (Some(done_at), Some(prune_prompt)) = (agent.done_at, agent.prune_after_orc_prompt) {
+                let elapsed = now.duration_since(done_at).as_secs();
+                elapsed >= PRUNE_CANDIDATE_SECS + PRUNE_REMOVE_SECS && orc_prompts >= prune_prompt + 3
+            } else {
+                false
+            }
+        };
+        if should_prune {
+            let agent = &mut app.agents[i];
+            let name = agent.name.clone();
+            agent.kill();
+            worktree::remove_worktree(&project_dir, &name).ok();
+            app.agents.remove(i);
+            if app.selected >= app.agents.len() && !app.agents.is_empty() {
+                app.selected = app.agents.len() - 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_dashboard_key(
     app: &mut App,
     code: KeyCode,
@@ -197,13 +253,16 @@ fn handle_dashboard_key(
     match code {
         KeyCode::Esc => enter_chat_mode(app),
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-        KeyCode::Enter => {
-            if app.selected_agent().is_some() {
-                enter_agent_mode(app, app.selected);
-            } else {
-                enter_chat_mode(app);
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.scroll_offset = app.scroll_offset.saturating_add(1);
+        }
+        KeyCode::Enter => enter_chat_mode(app),
+        KeyCode::Char('a') => {
+            if !app.agents.is_empty() {
+                app.mode = AppMode::AgentPanel;
             }
         }
         KeyCode::Char('n') => {
@@ -212,6 +271,35 @@ fn handle_dashboard_key(
                 callback: InputCallback::NewAgent,
             };
             app.input_buf.clear();
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(5);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_offset = app.scroll_offset.saturating_add(5);
+        }
+        KeyCode::Char('e') => open_editor_subprocess(app)?,
+        KeyCode::Char('?') => app.mode = AppMode::Help,
+        KeyCode::Tab => app.show_preview = !app.show_preview,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_agent_panel_key(
+    app: &mut App,
+    code: KeyCode,
+) -> Result<()> {
+    match code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Dashboard;
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+        KeyCode::Enter => {
+            if app.selected_agent().is_some() {
+                enter_agent_mode(app, app.selected);
+            }
         }
         KeyCode::Char('t') => {
             if app.selected_agent().is_some() {
@@ -233,13 +321,6 @@ fn handle_dashboard_key(
                 app.input_buf.clear();
             }
         }
-        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(5);
-        }
-        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_offset = app.scroll_offset.saturating_add(5);
-        }
-        KeyCode::Char('e') => open_editor_subprocess(app)?,
         KeyCode::Char('x') => {
             if app.selected_agent().is_some() {
                 let name = app.agents[app.selected].name.clone();
@@ -249,8 +330,6 @@ fn handle_dashboard_key(
                 };
             }
         }
-        KeyCode::Char('?') => app.mode = AppMode::Help,
-        KeyCode::Tab => app.show_preview = !app.show_preview,
         _ => {}
     }
     Ok(())
@@ -379,6 +458,7 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
                                 proc.send(&input).ok();
                             }
                             agent.output.push_user_input(&input);
+                            agent.prune_after_orc_prompt = None;
                         }
                         if let Some(name) = agent_name {
                             app.set_status(format!("sent to {}", name));
@@ -416,6 +496,7 @@ fn chat_orc(app: &mut App, message: &str) -> Result<()> {
     if let Some(ref mut orc) = app.orc {
         orc.send(message)?;
         app.orc_output.push(OutputEntry::UserInput(message.to_string()));
+        app.orc_prompt_count += 1;
         app.set_status("sent to orc".to_string());
     }
     Ok(())
@@ -500,6 +581,7 @@ fn direct_send(app: &mut App, message: &str) -> Result<()> {
             proc.send(message)?;
         }
         agent.output.push_user_input(message);
+        agent.prune_after_orc_prompt = None;
     }
     if let Some(name) = agent_name {
         app.set_status(format!("sent to {}", name));
