@@ -1,3 +1,4 @@
+use crate::agent::OutputEntry;
 use crate::app::{App, AppMode};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -27,11 +28,10 @@ pub fn render(f: &mut Frame, app: &App) {
 
 fn input_height(app: &App, width: u16) -> u16 {
     if !matches!(app.mode, AppMode::Input { .. }) {
-        return 3; // hints + status
+        return 3;
     }
     let line_count = app.input_buf.lines().count().max(1) as u16;
-    // Also account for wrapping within the available width
-    let prompt_len = 3u16; // "> " + cursor
+    let prompt_len = 3u16;
     let content_width = (width as usize).saturating_sub(prompt_len as usize + 1);
     let wrap_lines = if content_width > 0 {
         app.input_buf.lines()
@@ -41,7 +41,6 @@ fn input_height(app: &App, width: u16) -> u16 {
     } else {
         line_count
     };
-    // 1 for border + lines for content, capped at 10
     (1 + wrap_lines).min(10).max(2)
 }
 
@@ -50,16 +49,15 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // header
-            Constraint::Min(5),    // main area
-            Constraint::Length(bottom_h), // bottom bar (dynamic)
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(bottom_h),
         ])
         .split(f.area());
 
     render_header(f, app, chunks[0]);
 
     if !app.agents.is_empty() {
-        // Orc conversation (left) + agent sidebar (right)
         let main = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -71,7 +69,6 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         render_orc_output(f, app, main[0]);
         render_agent_sidebar(f, app, main[1]);
     } else {
-        // Full-width orc conversation
         render_orc_output(f, app, chunks[1]);
     }
 
@@ -79,19 +76,13 @@ fn render_dashboard(f: &mut Frame, app: &App) {
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let working = app
-        .agents
-        .iter()
+    let working = app.agents.iter()
         .filter(|a| matches!(a.state, crate::agent::AgentState::Working))
         .count();
-    let waiting = app
-        .agents
-        .iter()
+    let waiting = app.agents.iter()
         .filter(|a| matches!(a.state, crate::agent::AgentState::WaitingForUser))
         .count();
-    let stuck = app
-        .agents
-        .iter()
+    let errors = app.agents.iter()
         .filter(|a| matches!(a.state, crate::agent::AgentState::Error))
         .count();
 
@@ -118,23 +109,28 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    if stuck > 0 {
+    if errors > 0 {
         parts.push(Span::styled(
-            format!("  \u{2717} {}", stuck),
+            format!("  \u{2717} {}", errors),
             Style::default().fg(Color::Red),
+        ));
+    }
+
+    let total_cost: f64 = app.agents.iter().map(|a| a.cost_usd).sum();
+    if total_cost > 0.001 {
+        parts.push(Span::styled(
+            format!("  ${:.2}", total_cost),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 
     let header = Paragraph::new(Line::from(parts))
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
-
     f.render_widget(header, area);
 }
 
 fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
-    let output = &app.orc_output;
-
-    if output.is_empty() {
+    if app.orc_output.is_empty() {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -147,43 +143,25 @@ fn render_orc_output(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    use crate::agent::OutputEntry;
-    let combined: String = output.iter().map(|e| match e {
-        OutputEntry::Text(t) => t.clone(),
-        OutputEntry::ToolUse { name, input } => format!("[tool: {}] {}", name, input),
-        OutputEntry::Result { text, .. } => text.clone(),
-    }).collect::<Vec<_>>().join("\n");
+    let max_entries = (area.height as usize) + app.scroll_offset;
+    let end = app.orc_output.len().saturating_sub(app.scroll_offset);
+    let start = end.saturating_sub(max_entries);
+    let visible = &app.orc_output[start..end];
 
-    let all_lines: Vec<&str> = combined.lines().collect();
-    let content_lines = strip_claude_chrome(&all_lines);
-
-    let visible_lines: Vec<Line> = content_lines
-        .into_iter()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(area.height as usize + app.scroll_offset)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .skip(app.scroll_offset)
-        .map(|line| style_orc_line(line))
+    let lines: Vec<Line> = visible.iter()
+        .flat_map(|entry| style_output_entry(entry))
         .collect();
 
-    let output_widget = Paragraph::new(visible_lines)
-        .wrap(Wrap { trim: false });
-    f.render_widget(output_widget, area);
+    let output = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(output, area);
 }
 
 fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .agents
-        .iter()
+    let items: Vec<ListItem> = app.agents.iter()
         .enumerate()
         .map(|(i, agent)| {
             let is_selected = i == app.selected;
-            let state_icon = agent.state.icon();
-            let state_color = agent.state.color();
-            let elapsed = agent.elapsed_display();
+            let marker = if is_selected { "\u{25b8}" } else { " " };
 
             let name_style = if is_selected {
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
@@ -191,31 +169,22 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Gray)
             };
 
-            let marker = if is_selected { "\u{25b8}" } else { " " };
-
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(
                     format!("{} ", marker),
-                    if is_selected {
-                        Style::default().fg(Color::White)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
+                    if is_selected { Style::default().fg(Color::White) }
+                    else { Style::default().fg(Color::DarkGray) },
                 ),
-                Span::styled(state_icon, Style::default().fg(state_color)),
+                Span::styled(agent.state.icon(), Style::default().fg(agent.state.color())),
                 Span::raw(" "),
+                Span::styled(truncate(&agent.name, 12), name_style),
                 Span::styled(
-                    truncate(&agent.name, 12),
-                    name_style,
-                ),
-                Span::styled(
-                    format!(" {:>3}", elapsed),
+                    format!(" {:>3}", agent.elapsed_display()),
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
 
-            let line = Line::from(spans);
-            ListItem::new(line)
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -230,15 +199,9 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
 fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
     match &app.mode {
         AppMode::Input { prompt_label, .. } => {
-            let input_area = Rect {
-                y: area.y,
-                height: area.height,
-                ..area
-            };
-
             let border = Paragraph::new("")
                 .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
-            f.render_widget(border, Rect { height: 1, ..input_area });
+            f.render_widget(border, Rect { height: 1, ..area });
 
             let text_area = Rect {
                 y: area.y + 1,
@@ -246,7 +209,6 @@ fn render_bottom(f: &mut Frame, app: &App, area: Rect) {
                 ..area
             };
 
-            // Build multi-line display
             let buf_lines: Vec<&str> = if app.input_buf.is_empty() {
                 vec![""]
             } else {
@@ -356,24 +318,10 @@ fn render_status(f: &mut Frame, app: &App) {
         ));
         f.render_widget(msg, chunks[1]);
     } else {
-        let items: Vec<ListItem> = app
-            .agents
-            .iter()
+        let items: Vec<ListItem> = app.agents.iter()
             .enumerate()
             .map(|(i, agent)| {
                 let is_selected = i == app.status_selected;
-                let last_text = agent.output.last_text().unwrap_or("").to_string();
-                let output_lines: Vec<String> = {
-                    let mut v: Vec<&str> = last_text
-                        .lines()
-                        .rev()
-                        .filter(|l| !l.trim().is_empty())
-                        .take(5)
-                        .collect();
-                    v.reverse();
-                    v.iter().map(|s| s.to_string()).collect()
-                };
-
                 let marker = if is_selected { "\u{25b8}" } else { " " };
                 let name_style = if is_selected {
                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
@@ -385,28 +333,14 @@ fn render_status(f: &mut Frame, app: &App) {
                     Line::from(vec![
                         Span::styled(
                             format!(" {} ", marker),
-                            if is_selected {
-                                Style::default().fg(Color::White)
-                            } else {
-                                Style::default().fg(Color::DarkGray)
-                            },
+                            if is_selected { Style::default().fg(Color::White) }
+                            else { Style::default().fg(Color::DarkGray) },
                         ),
-                        Span::styled(
-                            format!("{} ", agent.state.icon()),
-                            Style::default().fg(agent.state.color()),
-                        ),
-                        Span::styled(
-                            &agent.name,
-                            name_style,
-                        ),
-                        Span::styled(
-                            format!("  [{}]", agent.state.label()),
-                            Style::default().fg(agent.state.color()),
-                        ),
-                        Span::styled(
-                            format!("  {}", agent.elapsed_display()),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(format!("{} ", agent.state.icon()), Style::default().fg(agent.state.color())),
+                        Span::styled(&agent.name, name_style),
+                        Span::styled(format!("  [{}]", agent.state.label()), Style::default().fg(agent.state.color())),
+                        Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("  ${:.2}", agent.cost_usd), Style::default().fg(Color::DarkGray)),
                     ]),
                     Line::from(vec![
                         Span::styled(
@@ -416,17 +350,21 @@ fn render_status(f: &mut Frame, app: &App) {
                     ]),
                 ];
 
-                for ol in &output_lines {
+                // Show recent output entries
+                for entry in agent.output.recent(3) {
+                    let (prefix, text, color) = match entry {
+                        OutputEntry::Text(t) => ("\u{2502} ", truncate(t, 70), Color::Gray),
+                        OutputEntry::ToolUse { name, .. } => ("\u{2502} ", format!("[{}]", name), Color::Cyan),
+                        OutputEntry::Result { text, is_error } => {
+                            ("\u{2502} ", truncate(text, 70), if *is_error { Color::Red } else { Color::Green })
+                        }
+                    };
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("     \u{2502} {}", truncate(ol, 70)),
-                            Style::default().fg(Color::Gray),
-                        ),
+                        Span::styled(format!("     {}{}", prefix, text), Style::default().fg(color)),
                     ]));
                 }
 
                 lines.push(Line::from(""));
-
                 ListItem::new(lines)
             })
             .collect();
@@ -446,10 +384,10 @@ fn render_status(f: &mut Frame, app: &App) {
     f.render_widget(hint, chunks[2]);
 }
 
-fn agent_input_height(app: &App, width: u16) -> u16 {
+fn agent_input_height(app: &App) -> u16 {
     let buf = &app.agent_input_buf;
     if buf.is_empty() {
-        return 2; // border + single line
+        return 2;
     }
     let line_count = buf.lines().count().max(1) as u16;
     (1 + line_count).min(10).max(2)
@@ -461,7 +399,7 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         None => return,
     };
 
-    let input_h = agent_input_height(app, f.area().width);
+    let input_h = agent_input_height(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -478,20 +416,12 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
                 format!(" {} ", agent.name),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("[{}]", agent.state.label()),
-                Style::default().fg(agent.state.color()),
-            ),
-            Span::styled(
-                format!("  {}", agent.elapsed_display()),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("[{}]", agent.state.label()), Style::default().fg(agent.state.color())),
+            Span::styled(format!("  {}", agent.elapsed_display()), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  ${:.2}", agent.cost_usd), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!(" {}", agent.task_description),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!(" {}", agent.task_description), Style::default().fg(Color::DarkGray)),
         ]),
     ];
 
@@ -499,25 +429,23 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(header, chunks[0]);
 
-    // Output — strip chrome, style lines
-    let last_text = agent.output.last_text().unwrap_or("").to_string();
-    let all_lines: Vec<&str> = last_text.lines().collect();
-    let content = strip_claude_chrome(&all_lines);
+    // Output
+    let max_entries = (chunks[1].height as usize) * 2 + scroll;
+    let entries = agent.output.recent(max_entries);
+    let all_lines: Vec<Line> = entries.iter()
+        .flat_map(|e| style_output_entry(e))
+        .collect();
 
-    let visible_lines: Vec<Line> = content
-        .into_iter()
+    let visible: Vec<Line> = all_lines.into_iter()
         .rev()
-        .filter(|l| !l.trim().is_empty())
         .take(chunks[1].height as usize + scroll)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .skip(scroll)
-        .map(|line| style_orc_line(line))
         .collect();
 
-    let output = Paragraph::new(visible_lines)
-        .wrap(Wrap { trim: false });
+    let output = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(output, chunks[1]);
 
     // Input box
@@ -541,11 +469,7 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
 
     let mut display_lines: Vec<Line> = Vec::new();
     for (i, line) in buf_lines.iter().enumerate() {
-        let prefix = if i == 0 {
-            format!(" {}", prompt)
-        } else {
-            " .. ".to_string()
-        };
+        let prefix = if i == 0 { format!(" {}", prompt) } else { " .. ".to_string() };
         let is_last = i == buf_lines.len() - 1;
         let text = if is_last {
             format!("{}{}\u{2588}", prefix, line)
@@ -562,7 +486,6 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
 
 fn render_help_overlay(f: &mut Frame) {
     let area = centered_rect(52, 24, f.area());
-
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -585,7 +508,7 @@ fn render_help_overlay(f: &mut Frame) {
         Line::from(""),
         help_line("j / k", "navigate agents"),
         help_line("enter", "agent full output"),
-        help_line("ctrl+u / ctrl+d", "scroll orc output"),
+        help_line("ctrl+u / ctrl+d", "scroll output"),
         Line::from(""),
         help_line("q / ctrl+c", "quit (kills all)"),
         help_line("?", "this help"),
@@ -602,7 +525,6 @@ fn render_help_overlay(f: &mut Frame) {
 
 fn render_confirm_overlay(f: &mut Frame, message: &str) {
     let area = centered_rect(44, 7, f.area());
-
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -611,10 +533,7 @@ fn render_confirm_overlay(f: &mut Frame, message: &str) {
 
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", message),
-            Style::default().fg(Color::White),
-        )),
+        Line::from(Span::styled(format!("  {}", message), Style::default().fg(Color::White))),
         Line::from(""),
         Line::from(vec![
             Span::styled("  y", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -626,6 +545,40 @@ fn render_confirm_overlay(f: &mut Frame, message: &str) {
 
     let confirm = Paragraph::new(lines).block(block);
     f.render_widget(confirm, area);
+}
+
+/// Style an OutputEntry into one or more Lines for display.
+fn style_output_entry(entry: &OutputEntry) -> Vec<Line<'static>> {
+    match entry {
+        OutputEntry::Text(text) => {
+            text.lines().map(|line| {
+                Line::from(Span::styled(
+                    format!(" {}", line),
+                    Style::default().fg(Color::Rgb(180, 180, 195)),
+                ))
+            }).collect()
+        }
+        OutputEntry::ToolUse { name, input } => {
+            let summary = truncate(input, 60);
+            vec![Line::from(vec![
+                Span::styled(
+                    format!(" \u{25b8} {} ", name),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(summary, Style::default().fg(Color::DarkGray)),
+            ])]
+        }
+        OutputEntry::Result { text, is_error } => {
+            let color = if *is_error { Color::Red } else { Color::Green };
+            let icon = if *is_error { "\u{2717}" } else { "\u{2713}" };
+            text.lines().map(|line| {
+                Line::from(Span::styled(
+                    format!(" {} {}", icon, line),
+                    Style::default().fg(color),
+                ))
+            }).collect()
+        }
+    }
 }
 
 fn help_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
@@ -647,124 +600,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
-}
-
-/// Style a line of orc output based on Claude Code conversation structure
-fn style_orc_line(line: &str) -> Line<'static> {
-    let trimmed = line.trim();
-    let owned = format!(" {}", line);
-
-    // User prompt: ❯
-    if trimmed.starts_with('\u{276f}') {
-        let content = trimmed.trim_start_matches('\u{276f}').trim_start().to_string();
-        return Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                "\u{276f} ".to_string(),
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                content,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    }
-
-    // Assistant response marker: ⏺
-    if trimmed.starts_with('\u{23fa}') {
-        let content = trimmed.trim_start_matches('\u{23fa}').trim_start().to_string();
-        return Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                "\u{23fa} ".to_string(),
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::styled(
-                content,
-                Style::default().fg(Color::White),
-            ),
-        ]);
-    }
-
-    // Tool use indicators: ⎿
-    if trimmed.starts_with('\u{23bf}') || trimmed.starts_with('\u{2502}') {
-        return Line::styled(owned, Style::default().fg(Color::DarkGray));
-    }
-
-    // Spinning/status indicators
-    if trimmed.starts_with('\u{2736}')  // ✶
-        || trimmed.starts_with('\u{25d0}') // ◐
-        || trimmed.starts_with('\u{25cf}') // ●
-        || trimmed.contains("Harmonizing")
-        || trimmed.contains("Pontificating")
-        || trimmed.contains("Thinking")
-        || trimmed.contains("Running")
-    {
-        return Line::styled(owned, Style::default().fg(Color::Yellow));
-    }
-
-    // Errors
-    if trimmed.to_lowercase().contains("error") {
-        return Line::styled(owned, Style::default().fg(Color::Red));
-    }
-
-    // Success
-    if trimmed.contains('\u{2713}') || trimmed.to_lowercase().contains("success")
-        || trimmed.to_lowercase().contains("complete")
-    {
-        return Line::styled(owned, Style::default().fg(Color::Green));
-    }
-
-    // Bullets / list items
-    if trimmed.starts_with('-') || trimmed.starts_with('*') || trimmed.starts_with('\u{2022}') {
-        return Line::styled(owned, Style::default().fg(Color::Rgb(200, 200, 220)));
-    }
-
-    // Code/command
-    if trimmed.starts_with("```") || trimmed.starts_with('$') {
-        return Line::styled(owned, Style::default().fg(Color::Cyan));
-    }
-
-    // Default
-    Line::styled(owned, Style::default().fg(Color::Rgb(180, 180, 195)))
-}
-
-/// Strip Claude Code UI chrome from captured pane output.
-/// Uses a hybrid approach: find conversation start by looking for the first real
-/// user prompt (not a "Try" suggestion), then filter remaining chrome lines.
-fn strip_claude_chrome<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
-    // Find first real content: ❯ not followed by Try/suggestion, or ⏺ response
-    let start = lines.iter().position(|l| {
-        let t = l.trim();
-        (t.starts_with('\u{276f}') && !t.contains("Try \"") && !t.contains("Try \u{201c}"))  // ❯ but not suggestion
-            || t.starts_with('\u{23fa}') // ⏺
-    }).unwrap_or(lines.len());
-
-    if start >= lines.len() {
-        return Vec::new();
-    }
-
-    // From start, keep only non-chrome lines
-    lines[start..]
-        .iter()
-        .filter(|l| !is_chrome_line(l))
-        .copied()
-        .collect()
-}
-
-fn is_chrome_line(line: &str) -> bool {
-    let l = line.trim();
-    l.contains("-- INSERT --")
-        || l.contains("-- NORMAL --")
-        || l.contains("Model: ")
-        || l.contains("Ctx Used:")
-        || l.contains("bypass permissions")
-        || l.contains("/effort")
-        || l.contains("native installer")
-        || l.contains("claude install")
-        || (l.starts_with('\u{276f}') && (l.contains("Try \"") || l.contains("Try \u{201c}")))
-        // Separator lines (only box-drawing chars and spaces)
-        || (l.len() > 20 && l.chars().all(|c| "\u{2500}\u{2501}\u{2502}\u{2550}\u{2551} -".contains(c)))
 }
 
 fn truncate(s: &str, max: usize) -> String {
