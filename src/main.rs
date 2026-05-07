@@ -41,7 +41,9 @@ fn main() -> Result<()> {
 
     // Spawn orc brain
     match orc::spawn_orc(&cli.project) {
-        Ok(proc) => {
+        Ok(mut proc) => {
+            // Must send an initial message — stream-json mode produces no output until first input
+            proc.send("Ready. Greet the user briefly.").ok();
             app.orc = Some(proc);
             app.set_status("orc started".to_string());
         }
