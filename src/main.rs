@@ -13,6 +13,7 @@ use std::process::Command;
 use std::time::Duration;
 
 mod agent;
+mod claude;
 mod app;
 mod events;
 mod orc;
