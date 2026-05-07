@@ -1,4 +1,3 @@
-use agent::{AgentState, OutputEntry};
 use anyhow::{bail, Result};
 use clap::Parser;
 use crossterm::{
@@ -10,7 +9,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
 use std::io;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod agent;
 mod app;
@@ -20,7 +19,7 @@ mod orc;
 mod ui;
 mod worktree;
 
-use app::{App, AppMode, ConfirmCallback, InputCallback, OrcCommand};
+use app::{App, AppMode, ConfirmCallback, InputCallback};
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +42,6 @@ fn main() -> Result<()> {
     // Spawn orc brain
     match orc::spawn_orc(&cli.project) {
         Ok(mut proc) => {
-            // Must send an initial message — stream-json mode produces no output until first input
             proc.send("Ready. Greet the user briefly.").ok();
             app.orc = Some(proc);
             app.set_status("orc started".to_string());
@@ -67,15 +65,7 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
-    // Cleanup: kill all agents
-    for agent in &mut app.agents {
-        agent.kill();
-        worktree::remove_worktree(&app.project_dir, &agent.name).ok();
-    }
-    // Kill orc
-    if let Some(ref mut orc) = app.orc {
-        orc.kill();
-    }
+    app.cleanup();
 
     result
 }
@@ -95,7 +85,6 @@ fn run_loop(
                 let msg = if result.is_empty() {
                     format!("Agent \"{}\" {}.", name, status)
                 } else {
-                    // Truncate long results to avoid blowing up context
                     let truncated = if result.len() > 2000 { &result[..2000] } else { result.as_str() };
                     format!("Agent \"{}\" {}. Result:\n{}", name, status, truncated)
                 };
@@ -103,18 +92,14 @@ fn run_loop(
             }
         }
 
-        // Process orc commands from latest output
-        process_orc_commands(app)?;
-
-        // Prune dead agents
-        prune_dead_agents(app)?;
+        app.process_orc_commands()?;
+        app.prune_dead_agents()?;
 
         terminal.draw(|f| ui::render(f, app))?;
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
-                    // Global Ctrl+C handling — works in all modes
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                         app.should_quit = true;
                     } else {
@@ -160,90 +145,7 @@ fn run_loop(
     Ok(())
 }
 
-/// Check latest orc output for [SPAWN_AGENT], [TELL_AGENT], [KILL_AGENT] commands.
-fn process_orc_commands(app: &mut App) -> Result<()> {
-    if app.orc_pending_cmds.is_empty() {
-        return Ok(());
-    }
-
-    // Drain all pending commands (parsed during event ingestion)
-    let cmds: Vec<OrcCommand> = std::mem::take(&mut app.orc_pending_cmds);
-    for cmd in cmds {
-        match cmd {
-            OrcCommand::Spawn { name, task } => {
-                spawn_new_agent_by_name(app, &name, &task)?;
-            }
-            OrcCommand::Tell { name, message } => {
-                if let Some(agent) = app.agents.iter_mut().find(|a| a.name == name) {
-                    if let Some(ref mut proc) = agent.process {
-                        proc.send(&message).ok();
-                        agent.output.push_user_input(&format!("[orc] {}", message));
-                        agent.prune_after_orc_prompt = None;
-                        app.set_status(format!("orc told {}", name));
-                    }
-                }
-            }
-            OrcCommand::Kill { name } => {
-                if let Some(idx) = app.agents.iter().position(|a| a.name == name) {
-                    kill_agent(app, idx)?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-const PRUNE_CANDIDATE_SECS: u64 = 5 * 60;  // 5 minutes after done
-const PRUNE_REMOVE_SECS: u64 = 10 * 60;    // 10 more minutes as candidate
-
-fn prune_dead_agents(app: &mut App) -> Result<()> {
-    let now = Instant::now();
-    let orc_prompts = app.orc_prompt_count;
-    let project_dir = app.project_dir.clone();
-
-    // First pass: mark prune candidates (done for 5+ minutes)
-    for agent in &mut app.agents {
-        if matches!(agent.state, AgentState::Done | AgentState::Error) {
-            if let Some(done_at) = agent.done_at {
-                let elapsed = now.duration_since(done_at).as_secs();
-                if elapsed >= PRUNE_CANDIDATE_SECS && agent.prune_after_orc_prompt.is_none() {
-                    // Becomes prune candidate; record current orc prompt count
-                    agent.prune_after_orc_prompt = Some(orc_prompts);
-                }
-            }
-        }
-    }
-
-    // Second pass: remove agents that have been candidates for 10+ min
-    // AND user has sent at least one orc prompt since they became candidates
-    let mut i = 0;
-    while i < app.agents.len() {
-        let should_prune = {
-            let agent = &app.agents[i];
-            if let (Some(done_at), Some(prune_prompt)) = (agent.done_at, agent.prune_after_orc_prompt) {
-                let elapsed = now.duration_since(done_at).as_secs();
-                elapsed >= PRUNE_CANDIDATE_SECS + PRUNE_REMOVE_SECS && orc_prompts >= prune_prompt + 3
-            } else {
-                false
-            }
-        };
-        if should_prune {
-            let agent = &mut app.agents[i];
-            let name = agent.name.clone();
-            agent.kill();
-            worktree::remove_worktree(&project_dir, &name).ok();
-            app.agents.remove(i);
-            if app.selected >= app.agents.len() && !app.agents.is_empty() {
-                app.selected = app.agents.len() - 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    Ok(())
-}
+// --- Key handlers ---
 
 fn handle_dashboard_key(
     app: &mut App,
@@ -286,10 +188,7 @@ fn handle_dashboard_key(
     Ok(())
 }
 
-fn handle_agent_panel_key(
-    app: &mut App,
-    code: KeyCode,
-) -> Result<()> {
+fn handle_agent_panel_key(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         KeyCode::Esc => {
             app.mode = AppMode::Dashboard;
@@ -366,10 +265,10 @@ fn handle_input_key(app: &mut App, code: KeyCode) -> Result<()> {
             let mode = std::mem::replace(&mut app.mode, AppMode::Dashboard);
             if let AppMode::Input { callback, .. } = mode {
                 match callback {
-                    InputCallback::NewAgent => spawn_new_agent(app, &input)?,
-                    InputCallback::TellAgent => tell_agent(app, &input)?,
-                    InputCallback::DirectSend => direct_send(app, &input)?,
-                    InputCallback::ChatOrc => chat_orc(app, &input)?,
+                    InputCallback::NewAgent => app.spawn_agent(&input)?,
+                    InputCallback::TellAgent => app.tell_agent(&input)?,
+                    InputCallback::DirectSend => app.direct_send(&input)?,
+                    InputCallback::ChatOrc => app.chat_orc(&input)?,
                 }
             }
             enter_chat_mode(app);
@@ -395,7 +294,6 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
     let browsing = matches!(app.mode, AppMode::AgentDetail { browsing: true, .. });
 
     if browsing {
-        // Browse mode: j/k scrolls text, Esc goes back to dashboard
         match code {
             KeyCode::Esc => {
                 app.mode = AppMode::Dashboard;
@@ -421,7 +319,6 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
                 }
             }
             KeyCode::Char('i') | KeyCode::Enter => {
-                // Switch back to input mode
                 if let AppMode::AgentDetail { browsing, .. } = &mut app.mode {
                     *browsing = false;
                 }
@@ -429,7 +326,6 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
             _ => {}
         }
     } else {
-        // Input mode: type to compose, Esc enters browse mode
         match code {
             KeyCode::Esc => {
                 app.agent_input_buf.clear();
@@ -484,128 +380,11 @@ fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
     if let AppMode::Confirm { callback, .. } = mode {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => match callback {
-                ConfirmCallback::KillAgent(idx) => kill_agent(app, idx)?,
+                ConfirmCallback::KillAgent(idx) => app.kill_agent(idx)?,
             },
             _ => {}
         }
     }
-    Ok(())
-}
-
-fn chat_orc(app: &mut App, message: &str) -> Result<()> {
-    if let Some(ref mut orc) = app.orc {
-        orc.send(message)?;
-        app.orc_output.push(OutputEntry::UserInput(message.to_string()));
-        app.orc_prompt_count += 1;
-        app.set_status("sent to orc".to_string());
-    }
-    Ok(())
-}
-
-fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
-    let (name, description) = if let Some((n, d)) = input.split_once(':') {
-        let n = n.trim();
-        let d = d.trim();
-        if !n.is_empty() && !d.is_empty() {
-            (n.to_string(), d.to_string())
-        } else {
-            let slug = agent::slugify_description(input);
-            (dedupe_name(&slug, &app.agents), input.to_string())
-        }
-    } else {
-        let slug = agent::slugify_description(input);
-        (dedupe_name(&slug, &app.agents), input.to_string())
-    };
-
-    spawn_new_agent_by_name(app, &name, &description)?;
-
-    // Notify orc about the new agent
-    if let Some(ref mut orc) = app.orc {
-        let msg = format!(
-            "Agent \"{}\" spawned with task: \"{}\". I'll monitor its progress.",
-            name, description
-        );
-        orc.send(&msg).ok();
-    }
-
-    Ok(())
-}
-
-fn stderr_log_path(agent_name: &str) -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".orc").join("logs").join(format!("{}.stderr", agent_name)))
-}
-
-fn spawn_new_agent_by_name(app: &mut App, name: &str, task: &str) -> Result<()> {
-    let name = dedupe_name(name, &app.agents);
-
-    // Create worktree
-    let worktree_path = worktree::create_worktree(&app.project_dir, &name)?;
-
-    // Spawn Claude Code process
-    let mut args = claude::ClaudeArgs::new()
-        .permission_mode("auto");
-    if let Some(log_path) = stderr_log_path(&name) {
-        args = args.stderr_log(log_path);
-    }
-
-    let mut process = claude::ClaudeProcess::spawn(args, worktree_path.to_str().unwrap())?;
-
-    // Send the task
-    process.send(task)?;
-
-    let agent = agent::Agent::new(name.clone(), task.to_string(), process, worktree_path);
-    app.agents.push(agent);
-    app.set_status(format!("spawned '{}'", name));
-
-    Ok(())
-}
-
-fn tell_agent(app: &mut App, message: &str) -> Result<()> {
-    if let Some(ref mut orc) = app.orc {
-        let agent_name = &app.agents[app.selected].name;
-        let relay_msg = format!(
-            "The user wants to tell agent \"{}\": \"{}\". Enrich this with relevant context and use [TELL_AGENT] to send it.",
-            agent_name, message
-        );
-        orc.send(&relay_msg)?;
-        app.set_status(format!("told {} (via orc)", agent_name));
-    }
-    Ok(())
-}
-
-fn direct_send(app: &mut App, message: &str) -> Result<()> {
-    let selected = app.selected;
-    let agent_name = app.agents.get(selected).map(|a| a.name.clone());
-    if let Some(agent) = app.agents.get_mut(selected) {
-        if let Some(ref mut proc) = agent.process {
-            proc.send(message)?;
-        }
-        agent.output.push_user_input(message);
-        agent.prune_after_orc_prompt = None;
-    }
-    if let Some(name) = agent_name {
-        app.set_status(format!("sent to {}", name));
-    }
-    Ok(())
-}
-
-fn kill_agent(app: &mut App, idx: usize) -> Result<()> {
-    if idx >= app.agents.len() {
-        return Ok(());
-    }
-
-    let agent = &mut app.agents[idx];
-    let name = agent.name.clone();
-
-    agent.kill();
-    worktree::remove_worktree(&app.project_dir, &name).ok();
-
-    app.agents.remove(idx);
-    if app.selected >= app.agents.len() && !app.agents.is_empty() {
-        app.selected = app.agents.len() - 1;
-    }
-
-    app.set_status(format!("killed '{}'", name));
     Ok(())
 }
 
@@ -615,7 +394,10 @@ fn open_editor_subprocess(app: &mut App) -> Result<()> {
         None => return Ok(()),
     };
 
-    let worktree = agent.worktree.to_str().unwrap().to_string();
+    let worktree = match agent.worktree.to_str() {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
 
     let output = Command::new("git")
         .args(["diff", "--name-only", "HEAD"])
@@ -639,7 +421,7 @@ fn open_editor_subprocess(app: &mut App) -> Result<()> {
     let file_args: Vec<String> = files.iter().map(|f| format!("{}/{}", worktree, f)).collect();
 
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
 
     Command::new(&editor)
         .args(&file_args)
@@ -647,23 +429,9 @@ fn open_editor_subprocess(app: &mut App) -> Result<()> {
         .ok();
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
 
     Ok(())
-}
-
-fn dedupe_name(base: &str, agents: &[agent::Agent]) -> String {
-    let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-    if !names.contains(&base) {
-        return base.to_string();
-    }
-    for i in 2..100 {
-        let candidate = format!("{}-{}", base, i);
-        if !names.contains(&candidate.as_str()) {
-            return candidate;
-        }
-    }
-    base.to_string()
 }
 
 fn check_dependencies() -> Result<()> {
@@ -674,7 +442,7 @@ fn check_dependencies() -> Result<()> {
 
     let mut missing = Vec::new();
     for (cmd, reason) in &required {
-        if Command::new("which").arg(cmd).output().map(|o| !o.status.success()).unwrap_or(true) {
+        if Command::new("sh").args(["-c", &format!("command -v {}", cmd)]).output().map(|o| !o.status.success()).unwrap_or(true) {
             missing.push(format!("  {} \u{2014} {}", cmd, reason));
         }
     }
@@ -684,41 +452,4 @@ fn check_dependencies() -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_agent(name: &str) -> agent::Agent {
-        agent::Agent::new_without_process(
-            name.to_string(),
-            "task".to_string(),
-            std::path::PathBuf::from("/tmp"),
-        )
-    }
-
-    #[test]
-    fn test_dedupe_name_no_conflict() {
-        let agents = vec![make_agent("foo")];
-        assert_eq!(dedupe_name("bar", &agents), "bar");
-    }
-
-    #[test]
-    fn test_dedupe_name_conflict() {
-        let agents = vec![make_agent("foo")];
-        assert_eq!(dedupe_name("foo", &agents), "foo-2");
-    }
-
-    #[test]
-    fn test_dedupe_name_multiple_conflicts() {
-        let agents = vec![make_agent("foo"), make_agent("foo-2"), make_agent("foo-3")];
-        assert_eq!(dedupe_name("foo", &agents), "foo-4");
-    }
-
-    #[test]
-    fn test_dedupe_name_empty_agents() {
-        let agents: Vec<agent::Agent> = vec![];
-        assert_eq!(dedupe_name("test", &agents), "test");
-    }
 }

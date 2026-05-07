@@ -26,11 +26,9 @@ pub fn parse_event_line(line: &str) -> Result<StreamEvent> {
 pub struct ClaudeArgs {
     system_prompt: Option<String>,
     model: Option<String>,
-    resume_session: Option<String>,
     tools: Option<String>,
     disallowed_tools: Option<String>,
     permission_mode: Option<String>,
-    add_dir: Option<String>,
     no_mcp: bool,
     stderr_log: Option<PathBuf>,
     extra_args: Vec<String>,
@@ -41,11 +39,9 @@ impl ClaudeArgs {
         Self {
             system_prompt: None,
             model: None,
-            resume_session: None,
             tools: None,
             disallowed_tools: None,
             permission_mode: None,
-            add_dir: None,
             no_mcp: false,
             stderr_log: None,
             extra_args: Vec::new(),
@@ -73,13 +69,9 @@ impl ClaudeArgs {
         self
     }
 
+    #[cfg(test)]
     pub fn model(mut self, model: &str) -> Self {
         self.model = Some(model.to_string());
-        self
-    }
-
-    pub fn resume(mut self, session_id: &str) -> Self {
-        self.resume_session = Some(session_id.to_string());
         self
     }
 
@@ -90,11 +82,6 @@ impl ClaudeArgs {
 
     pub fn permission_mode(mut self, mode: &str) -> Self {
         self.permission_mode = Some(mode.to_string());
-        self
-    }
-
-    pub fn add_dir(mut self, dir: &str) -> Self {
-        self.add_dir = Some(dir.to_string());
         self
     }
 
@@ -116,10 +103,6 @@ impl ClaudeArgs {
             args.push("--model".to_string());
             args.push(model.clone());
         }
-        if let Some(ref session_id) = self.resume_session {
-            args.push("--resume".to_string());
-            args.push(session_id.clone());
-        }
         if let Some(ref tools) = self.tools {
             args.push("--tools".to_string());
             args.push(tools.clone());
@@ -132,10 +115,6 @@ impl ClaudeArgs {
             args.push("--permission-mode".to_string());
             args.push(mode.clone());
         }
-        if let Some(ref dir) = self.add_dir {
-            args.push("--add-dir".to_string());
-            args.push(dir.clone());
-        }
         if self.no_mcp {
             args.push("--strict-mcp-config".to_string());
         }
@@ -147,7 +126,6 @@ impl ClaudeArgs {
 /// A running Claude Code child process with piped stdin/stdout.
 pub struct ClaudeProcess {
     pub child: Child,
-    pub session_id: Option<String>,
     reader: BufReader<std::process::ChildStdout>,
 }
 
@@ -182,14 +160,20 @@ impl ClaudeProcess {
         let fd = stdout.as_raw_fd();
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("fcntl F_GETFL failed on stdout pipe");
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("fcntl F_SETFL failed setting non-blocking");
+            }
         }
 
         let reader = BufReader::new(stdout);
 
         Ok(Self {
             child,
-            session_id: None,
             reader,
         })
     }
@@ -214,11 +198,6 @@ impl ClaudeProcess {
                     return Ok(None);
                 }
                 let event = parse_event_line(trimmed)?;
-                if let StreamEvent::System { subtype, session_id: Some(ref sid), .. } = &event {
-                    if subtype == "init" {
-                        self.session_id = Some(sid.clone());
-                    }
-                }
                 Ok(Some(event))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -292,15 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_args_with_resume() {
-        let args = ClaudeArgs::new()
-            .resume("abc-123")
-            .build();
-        assert!(args.contains(&"--resume".to_string()));
-        assert!(args.contains(&"abc-123".to_string()));
-    }
-
-    #[test]
     fn test_claude_args_with_tools_disabled() {
         let args = ClaudeArgs::new()
             .tools("")
@@ -316,15 +286,6 @@ mod tests {
             .build();
         assert!(args.contains(&"--permission-mode".to_string()));
         assert!(args.contains(&"auto".to_string()));
-    }
-
-    #[test]
-    fn test_claude_args_with_add_dir() {
-        let args = ClaudeArgs::new()
-            .add_dir("/some/path")
-            .build();
-        assert!(args.contains(&"--add-dir".to_string()));
-        assert!(args.contains(&"/some/path".to_string()));
     }
 
     #[test]

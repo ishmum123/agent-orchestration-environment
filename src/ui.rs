@@ -78,9 +78,6 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let working = app.agents.iter()
         .filter(|a| matches!(a.state, crate::agent::AgentState::Working))
         .count();
-    let waiting = app.agents.iter()
-        .filter(|a| matches!(a.state, crate::agent::AgentState::WaitingForUser))
-        .count();
     let errors = app.agents.iter()
         .filter(|a| matches!(a.state, crate::agent::AgentState::Error))
         .count();
@@ -100,12 +97,6 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         parts.push(Span::styled(
             format!("  \u{25cf} {}", working),
             Style::default().fg(Color::Green),
-        ));
-    }
-    if waiting > 0 {
-        parts.push(Span::styled(
-            format!("  \u{25cb} {}", waiting),
-            Style::default().fg(Color::Yellow),
         ));
     }
     if errors > 0 {
@@ -341,21 +332,17 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(header, chunks[0]);
 
-    // Output
-    let max_entries = (chunks[1].height as usize) * 2 + scroll;
-    let entries = agent.output.recent(max_entries);
-    let all_lines: Vec<Line> = entries.iter()
+    // Output — render all entries then window into them using scroll offset.
+    // scroll=0 shows the bottom; higher values scroll toward older content.
+    let all_lines: Vec<Line> = agent.output.all_entries().iter()
         .flat_map(|e| style_output_entry(e))
         .collect();
 
-    let visible: Vec<Line> = all_lines.into_iter()
-        .rev()
-        .take(chunks[1].height as usize + scroll)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .skip(scroll)
-        .collect();
+    let height = chunks[1].height as usize;
+    let total = all_lines.len();
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+    let visible: Vec<Line> = all_lines.into_iter().skip(start).take(end - start).collect();
 
     let output = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(output, chunks[1]);

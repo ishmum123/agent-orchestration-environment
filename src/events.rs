@@ -3,6 +3,7 @@ use serde::Deserialize;
 /// A single content block within an assistant message.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
@@ -25,19 +26,13 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantMessage {
     #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub role: String,
-    #[serde(default)]
     pub content: Vec<ContentBlock>,
-    pub stop_reason: Option<String>,
 }
 
 /// Top-level NDJSON events from `claude -p --output-format stream-json --verbose`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 pub enum StreamEvent {
     #[serde(rename = "system")]
     System {

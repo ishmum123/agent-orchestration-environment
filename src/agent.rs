@@ -7,8 +7,6 @@ use crate::claude::ClaudeProcess;
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentState {
     Working,
-    WaitingForUser,
-    Idle,
     Done,
     Error,
 }
@@ -17,8 +15,6 @@ impl AgentState {
     pub fn label(&self) -> &str {
         match self {
             AgentState::Working => "working",
-            AgentState::WaitingForUser => "needs you",
-            AgentState::Idle => "idle",
             AgentState::Done => "done",
             AgentState::Error => "error",
         }
@@ -27,8 +23,6 @@ impl AgentState {
     pub fn color(&self) -> Color {
         match self {
             AgentState::Working => Color::Green,
-            AgentState::WaitingForUser => Color::Yellow,
-            AgentState::Idle => Color::DarkGray,
             AgentState::Done => Color::Cyan,
             AgentState::Error => Color::Red,
         }
@@ -36,11 +30,9 @@ impl AgentState {
 
     pub fn icon(&self) -> &str {
         match self {
-            AgentState::Working => "\u{25cf}",       // ●
-            AgentState::WaitingForUser => "\u{25cb}", // ○
-            AgentState::Idle => "\u{2500}",          // ─
-            AgentState::Done => "\u{2713}",          // ✓
-            AgentState::Error => "\u{2717}",         // ✗
+            AgentState::Working => "\u{25cf}",  // ●
+            AgentState::Done => "\u{2713}",     // ✓
+            AgentState::Error => "\u{2717}",    // ✗
         }
     }
 }
@@ -86,15 +78,13 @@ impl OutputLog {
         self.entries.push(OutputEntry::UserInput(text.to_string()));
     }
 
-    pub fn last_text(&self) -> Option<&str> {
-        self.entries.iter().rev().find_map(|e| {
-            if let OutputEntry::Text(t) = e { Some(t.as_str()) } else { None }
-        })
-    }
-
     pub fn recent(&self, n: usize) -> &[OutputEntry] {
         let start = self.entries.len().saturating_sub(n);
         &self.entries[start..]
+    }
+
+    pub fn all_entries(&self) -> &[OutputEntry] {
+        &self.entries
     }
 }
 
@@ -105,7 +95,6 @@ pub struct Agent {
     pub worktree: PathBuf,
     pub state: AgentState,
     pub output: OutputLog,
-    pub session_id: Option<String>,
     pub created_at: Instant,
     pub cost_usd: f64,
     /// When the agent finished (Done/Error). Used for pruning.
@@ -122,7 +111,6 @@ impl Agent {
         process: ClaudeProcess,
         worktree: PathBuf,
     ) -> Self {
-        let session_id = process.session_id.clone();
         Self {
             name,
             task_description,
@@ -130,7 +118,6 @@ impl Agent {
             worktree,
             state: AgentState::Working,
             output: OutputLog::new(),
-            session_id,
             created_at: Instant::now(),
             cost_usd: 0.0,
             done_at: None,
@@ -150,9 +137,8 @@ impl Agent {
             task_description,
             process: None,
             worktree,
-            state: AgentState::Idle,
+            state: AgentState::Done,
             output: OutputLog::new(),
-            session_id: None,
             created_at: Instant::now(),
             cost_usd: 0.0,
             done_at: None,
@@ -169,10 +155,6 @@ impl Agent {
         } else {
             format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
         }
-    }
-
-    pub fn is_alive(&mut self) -> bool {
-        self.process.as_mut().map(|p| p.is_alive()).unwrap_or(false)
     }
 
     pub fn kill(&mut self) {
@@ -246,15 +228,13 @@ mod tests {
     #[test]
     fn test_state_labels() {
         assert_eq!(AgentState::Working.label(), "working");
-        assert_eq!(AgentState::WaitingForUser.label(), "needs you");
-        assert_eq!(AgentState::Idle.label(), "idle");
         assert_eq!(AgentState::Done.label(), "done");
         assert_eq!(AgentState::Error.label(), "error");
     }
 
     #[test]
     fn test_state_icons_are_single_char() {
-        for state in [AgentState::Working, AgentState::WaitingForUser, AgentState::Idle, AgentState::Done, AgentState::Error] {
+        for state in [AgentState::Working, AgentState::Done, AgentState::Error] {
             assert_eq!(state.icon().chars().count(), 1);
         }
     }
@@ -274,7 +254,12 @@ mod tests {
     fn test_output_log_push_text() {
         let mut log = OutputLog::new();
         log.push_text("hello world");
-        assert_eq!(log.last_text(), Some("hello world"));
+        let entries = log.recent(1);
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            OutputEntry::Text(t) => assert_eq!(t, "hello world"),
+            _ => panic!("expected Text"),
+        }
     }
 
     #[test]

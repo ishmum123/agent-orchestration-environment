@@ -68,7 +68,7 @@ pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
             "add",
             "-b",
             &branch,
-            worktree_dir.to_str().unwrap(),
+            worktree_dir.to_str().context("worktree path not valid UTF-8")?,
             &base,
         ])
         .current_dir(project_dir)
@@ -84,21 +84,16 @@ pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
 }
 
 /// Removes the worktree and branch for the given agent.
-pub fn remove_worktree(project_dir: &str, agent_name: &str) -> Result<()> {
-    let root = repo_root(project_dir)?;
-
-    let worktree_dir = root
-        .parent()
-        .unwrap_or(Path::new("/"))
-        .join(".orc-worktrees")
-        .join(agent_name);
+pub fn remove_worktree(project_dir: &str, worktree_path: &Path, agent_name: &str) -> Result<()> {
+    let worktree_str = worktree_path.to_str()
+        .context("worktree path not valid UTF-8")?;
 
     let output = Command::new("git")
         .args([
             "worktree",
             "remove",
             "--force",
-            worktree_dir.to_str().unwrap(),
+            worktree_str,
         ])
         .current_dir(project_dir)
         .output()
