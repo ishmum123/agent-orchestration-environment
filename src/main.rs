@@ -7,21 +7,19 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
-use std::fs;
 use std::io;
 use std::process::Command;
 use std::time::Duration;
 
 mod agent;
-mod claude;
 mod app;
+mod claude;
 mod events;
 mod orc;
-mod tmux;
 mod ui;
 mod worktree;
 
-use app::{App, AppMode, ConfirmCallback, InputCallback};
+use app::{App, AppMode, ConfirmCallback, InputCallback, OrcCommand, parse_orc_commands};
 
 #[derive(Parser)]
 #[command(
@@ -32,10 +30,6 @@ struct Cli {
     /// Project directory (defaults to current directory)
     #[arg(short, long, default_value = ".")]
     project: String,
-
-    /// tmux session name
-    #[arg(short, long, default_value = "orc")]
-    session: String,
 }
 
 fn main() -> Result<()> {
@@ -45,11 +39,16 @@ fn main() -> Result<()> {
 
     let mut app = App::new(&cli.project);
 
-    // Generate lazygit config
-    ensure_lazygit_config()?;
-
-    // TODO(task-7): spawn orc via ClaudeProcess
-    app.set_status("orc started".to_string());
+    // Spawn orc brain
+    match orc::spawn_orc(&cli.project) {
+        Ok(proc) => {
+            app.orc = Some(proc);
+            app.set_status("orc started".to_string());
+        }
+        Err(e) => {
+            bail!("failed to start orc: {}", e);
+        }
+    }
 
     // Setup terminal
     enable_raw_mode()?;
@@ -65,14 +64,15 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
-    // Cleanup
-    for agent in &app.agents {
+    // Cleanup: kill all agents
+    for agent in &mut app.agents {
+        agent.kill();
         worktree::remove_worktree(&app.project_dir, &agent.name).ok();
     }
-    let orc_dir = dirs::home_dir().unwrap_or_default().join(".orc");
-    fs::remove_file(orc_dir.join("locked")).ok();
-    fs::remove_dir_all(orc_dir.join("orc")).ok();
-    fs::remove_dir_all(orc_dir.join("agents")).ok();
+    // Kill orc
+    if let Some(ref mut orc) = app.orc {
+        orc.kill();
+    }
 
     result
 }
@@ -81,12 +81,16 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
-    let poll_interval = Duration::from_secs(2);
-
     loop {
+        // Drain events from all processes (non-blocking)
+        app.drain_events();
+
+        // Process orc commands from latest output
+        process_orc_commands(app)?;
+
         terminal.draw(|f| ui::render(f, app))?;
 
-        if event::poll(Duration::from_millis(200))? {
+        if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
                     match &app.mode {
@@ -123,15 +127,41 @@ fn run_loop(
             }
         }
 
-        // Periodic polling (orc + agents)
-        if app.last_poll.elapsed() > poll_interval {
-            app.drain_events();
-        }
-
         if app.should_quit {
             break;
         }
     }
+    Ok(())
+}
+
+/// Check latest orc output for [SPAWN_AGENT], [TELL_AGENT], [KILL_AGENT] commands.
+fn process_orc_commands(app: &mut App) -> Result<()> {
+    // Only process commands from the last result event
+    if let Some(agent::OutputEntry::Result { text, .. }) = app.orc_output.last() {
+        let text = text.clone();
+        let cmds = parse_orc_commands(&text);
+        for cmd in cmds {
+            match cmd {
+                OrcCommand::Spawn { name, task } => {
+                    spawn_new_agent_by_name(app, &name, &task)?;
+                }
+                OrcCommand::Tell { name, message } => {
+                    if let Some(agent) = app.agents.iter_mut().find(|a| a.name == name) {
+                        if let Some(ref mut proc) = agent.process {
+                            proc.send(&message).ok();
+                            app.set_status(format!("orc told {}", name));
+                        }
+                    }
+                }
+                OrcCommand::Kill { name } => {
+                    if let Some(idx) = app.agents.iter().position(|a| a.name == name) {
+                        kill_agent(app, idx)?;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -227,10 +257,7 @@ fn enter_agent_mode(app: &mut App, idx: usize) {
     }
 }
 
-fn handle_input_key(
-    app: &mut App,
-    code: KeyCode,
-) -> Result<()> {
+fn handle_input_key(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         KeyCode::Enter => {
             let input = app.input_buf.clone();
@@ -246,7 +273,6 @@ fn handle_input_key(
                     InputCallback::ChatOrc => chat_orc(app, &input)?,
                 }
             }
-            // Return to chat mode after sending
             enter_chat_mode(app);
             Ok(())
         }
@@ -307,7 +333,6 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
                 app.agent_input_buf.clear();
             }
         }
-        // Scroll with Ctrl+U / Ctrl+D
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let AppMode::AgentDetail { scroll, .. } = &mut app.mode {
                 *scroll = scroll.saturating_add(5);
@@ -323,10 +348,14 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
                 let input = app.agent_input_buf.clone();
                 if let AppMode::AgentDetail { agent_idx, .. } = &app.mode {
                     let idx = *agent_idx;
-                    if let Some(agent) = app.agents.get(idx) {
-                        // TODO(task-5): send to agent via ClaudeProcess stdin
-                        let _ = &input;
-                        app.set_status(format!("sent to {}", agent.name));
+                    let agent_name = app.agents.get(idx).map(|a| a.name.clone());
+                    if let Some(agent) = app.agents.get_mut(idx) {
+                        if let Some(ref mut proc) = agent.process {
+                            proc.send(&input).ok();
+                        }
+                    }
+                    if let Some(name) = agent_name {
+                        app.set_status(format!("sent to {}", name));
                     }
                 }
                 app.agent_input_buf.clear();
@@ -357,16 +386,14 @@ fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
 }
 
 fn chat_orc(app: &mut App, message: &str) -> Result<()> {
-    // TODO(task-7): send message to orc via ClaudeProcess stdin
-    if app.orc.is_some() {
-        let _ = message;
+    if let Some(ref mut orc) = app.orc {
+        orc.send(message)?;
         app.set_status("sent to orc".to_string());
     }
     Ok(())
 }
 
 fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
-    // TODO(task-5): spawn agent via ClaudeProcess
     let (name, description) = if let Some((n, d)) = input.split_once(':') {
         let n = n.trim();
         let d = d.trim();
@@ -380,26 +407,65 @@ fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
         let slug = agent::slugify_description(input);
         (dedupe_name(&slug, &app.agents), input.to_string())
     };
-    let _ = (name, description);
-    app.set_status("spawn not yet implemented".to_string());
+
+    spawn_new_agent_by_name(app, &name, &description)?;
+
+    // Notify orc about the new agent
+    if let Some(ref mut orc) = app.orc {
+        let msg = format!(
+            "Agent \"{}\" spawned with task: \"{}\". I'll monitor its progress.",
+            name, description
+        );
+        orc.send(&msg).ok();
+    }
+
+    Ok(())
+}
+
+fn spawn_new_agent_by_name(app: &mut App, name: &str, task: &str) -> Result<()> {
+    let name = dedupe_name(name, &app.agents);
+
+    // Create worktree
+    let worktree_path = worktree::create_worktree(&app.project_dir, &name)?;
+
+    // Spawn Claude Code process
+    let args = claude::ClaudeArgs::new()
+        .permission_mode("auto");
+
+    let mut process = claude::ClaudeProcess::spawn(args, worktree_path.to_str().unwrap())?;
+
+    // Send the task
+    process.send(task)?;
+
+    let agent = agent::Agent::new(name.clone(), task.to_string(), process, worktree_path);
+    app.agents.push(agent);
+    app.set_status(format!("spawned '{}'", name));
+
     Ok(())
 }
 
 fn tell_agent(app: &mut App, message: &str) -> Result<()> {
-    // TODO(task-7): relay message via ClaudeProcess
-    if app.orc.is_some() && !app.agents.is_empty() {
-        let agent_name = app.agents[app.selected].name.clone();
-        let _ = message;
+    if let Some(ref mut orc) = app.orc {
+        let agent_name = &app.agents[app.selected].name;
+        let relay_msg = format!(
+            "The user wants to tell agent \"{}\": \"{}\". Enrich this with relevant context and use [TELL_AGENT] to send it.",
+            agent_name, message
+        );
+        orc.send(&relay_msg)?;
         app.set_status(format!("told {} (via orc)", agent_name));
     }
     Ok(())
 }
 
 fn direct_send(app: &mut App, message: &str) -> Result<()> {
-    // TODO(task-5): send to agent via ClaudeProcess stdin
-    if !app.agents.is_empty() {
-        let name = app.agents[app.selected].name.clone();
-        let _ = message;
+    let selected = app.selected;
+    let agent_name = app.agents.get(selected).map(|a| a.name.clone());
+    if let Some(agent) = app.agents.get_mut(selected) {
+        if let Some(ref mut proc) = agent.process {
+            proc.send(message)?;
+        }
+    }
+    if let Some(name) = agent_name {
         app.set_status(format!("sent to {}", name));
     }
     Ok(())
@@ -410,22 +476,13 @@ fn kill_agent(app: &mut App, idx: usize) -> Result<()> {
         return Ok(());
     }
 
-    let name = app.agents[idx].name.clone();
+    let agent = &mut app.agents[idx];
+    let name = agent.name.clone();
 
-    // TODO(task-5): kill agent via ClaudeProcess
-
-    // Remove worktree
+    agent.kill();
     worktree::remove_worktree(&app.project_dir, &name).ok();
 
-    // Remove orc metadata file if it exists
-    let meta_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(format!(".orc/agents/{}.json", name));
-    fs::remove_file(meta_path).ok();
-
     app.agents.remove(idx);
-
-    // Fix selection index
     if app.selected >= app.agents.len() && !app.agents.is_empty() {
         app.selected = app.agents.len() - 1;
     }
@@ -442,7 +499,6 @@ fn open_editor_subprocess(app: &mut App) -> Result<()> {
 
     let worktree = agent.worktree.to_str().unwrap().to_string();
 
-    // Get changed files
     let output = Command::new("git")
         .args(["diff", "--name-only", "HEAD"])
         .current_dir(&worktree)
@@ -464,7 +520,6 @@ fn open_editor_subprocess(app: &mut App) -> Result<()> {
     let files: Vec<&str> = changed_files.lines().collect();
     let file_args: Vec<String> = files.iter().map(|f| format!("{}/{}", worktree, f)).collect();
 
-    // Run editor as a child process (not via tmux)
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
 
@@ -479,7 +534,6 @@ fn open_editor_subprocess(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Ensure agent name is unique by appending -2, -3, etc.
 fn dedupe_name(base: &str, agents: &[agent::Agent]) -> String {
     let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
     if !names.contains(&base) {
@@ -496,13 +550,8 @@ fn dedupe_name(base: &str, agents: &[agent::Agent]) -> String {
 
 fn check_dependencies() -> Result<()> {
     let required = [
-        ("tmux", "tmux is required for session management"),
         ("git", "git is required for worktree isolation"),
-        ("claude", "Claude Code CLI is required for the orchestrator and agents"),
-    ];
-    let optional = [
-        ("lazygit", "[d]iff view requires lazygit"),
-        ("delta", "lazygit pager uses delta for diffs"),
+        ("claude", "Claude Code CLI is required"),
     ];
 
     let mut missing = Vec::new();
@@ -514,12 +563,6 @@ fn check_dependencies() -> Result<()> {
 
     if !missing.is_empty() {
         bail!("missing required dependencies:\n{}", missing.join("\n"));
-    }
-
-    for (cmd, reason) in &optional {
-        if Command::new("which").arg(cmd).output().map(|o| !o.status.success()).unwrap_or(true) {
-            eprintln!("warning: {} not found \u{2014} {}", cmd, reason);
-        }
     }
 
     Ok(())
@@ -560,27 +603,4 @@ mod tests {
         let agents: Vec<agent::Agent> = vec![];
         assert_eq!(dedupe_name("test", &agents), "test");
     }
-}
-
-fn ensure_lazygit_config() -> Result<()> {
-    let config_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orc");
-    fs::create_dir_all(&config_dir)?;
-
-    let config_path = config_dir.join("lazygit.yml");
-    if !config_path.exists() {
-        let config = r#"gui:
-  showBottomLine: false
-  showCommandLog: false
-  theme:
-    activeBorderColor: ["green", "bold"]
-git:
-  paging:
-    colorArg: always
-    pager: delta --dark --paging=never
-"#;
-        fs::write(&config_path, config)?;
-    }
-    Ok(())
 }
