@@ -14,6 +14,7 @@ use std::time::Duration;
 
 mod agent;
 mod app;
+mod events;
 mod orc;
 mod tmux;
 mod ui;
