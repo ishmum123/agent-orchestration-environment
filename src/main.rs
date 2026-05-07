@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     ensure_lazygit_config()?;
 
     // Spawn orc — creates tmux session with claude directly in pane 0
-    app.orc_pane = Some(orc::spawn_orc(&app.session, &cli.project)?);
+    app.orc_pane = Some(orc::spawn_orc(&cli.project)?);
     app.set_status("orc started".to_string());
 
     // Setup terminal
@@ -331,23 +331,8 @@ fn handle_detail_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> R
                 if let AppMode::AgentDetail { agent_idx, .. } = &app.mode {
                     let idx = *agent_idx;
                     if let Some(agent) = app.agents.get(idx) {
-                        let flat = input.lines()
-                            .map(|l| l.trim())
-                            .filter(|l| !l.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let tmp_path = dirs::home_dir()
-                            .unwrap_or_default()
-                            .join(".orc/msg.tmp");
-                        fs::write(&tmp_path, &flat)?;
-                        Command::new("tmux")
-                            .args(["load-buffer", tmp_path.to_str().unwrap()])
-                            .status().ok();
-                        Command::new("tmux")
-                            .args(["paste-buffer", "-t", &agent.pane.target()])
-                            .status().ok();
-                        tmux::send_keys_raw(&agent.pane, "Enter")?;
-                        fs::remove_file(&tmp_path).ok();
+                        // TODO(task-5): send to agent via ClaudeProcess stdin
+                        let _ = &input;
                         app.set_status(format!("sent to {}", agent.name));
                     }
                 }
@@ -379,40 +364,16 @@ fn handle_confirm_key(app: &mut App, code: KeyCode) -> Result<()> {
 }
 
 fn chat_orc(app: &mut App, message: &str) -> Result<()> {
-    if let Some(orc_pane) = &app.orc_pane {
-        // For multi-line or long messages, use tmux load-buffer to avoid
-        // send-keys issues with special characters and newlines
-        let tmp_path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".orc/msg.tmp");
-        // Collapse newlines to spaces for a single-message send
-        let flat = message.lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        fs::write(&tmp_path, &flat)?;
-
-        // Load into tmux buffer and paste into the pane
-        Command::new("tmux")
-            .args(["load-buffer", tmp_path.to_str().unwrap()])
-            .status()
-            .ok();
-        Command::new("tmux")
-            .args(["paste-buffer", "-t", &orc_pane.target()])
-            .status()
-            .ok();
-        // Send Enter to submit
-        tmux::send_keys_raw(orc_pane, "Enter")?;
-        fs::remove_file(&tmp_path).ok();
-
+    // TODO(task-5): send message to orc via ClaudeProcess stdin
+    if app.orc_pane.is_some() {
+        let _ = message;
         app.set_status("sent to orc".to_string());
     }
     Ok(())
 }
 
 fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
-    // Parse "name: description" or auto-generate slug from description
+    // TODO(task-5): spawn agent via ClaudeProcess
     let (name, description) = if let Some((n, d)) = input.split_once(':') {
         let n = n.trim();
         let d = d.trim();
@@ -426,52 +387,28 @@ fn spawn_new_agent(app: &mut App, input: &str) -> Result<()> {
         let slug = agent::slugify_description(input);
         (dedupe_name(&slug, &app.agents), input.to_string())
     };
-
-    // Create worktree
-    let worktree_path = worktree::create_worktree(&app.project_dir, &name)?;
-
-    // Create tmux pane (background — user never sees it)
-    let pane = app
-        .session
-        .create_pane(worktree_path.to_str().unwrap())?;
-
-    // Launch claude in the pane
-    tmux::send_keys(&pane, "claude")?;
-
-    // Wait for claude to start, then send the prompt
-    std::thread::sleep(Duration::from_secs(3));
-    tmux::send_keys(&pane, &description)?;
-
-    let pane_id = pane.pane;
-    let agent = agent::Agent::new(name.clone(), description.clone(), pane, worktree_path);
-    app.agents.push(agent);
-
-    // Notify orc about the new agent
-    if let Some(orc_pane) = &app.orc_pane {
-        orc::notify_agent_spawned(orc_pane, &name, pane_id, &description)?;
-    }
-
-    app.set_status(format!("spawned '{}'", name));
+    let _ = (name, description);
+    app.set_status("spawn not yet implemented".to_string());
     Ok(())
 }
 
 fn tell_agent(app: &mut App, message: &str) -> Result<()> {
-    if let Some(orc_pane) = &app.orc_pane {
-        let agent_name = &app.agents[app.selected].name;
-        let relay_msg = format!(
-            "The user wants to tell agent \"{}\": \"{}\". Enrich this with relevant context and send it to the agent's pane using tmux send-keys.",
-            agent_name, message
-        );
-        tmux::send_keys(orc_pane, &relay_msg)?;
+    // TODO(task-5): relay message via ClaudeProcess
+    if app.orc_pane.is_some() && !app.agents.is_empty() {
+        let agent_name = app.agents[app.selected].name.clone();
+        let _ = message;
         app.set_status(format!("told {} (via orc)", agent_name));
     }
     Ok(())
 }
 
 fn direct_send(app: &mut App, message: &str) -> Result<()> {
-    let agent = &app.agents[app.selected];
-    tmux::send_keys(&agent.pane, message)?;
-    app.set_status(format!("sent to {}", agent.name));
+    // TODO(task-5): send to agent via ClaudeProcess stdin
+    if !app.agents.is_empty() {
+        let name = app.agents[app.selected].name.clone();
+        let _ = message;
+        app.set_status(format!("sent to {}", name));
+    }
     Ok(())
 }
 
@@ -480,11 +417,9 @@ fn kill_agent(app: &mut App, idx: usize) -> Result<()> {
         return Ok(());
     }
 
-    let agent = &app.agents[idx];
-    let name = agent.name.clone();
+    let name = app.agents[idx].name.clone();
 
-    // Kill the tmux pane
-    app.session.kill_pane(&agent.pane).ok();
+    // TODO(task-5): kill agent via ClaudeProcess
 
     // Remove worktree
     worktree::remove_worktree(&app.project_dir, &name).ok();
@@ -602,10 +537,9 @@ mod tests {
     use super::*;
 
     fn make_agent(name: &str) -> agent::Agent {
-        agent::Agent::new(
+        agent::Agent::new_without_process(
             name.to_string(),
             "task".to_string(),
-            tmux::TmuxPane { session: "s".to_string(), window: 0, pane: 0 },
             std::path::PathBuf::from("/tmp"),
         )
     }

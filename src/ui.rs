@@ -92,7 +92,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let stuck = app
         .agents
         .iter()
-        .filter(|a| matches!(a.state, crate::agent::AgentState::Stuck))
+        .filter(|a| matches!(a.state, crate::agent::AgentState::Error))
         .count();
 
     let mut parts = vec![
@@ -208,13 +208,6 @@ fn render_agent_sidebar(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
-
-            if agent.locked {
-                spans.push(Span::styled(
-                    " \u{1f512}",
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
 
             let line = Line::from(spans);
             ListItem::new(line)
@@ -364,16 +357,17 @@ fn render_status(f: &mut Frame, app: &App) {
             .enumerate()
             .map(|(i, agent)| {
                 let is_selected = i == app.status_selected;
-                let output_lines: Vec<&str> = agent
-                    .last_output
-                    .lines()
-                    .rev()
-                    .filter(|l| !l.trim().is_empty())
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
+                let last_text = agent.output.last_text().unwrap_or("").to_string();
+                let output_lines: Vec<String> = {
+                    let mut v: Vec<&str> = last_text
+                        .lines()
+                        .rev()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(5)
+                        .collect();
+                    v.reverse();
+                    v.iter().map(|s| s.to_string()).collect()
+                };
 
                 let marker = if is_selected { "\u{25b8}" } else { " " };
                 let name_style = if is_selected {
@@ -501,7 +495,8 @@ fn render_agent_detail(f: &mut Frame, app: &App, agent_idx: usize, scroll: usize
     f.render_widget(header, chunks[0]);
 
     // Output — strip chrome, style lines
-    let all_lines: Vec<&str> = agent.last_output.lines().collect();
+    let last_text = agent.output.last_text().unwrap_or("").to_string();
+    let all_lines: Vec<&str> = last_text.lines().collect();
     let content = strip_claude_chrome(&all_lines);
 
     let visible_lines: Vec<Line> = content
