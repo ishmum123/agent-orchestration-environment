@@ -40,12 +40,10 @@ To send a message to an existing agent:
 
 ## Spawning rules
 
-- NEVER spawn agents just to explore, read, or understand the codebase. That's wasteful.
-- Only spawn agents for concrete implementation tasks with clear deliverables.
-- If you need to understand the project first, ASK THE USER — don't spawn explorers.
-- When the user gives a vague request, clarify scope before spawning. Don't guess.
-- Aim for the minimum number of agents needed. 1-3 is typical. More than 5 is almost always wrong.
-- Each agent should have a specific, bounded task — not "explore and figure out".
+- Be conservative. Aim for the minimum number of agents needed. 1-3 is typical.
+- NEVER spawn more than 5 agents at once. If you think you need more, ask the user first.
+- Each agent should have a specific, bounded task.
+- Exploration agents are fine, but one is usually enough — don't spawn many explorers.
 
 ## Other guidelines
 

@@ -136,27 +136,42 @@ fn run_loop(
 
 /// Check latest orc output for [SPAWN_AGENT], [TELL_AGENT], [KILL_AGENT] commands.
 fn process_orc_commands(app: &mut App) -> Result<()> {
-    // Only process commands from the last result event
-    if let Some(agent::OutputEntry::Result { text, .. }) = app.orc_output.last() {
-        let text = text.clone();
-        let cmds = parse_orc_commands(&text);
-        for cmd in cmds {
-            match cmd {
-                OrcCommand::Spawn { name, task } => {
-                    spawn_new_agent_by_name(app, &name, &task)?;
-                }
-                OrcCommand::Tell { name, message } => {
-                    if let Some(agent) = app.agents.iter_mut().find(|a| a.name == name) {
-                        if let Some(ref mut proc) = agent.process {
-                            proc.send(&message).ok();
-                            app.set_status(format!("orc told {}", name));
-                        }
+    let total = app.orc_output.len();
+    if total <= app.orc_cmds_processed {
+        return Ok(());
+    }
+
+    // Collect text from new (unprocessed) entries only
+    let new_text: String = app.orc_output[app.orc_cmds_processed..total]
+        .iter()
+        .filter_map(|e| match e {
+            agent::OutputEntry::Text(t) => Some(t.as_str()),
+            agent::OutputEntry::Result { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Mark as processed BEFORE executing (prevents re-entry if spawn triggers more events)
+    app.orc_cmds_processed = total;
+
+    let cmds = parse_orc_commands(&new_text);
+    for cmd in cmds {
+        match cmd {
+            OrcCommand::Spawn { name, task } => {
+                spawn_new_agent_by_name(app, &name, &task)?;
+            }
+            OrcCommand::Tell { name, message } => {
+                if let Some(agent) = app.agents.iter_mut().find(|a| a.name == name) {
+                    if let Some(ref mut proc) = agent.process {
+                        proc.send(&message).ok();
+                        app.set_status(format!("orc told {}", name));
                     }
                 }
-                OrcCommand::Kill { name } => {
-                    if let Some(idx) = app.agents.iter().position(|a| a.name == name) {
-                        kill_agent(app, idx)?;
-                    }
+            }
+            OrcCommand::Kill { name } => {
+                if let Some(idx) = app.agents.iter().position(|a| a.name == name) {
+                    kill_agent(app, idx)?;
                 }
             }
         }
