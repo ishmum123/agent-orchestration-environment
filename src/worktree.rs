@@ -46,17 +46,17 @@ pub fn main_branch(project_dir: &str) -> Result<String> {
 
 /// Creates a git worktree for the given agent.
 ///
-/// Branch: `orchestr8/{agent_name}`
-/// Directory: `{repo_root_parent}/.orchestr8-worktrees/{agent_name}`
+/// Branch: `orc/{agent_name}`
+/// Directory: `{repo_root_parent}/.orc-worktrees/{agent_name}`
 pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
     let root = repo_root(project_dir)?;
     let base = main_branch(project_dir)?;
 
-    let branch = format!("orchestr8/{agent_name}");
+    let branch = format!("orc/{agent_name}");
     let worktree_dir = root
         .parent()
         .unwrap_or(Path::new("/"))
-        .join(".orchestr8-worktrees")
+        .join(".orc-worktrees")
         .join(agent_name);
 
     fs::create_dir_all(worktree_dir.parent().unwrap())
@@ -90,7 +90,7 @@ pub fn remove_worktree(project_dir: &str, agent_name: &str) -> Result<()> {
     let worktree_dir = root
         .parent()
         .unwrap_or(Path::new("/"))
-        .join(".orchestr8-worktrees")
+        .join(".orc-worktrees")
         .join(agent_name);
 
     let output = Command::new("git")
@@ -109,7 +109,7 @@ pub fn remove_worktree(project_dir: &str, agent_name: &str) -> Result<()> {
         bail!("git worktree remove failed: {stderr}");
     }
 
-    let branch = format!("orchestr8/{agent_name}");
+    let branch = format!("orc/{agent_name}");
     let output = Command::new("git")
         .args(["branch", "-D", &branch])
         .current_dir(project_dir)

@@ -42,7 +42,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .count();
 
     let header = format!(
-        "orchestr8 \u{2500} {} agents \u{2500} {} working \u{2500} {} waiting",
+        "orc \u{2500} {} agents \u{2500} {} working \u{2500} {} waiting",
         app.agents.len(),
         working,
         waiting,

@@ -1,5 +1,5 @@
 [package]
-name = "orchestr8"
+name = "orc"
 version = "0.1.0"
 edition = "2021"
 description = "Parallel Claude Code agents with an intelligent orchestrator"

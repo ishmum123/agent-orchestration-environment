@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -8,6 +8,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::fs;
 use std::io;
+use std::process::Command;
 use std::time::Duration;
 
 mod agent;
@@ -21,7 +22,7 @@ use app::{App, AppMode, InputCallback};
 
 #[derive(Parser)]
 #[command(
-    name = "orchestr8",
+    name = "orc",
     about = "Parallel Claude Code agents with intelligent orchestration"
 )]
 struct Cli {
@@ -30,12 +31,15 @@ struct Cli {
     project: String,
 
     /// tmux session name
-    #[arg(short, long, default_value = "orchestr8")]
+    #[arg(short, long, default_value = "orc")]
     session: String,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    check_dependencies()?;
+
     let mut app = App::new(&cli.session, &cli.project);
 
     // Create tmux session
@@ -70,9 +74,9 @@ fn main() -> Result<()> {
     for agent in &app.agents {
         worktree::remove_worktree(&app.project_dir, &agent.name).ok();
     }
-    let orchestr8_dir = dirs::home_dir().unwrap_or_default().join(".orchestr8");
-    fs::remove_file(orchestr8_dir.join("locked")).ok();
-    fs::remove_dir_all(orchestr8_dir.join("orc")).ok();
+    let orc_dir = dirs::home_dir().unwrap_or_default().join(".orc");
+    fs::remove_file(orc_dir.join("locked")).ok();
+    fs::remove_dir_all(orc_dir.join("orc")).ok();
 
     result
 }
@@ -201,7 +205,7 @@ fn attach_to_agent(
         // Write lock file so orc knows not to send to this pane
         let lock_path = dirs::home_dir()
             .unwrap_or_default()
-            .join(".orchestr8/locked");
+            .join(".orc/locked");
         fs::create_dir_all(lock_path.parent().unwrap())?;
         fs::write(&lock_path, pane.pane.to_string())?;
 
@@ -291,7 +295,7 @@ fn open_diff(
 
         let config_path = dirs::home_dir()
             .unwrap_or_default()
-            .join(".orchestr8/lazygit.yml");
+            .join(".orc/lazygit.yml");
 
         let lazygit_cmd = format!(
             "lazygit --work-tree={} --git-dir={}/.git --use-config-file={}; exit",
@@ -317,10 +321,41 @@ fn open_diff(
     Ok(())
 }
 
+fn check_dependencies() -> Result<()> {
+    let required = [
+        ("tmux", "tmux is required for session management"),
+        ("git", "git is required for worktree isolation"),
+        ("claude", "Claude Code CLI is required for the orchestrator and agents"),
+    ];
+    let optional = [
+        ("lazygit", "[d]iff view requires lazygit"),
+        ("delta", "lazygit pager uses delta for diffs"),
+    ];
+
+    let mut missing = Vec::new();
+    for (cmd, reason) in &required {
+        if Command::new("which").arg(cmd).output().map(|o| !o.status.success()).unwrap_or(true) {
+            missing.push(format!("  {} — {}", cmd, reason));
+        }
+    }
+
+    if !missing.is_empty() {
+        bail!("missing required dependencies:\n{}", missing.join("\n"));
+    }
+
+    for (cmd, reason) in &optional {
+        if Command::new("which").arg(cmd).output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("warning: {} not found — {}", cmd, reason);
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_lazygit_config() -> Result<()> {
     let config_dir = dirs::home_dir()
         .unwrap_or_default()
-        .join(".orchestr8");
+        .join(".orc");
     fs::create_dir_all(&config_dir)?;
 
     let config_path = config_dir.join("lazygit.yml");

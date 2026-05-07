@@ -1,4 +1,4 @@
-# Orchestr8
+# Orc
 
 Rust TUI tool for running parallel Claude Code agents with an intelligent orchestrator.
 

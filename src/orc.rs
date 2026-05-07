@@ -33,7 +33,7 @@ tmux send-keys -t {session}:0.{{PANE_ID}} "your message here" Enter
 
 ## Rules
 
-- Before sending to any pane, check if file `~/.orchestr8/locked` exists. If it contains a pane id, do NOT send to that pane — the user is attached.
+- Before sending to any pane, check if file `~/.orc/locked` exists. If it contains a pane id, do NOT send to that pane — the user is attached.
 - Don't flood agents — one message at a time, wait for response.
 - Keep your answers concise and actionable.
 - Project directory: {project}
@@ -58,7 +58,7 @@ pub fn spawn_orc(session: &TmuxSession, project_dir: &str) -> Result<TmuxPane> {
     };
 
     // Write orc instructions to a dedicated directory
-    let orc_dir = orchestr8_dir().join("orc");
+    let orc_dir = orc_base_dir().join("orc");
     fs::create_dir_all(&orc_dir)?;
 
     let instructions = generate_orc_instructions(&session.name, project_dir);
@@ -85,8 +85,8 @@ pub fn notify_agent_spawned(
     tmux::send_keys(orc_pane, &msg)
 }
 
-fn orchestr8_dir() -> PathBuf {
+fn orc_base_dir() -> PathBuf {
     dirs::home_dir()
-        .map(|h| h.join(".orchestr8"))
-        .unwrap_or_else(|| Path::new("/tmp/.orchestr8").to_path_buf())
+        .map(|h| h.join(".orc"))
+        .unwrap_or_else(|| Path::new("/tmp/.orc").to_path_buf())
 }
