@@ -187,6 +187,23 @@ impl App {
         }
     }
 
+    /// Replace the pty_tail buffer with a snapshot of the currently visible
+    /// pane. Called on every tick from the pane-capturer task — semantically
+    /// "this is what the user would see right now if they attached."
+    pub fn set_pty_tail(&mut self, session_id: &str, lines: Vec<String>) {
+        if let Some(&idx) = self.session_index.get(session_id) {
+            let tail = &mut self.sessions[idx].pty_tail;
+            tail.clear();
+            // Cap at 500 to match the existing buffer bound; the snapshot is
+            // already only the visible pane height (~40 lines) but a user with
+            // a tall terminal could exceed that if we ever switch to scrollback.
+            let take_from = lines.len().saturating_sub(500);
+            for line in lines.into_iter().skip(take_from) {
+                tail.push_back(line);
+            }
+        }
+    }
+
     pub fn append_pty_line(&mut self, session_id: &str, line: String) {
         if let Some(&idx) = self.session_index.get(session_id) {
             let tail = &mut self.sessions[idx].pty_tail;

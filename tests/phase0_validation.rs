@@ -50,7 +50,7 @@ fn setup_mcp() -> McpServer {
         .output();
 
     std::mem::forget(dir);
-    McpServer::new(setup_state(), project_dir, hook_socket_path)
+    McpServer::new(setup_state(), project_dir, hook_socket_path, 0)
 }
 
 /// Send a JSON-RPC request and return the response, asserting no JSON-RPC error.
@@ -99,7 +99,7 @@ async fn mcp_tools_list_returns_all_seven_tools() {
     };
     let result = call_ok(&server, &req).await;
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7, "expected 7 tools, got {}", tools.len());
+    assert_eq!(tools.len(), 8, "expected 8 tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let expected = [
@@ -109,6 +109,7 @@ async fn mcp_tools_list_returns_all_seven_tools() {
         "ask_user",
         "list_sessions",
         "mark_done",
+        "submit_for_review",
         "update_task_graph",
     ];
     for name in &expected {
@@ -502,7 +503,7 @@ async fn full_pipeline_mcp_hooks_state() {
         .output();
     let mcp_hook_sock = mcp_dir.path().join("hooks.sock");
     std::mem::forget(mcp_dir);
-    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock);
+    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock, 0);
 
     // 6a: MCP call to spawn_session
     let worker_name = format!("pipeline-{}", unique_suffix());
@@ -585,7 +586,7 @@ async fn full_pipeline_ask_user_flow() {
         .output();
     let ask_hook_sock = ask_dir.path().join("hooks.sock");
     std::mem::forget(ask_dir);
-    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock);
+    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock, 0);
 
     // Create a session (so ask_user has something to associate with)
     let spawn_req = JsonRpcRequest {

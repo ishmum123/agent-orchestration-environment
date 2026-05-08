@@ -9,6 +9,7 @@ mod session;
 mod state;
 mod tmux;
 mod ui;
+mod worker;
 mod worktree;
 
 use anyhow::{bail, Result};
@@ -113,12 +114,14 @@ async fn main() -> Result<()> {
     });
 
     // -- MCP HTTP server ------------------------------------------------------
+    let (mcp_listener, mcp_port) = mcp::bind_http_listener().await?;
     let mcp_server = Arc::new(McpServer::new(
         state_handle.clone(),
         project_dir.clone(),
         hook_sock.clone(),
+        mcp_port,
     ));
-    let mcp_port = mcp::start_http_server(mcp_server).await?;
+    mcp::serve_http(mcp_listener, mcp_server);
 
     // -- Orc brain process ----------------------------------------------------
     let mcp_config_path = orc::write_mcp_config(mcp_port).await?;
@@ -135,6 +138,14 @@ async fn main() -> Result<()> {
         eprintln!("[orc] cleaned up {cleaned} orphaned tmux sessions");
     }
 
+    // -- Sweep zombie sessions: anything in DB whose tmux is gone is dead.
+    //    Transitions Running/AwaitingReview → Failed (so `R` restart works);
+    //    Blocked → removed outright (state machine forbids Blocked→Failed).
+    let zombies = state::sweep_zombie_sessions(&state_handle).await;
+    if zombies > 0 {
+        eprintln!("[orc] swept {zombies} zombie session(s) from previous runs");
+    }
+
     // -- App state ------------------------------------------------------------
     let mut app = App::new(&project_str).with_state_handle(state_handle.clone());
     app.push_chat(ChatRole::System, format!("orc v2 — MCP on port {mcp_port}"));
@@ -149,6 +160,10 @@ async fn main() -> Result<()> {
     // -- State broadcast subscription ----------------------------------------
     let mut state_rx = state_handle.subscribe();
 
+    // -- PTY tail channel: each event is a full snapshot of the worker's
+    //    visible pane (replaces the tail buffer). Captured every ~1s.
+    let (pty_tx, mut pty_rx) = mpsc::channel::<(String, Vec<String>)>(64);
+
     // -- Main event loop ------------------------------------------------------
     let result = run_event_loop(
         &mut terminal,
@@ -156,6 +171,8 @@ async fn main() -> Result<()> {
         &state_handle,
         &mut state_rx,
         &mut orc_process,
+        pty_tx,
+        &mut pty_rx,
     )
     .await;
 
@@ -178,6 +195,8 @@ async fn run_event_loop(
     state_handle: &StateHandle,
     state_rx: &mut tokio::sync::broadcast::Receiver<StateChange>,
     orc_process: &mut OrcProcess,
+    pty_tx: mpsc::Sender<(String, Vec<String>)>,
+    pty_rx: &mut mpsc::Receiver<(String, Vec<String>)>,
 ) -> Result<()> {
     loop {
         // Render
@@ -212,8 +231,20 @@ async fn run_event_loop(
 
             change = state_rx.recv() => {
                 if let Ok(change) = change {
+                    if let StateChange::SessionCreated { session } = &change {
+                        tmux::spawn_pane_capturer(
+                            session.id.clone(),
+                            session.tmux_session.clone(),
+                            pty_tx.clone(),
+                            Duration::from_millis(1000),
+                        );
+                    }
                     handle_state_change(app, change);
                 }
+            }
+
+            Some((session_id, lines)) = pty_rx.recv() => {
+                app.set_pty_tail(&session_id, lines);
             }
 
             events = orc_process.read_events() => {

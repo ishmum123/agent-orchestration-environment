@@ -105,11 +105,23 @@ pub enum ReviewItem {
 // Diff computation
 // ---------------------------------------------------------------------------
 
-/// Shell out to `git diff --no-color base_commit..HEAD` in the worktree,
-/// parse unified diff output into structured types.
+/// Compute the worker's diff against `base_commit`, including uncommitted and
+/// untracked changes. Workers typically don't commit — they edit the worktree
+/// directly. So a plain `git diff base..HEAD` would miss everything.
+///
+/// Strategy: `git add -N` makes untracked files visible to `git diff` as
+/// intent-to-add (no content staged, just the path), then `git diff base` shows
+/// every change the worktree has accumulated since the base commit.
 pub async fn compute_diff(worktree_path: &str, base_commit: &str) -> Result<ParsedDiff> {
+    // Make untracked files visible to `git diff` without staging their contents.
+    let _ = Command::new("git")
+        .args(["add", "-N", "."])
+        .current_dir(worktree_path)
+        .output()
+        .await;
+
     let output = Command::new("git")
-        .args(["diff", "--no-color", &format!("{base_commit}..HEAD")])
+        .args(["diff", "--no-color", base_commit])
         .current_dir(worktree_path)
         .output()
         .await?;

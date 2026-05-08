@@ -1,189 +1,138 @@
-# Orc
+# Orc — Spec
 
-A terminal tool that wraps Claude Code with an intelligent orchestrator. You talk to orc like you'd talk to Claude Code. When work needs doing, orc spawns background agents and manages them — you only see them when they're running, and only intervene when orc can't handle it alone.
+A terminal app for running parallel Claude conversations with an orchestrator on top. You type to orc; orc plans, delegates to workers, and reports back. You can also talk to any worker directly. Everything happens inside one TUI — you never see a raw Claude session.
+
+---
 
 ## Core principle
 
-**Orc is Claude Code with a team.** You type, orc responds. The difference: when orc decides work needs doing, it delegates to background agents instead of doing it itself. Orc keeps its own context small and dedicated to understanding you.
+**Orc is the entire interface to a multi-Claude team.** Every conversation — the orchestrator and each worker — is a tab. You read tabs to see what's happening. You write to a tab through a pop-up. The orchestrator can act on its own, including answering workers' questions on your behalf.
 
-## Architecture
+There are exactly three kinds of participants:
 
-```
-┌─────────────────────────────────────────────────┐
-│              Orc TUI (ratatui)                  │
-│  ┌──────────────────┐  ┌─────────────────────┐  │
-│  │   Orc Output     │  │  Agent Sidebar      │  │
-│  │   (left panel)   │  │  ● agent-1    12s   │  │
-│  │                  │  │  ✓ agent-2    45s   │  │
-│  │                  │  │                     │  │
-│  └──────────────────┘  └─────────────────────┘  │
-│  ┌──────────────────────────────────────────┐   │
-│  │ > user input                             │   │
-│  └──────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────┘
-        │                           │
-        ▼                           ▼
-  Orc Brain Process           Agent Processes
-  (claude -p)                 (claude -p × N)
-  - no tools                  - auto permissions
-  - no MCP                    - own git worktree
-  - reasons about tasks       - does actual work
-  - emits [SPAWN_AGENT]
-```
+- **Orc** — one. Plans, delegates, supervises.
+- **Workers** — many. Each scoped to a subtask, isolated in its own git worktree.
+- **You** — observe everything, intervene anywhere.
 
-The TUI owns all process lifecycle. Claude Code instances are child processes communicating via `--input-format stream-json --output-format stream-json` NDJSON pipes. No tmux dependency.
+Workers are not terminals you attach into. They are Claude conversations rendered as a structured event log inside orc's UI.
 
-## User experience flow
+---
 
-### 1. Launch
+## Tabs
+
+One tab per conversation. The first tab is orc; subsequent tabs are workers, in spawn order.
+
+Each tab shows:
 
 ```
-$ orc -p /path/to/project
+[ session header — name, model, state, elapsed ]
+[ scrollable event log ]
+[ action bar — keys available in this context ]
 ```
 
-Orc starts, greets you. You type naturally in the input bar.
+The event log is append-only and chronological. It contains:
 
-### 2. Conversation — orc clarifies before acting
+- Assistant text from this session
+- Tool calls (collapsed: `→ Read({ ... })`)
+- Tool results (collapsed: `← ok` or `← error: ...`)
+- User messages sent into this session
+- System notes — `[interrupted]`, `answered by orc: ...`, `worker exited code 0`, etc.
 
-```
-you: the login keeps re-prompting every 50 minutes and the edit/delete
-     UI needs a redesign
+Tabs are scrollable with `j`/`k`. Switching is `Tab`/`Shift-Tab` or `1`-`9`. The orc tab is always `1`.
 
-orc: A few questions before I spin up agents:
-     1. The 50-min re-prompt — session token expiring or re-auth flow?
-     2. For edit/delete redesign — swipe-to-reveal or selection mode?
-```
+State badges in the tab strip: `◐` running · `?` blocked on permission · `!` blocked on a question · `◑` awaiting review · `✓` done · `✗` failed.
 
-If orc understands clearly, it skips questions and spawns agents directly.
+---
 
-### 3. Agents spawn in the background
+## Speaking
 
-Orc embeds commands in its text output:
+All input is a centered pop-up modal. There is no persistent input box on tabs. This keeps tabs purely about reading — writing is a deliberate act.
 
-```
-[SPAWN_AGENT name="auth-fix" task="Switch from ID token revalidation to session tokens in src/auth/"]
-[SPAWN_AGENT name="edit-redesign" task="Implement swipe-to-reveal for edit/delete actions"]
-```
+- **You → orc**: `n` from anywhere, or from the orc tab.
+- **You → worker**: `n` from that worker's tab.
+- **Orc → worker**: invisible — orc uses tools; you see the result land in the worker's log.
+- **Worker → orc**: invisible — same; appears as a tool call in the worker's log.
 
-The TUI parses these, creates git worktrees, spawns Claude Code processes, and sends each agent its task. Commands are stripped from displayed output — the user sees clean text.
+Pop-ups belong to a session. Closing without sending is `Esc`; sending is `Enter`. Multi-line composition with `Shift-Enter` (newline in buffer); the modal grows up to a sensible cap.
 
-### 4. Sidebar — visible when agents exist
+---
 
-```
-┌──────────────────────────────────┬───────────────────┐
-│                                  │ ● auth-fix    2m  │
-│  orc conversation                │ ● edit-rede.. 2m  │
-│  (you keep talking here)         │                   │
-│                                  │                   │
-└──────────────────────────────────┴───────────────────┘
-```
+## Questions
 
-Sidebar appears when agents are spawned. Each entry shows state icon, name, elapsed time.
+Any session can ask a question that requires a human-shaped answer. The question raises a pop-up on screen. **Who is allowed to answer depends on who's asking:**
 
-### 5. Agent completion — feedback loop
+- **Orc asks → only you can answer.** Orc cannot answer itself.
+- **Worker asks → either you or orc can answer.** First responder wins; the pop-up dismisses regardless. The session that asked logs `answered by you: ...` or `answered by orc: ...` so the audit trail is clear.
 
-When an agent finishes, the TUI sends the result back to the orc brain:
+For orc to actually answer a worker, orc has to *see* the question in real time. Worker questions are forwarded into orc's stream the moment they're raised. Orc decides per-question whether it has the context to answer, or stays quiet and lets you handle it.
 
-```
-Agent "auth-fix" finished. Result: Replaced ID token revalidation...
-```
+If orc stays quiet, the user is the only path. The pop-up is non-blocking otherwise — you can switch tabs, read other logs, and come back. Tab badge flashes when a question is unresolved on a non-focused tab.
 
-Orc summarizes for the user. If the result triggers more work, orc can spawn additional agents.
+This is the orchestration loop in concrete form: orc supervises by *seeing* what workers do and ask, and *intervenes* when it has the context. You are the fallback, not the default.
 
-### 6. Attention markers — orc escalates to you
+---
 
-When orc can't handle something, it tells you in the chat. You can respond to orc (who relays via `[TELL_AGENT]`) or send directly to the agent with `/`.
+## Interrupting
 
-## Agent states
+Any session — orc or any worker — can be interrupted from its tab with a single key (e.g. `Ctrl-C`). The session stops mid-thought; the conversation stays alive and ready for the next message. The tab logs `[interrupted]`.
 
-| Icon | State | Meaning |
-|------|-------|---------|
-| ● | working | Agent is actively producing output |
-| ○ | needs you | Orc escalated, needs human decision |
-| ─ | idle | Agent finished current task |
-| ✓ | done | Work complete |
-| ✗ | error | Process exited with error |
+Same gesture as Esc-during-Claude-Code, applied uniformly. There is no "kill the process and lose context" outcome from interrupt — that's what `k kill` is for.
 
-## Command protocol
+---
 
-Orc embeds commands in its natural language responses:
+## Spawning, killing, restarting
 
-```
-[SPAWN_AGENT name="short-slug" task="Full description of what to do"]
-[TELL_AGENT name="agent-name" message="Message to send to the agent"]
-[KILL_AGENT name="agent-name"]
-```
+- **Spawn**: orc decides. You ask orc for work; orc spawns workers as it sees fit. (Direct user-initiated spawn from a key is possible but not the primary path.)
+- **Kill (`k`)**: terminates a worker, removes its tab and worktree, drops its DB row. Confirmation modal first. Orc is notified via its event stream.
+- **Restart (`R`)**: kills the current worker process and starts a fresh one in the same worktree, with conversation continuity (the new process resumes the prior Claude session). Used when a worker is wedged or after an interrupt didn't recover cleanly.
 
-Commands can span multiple lines (task/message values may contain newlines). The TUI parser extracts these, executes them, and strips them from displayed output.
+---
 
-## Process architecture
+## Reviewing
 
-### Orc brain
-- `claude -p --tools "" --disallowed-tools LSP --strict-mcp-config`
-- System prompt instructs it to reason about tasks and emit commands
-- Cannot run tools or edit files — pure reasoning
-- Persistent for the session lifetime
+When a worker has work ready for the user (worker calls `submit_for_review`, or user opens review on demand), the worker's tab supports three view modes that share one review session:
 
-### Worker agents
-- `claude -p --permission-mode auto`
-- Each in an isolated git worktree (branch `orc/{name}`, dir `../.orc-worktrees/{name}`)
-- Stderr captured to `~/.orc/logs/{name}.stderr`
-- Killed and cleaned up when done or on quit
+1. **Diff view** (`r`): default. Split-pane file tree on the left, diff on the right. Lowest friction. Most reviews end here.
+2. **Whole-file view** (`o` from diff view): one keystroke up from diff. Single scrollable pane showing the file's *current* content with line numbers. Same review keys (`c` comment, `a` approve, `j/k` navigate). Used when context outside the changes matters.
+3. **Editor (`e` from anywhere in review or worker tab)**: surrenders the terminal to `$EDITOR` pointed at the worktree (or a specific file:line). Orc resumes when the editor exits. Used when you're going to *change something*, not just read. The worker keeps running in the background — interrupt it first if you don't want it racing your edits.
 
-### Communication
-- All processes use `--input-format stream-json --output-format stream-json --verbose`
-- TUI reads stdout as NDJSON (non-blocking), writes to stdin
-- Event types: `system` (init), `assistant` (content blocks), `result` (completion)
-- No polling — continuous non-blocking read in the event loop
+**Comments and approvals accumulate in one review session regardless of view.** A comment placed in diff view is visible in whole-file view of the same file at the same line. Submit (`s`) sends everything to the worker as one structured payload; the worker resumes with the feedback as its next prompt. Cancel (`q`/`Esc`) leaves the review draft attached to the worker so you can come back.
 
-## Keybinds
+The keystroke ladder `r → o → e` reinforces frequency and disruption: each step opens more capability and costs more.
 
-| Key | Action |
-|-----|--------|
-| esc | Chat mode (default — type to orc) |
-| n | Spawn new agent manually |
-| t | Tell selected agent (via orc enrichment) |
-| / | Send directly to agent (bypass orc) |
-| e | Open $EDITOR on agent's changed files |
-| x | Kill selected agent (with confirmation) |
-| s | Status overview |
-| j/k | Navigate agents |
-| Enter | Agent full output view |
-| Ctrl+U/D | Scroll output |
-| Tab | Toggle preview |
-| ? | Help overlay |
-| q / Ctrl+C | Quit (kills all, cleans up worktrees) |
+---
 
-## Worktree isolation
+## What's preserved
 
-Each agent gets its own git worktree:
+- **Worktrees**. Each worker gets `git worktree add` to a dedicated branch. This is workspace isolation, unrelated to how the Claude process is run. Worktrees stay.
+- **State machine**. Running · Blocked · AwaitingReview · Done · Failed. Same as before.
+- **Persistence**. Sessions, transitions, reviews, task graphs in SQLite. Survives restarts.
+- **`orc doctor`**. Sanity check for git, claude CLI, and any leftover artefacts.
 
-```
-{repo_root_parent}/.orc-worktrees/
-├── auth-fix/         # branch: orc/auth-fix
-├── edit-redesign/    # branch: orc/edit-redesign
-└── ...
-```
+## What's removed
 
-On agent kill or orc quit: `git worktree remove --force` + `git branch -D`.
+- **tmux for workers**. Workers are stream-json children of orc; no terminal involved.
+- **Attach-into-claude**. There is no path that surrenders the screen to a raw Claude TUI. Editor handoff is the only outside-orc surrender, and it goes to a tool *you* picked.
+- **The PTY tail / pane snapshot**. Workers' logs are structured events, not terminal redraws.
 
-## File layout
+---
 
-```
-~/.orc/
-└── logs/
-    ├── auth-fix.stderr
-    └── edit-redesign.stderr
+## What you see
 
-{repo_root_parent}/.orc-worktrees/
-├── auth-fix/
-└── edit-redesign/
-```
+The promise to the user, in order of importance:
 
-## Non-goals (v1)
+1. **Always inside orc.** Every Claude conversation is rendered by orc. The only thing that ever takes the screen away is your editor, and only when you ask for it.
+2. **Readable, not noisy.** Workers' tabs show what they think and do, in chronological order, structured. No status-line redraws, no cursor-positioning artefacts.
+3. **One mental model everywhere.** Tabs work the same way whether the conversation is orc or a worker. Pop-ups, questions, interrupts, review — all behave identically across tab types.
+4. **Orchestration is real.** Orc isn't a router for messages. It supervises workers, answers their questions when it can, and only escalates to you when it can't.
+5. **You can always intervene.** Type to any tab. Interrupt any tab. Review or edit any worker's worktree. The orchestrator has authority over workers; you have authority over everything.
 
-- Agents talking to each other (orc mediates all cross-agent coordination)
-- Web UI or desktop app (terminal-first)
-- Non-Claude agents (Claude Code only)
-- Persisting across machine restarts
-- API cost tracking (subscription-based usage assumed)
+---
+
+## Out of scope (this spec)
+
+- Multi-orc / nested orchestration.
+- Workers spawned from another runtime (Codex, etc.) — interface designed for it but only Claude is implemented.
+- Cross-session conflict detection beyond worktree paths.
+- Web UI, daemon mode, mobile.
+- Memory across orc runs beyond what SQLite holds.

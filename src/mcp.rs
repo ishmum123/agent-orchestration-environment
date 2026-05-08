@@ -54,14 +54,21 @@ pub struct McpServer {
     state: StateHandle,
     project_dir: PathBuf,
     hook_socket_path: PathBuf,
+    mcp_port: u16,
 }
 
 impl McpServer {
-    pub fn new(state: StateHandle, project_dir: PathBuf, hook_socket_path: PathBuf) -> Self {
+    pub fn new(
+        state: StateHandle,
+        project_dir: PathBuf,
+        hook_socket_path: PathBuf,
+        mcp_port: u16,
+    ) -> Self {
         McpServer {
             state,
             project_dir,
             hook_socket_path,
+            mcp_port,
         }
     }
 
@@ -133,6 +140,18 @@ impl McpServer {
                     "properties": {
                         "session_id": { "type": "string", "description": "Session to mark done" },
                         "summary": { "type": "string", "description": "Summary of what was accomplished" }
+                    },
+                    "required": ["session_id", "summary"]
+                }),
+            },
+            ToolDef {
+                name: "submit_for_review".into(),
+                description: "Submit a worker's completed work for human review. Transitions the session to AwaitingReview so the user can inspect the diff and approve or reject. Use this instead of mark_done when changes need human verification.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Session whose work is ready for review" },
+                        "summary": { "type": "string", "description": "Summary of changes made (shown to user)" }
                     },
                     "required": ["session_id", "summary"]
                 }),
@@ -214,6 +233,7 @@ impl McpServer {
             "ask_user" => self.tool_ask_user(&args).await,
             "list_sessions" => self.tool_list_sessions(&args).await,
             "mark_done" => self.tool_mark_done(&args).await,
+            "submit_for_review" => self.tool_submit_for_review(&args).await,
             "update_task_graph" => self.tool_update_task_graph(&args).await,
             _ => Err(anyhow::anyhow!("unknown tool: {}", tool_name)),
         };
@@ -262,10 +282,14 @@ impl McpServer {
         let worktree_path = crate::worktree::create_worktree(project_dir, name).await?;
         let worktree_str = worktree_path.to_str().unwrap_or("").to_string();
 
-        // 2. Get base commit
+        // 2. Get base commit — read it from inside the worktree so it matches
+        //    whatever ref `worktree add` chose (currently the main branch). If
+        //    we read from project_dir we'd capture the orchestrator's branch
+        //    HEAD, which can diverge from the worktree's HEAD and give review
+        //    diffs polluted with unrelated branch differences.
         let base_output = tokio::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
-            .current_dir(project_dir)
+            .current_dir(&worktree_path)
             .output()
             .await?;
         let base_commit = String::from_utf8_lossy(&base_output.stdout)
@@ -287,26 +311,77 @@ impl McpServer {
         )
         .await?;
 
-        if tmux_ok {
-            // 5. Start Claude Code inside tmux with the task
-            let claude_cmd = format!(
-                "claude -p --model {} --permission-mode plan \"{}\"",
-                model,
-                task.replace('"', "\\\"")
-            );
-            let _ = crate::tmux::send_text(&tmux_name, &claude_cmd).await;
-            let _ = crate::tmux::send_keys(&tmux_name, &["Enter"]).await;
-
-            // 6. Start pipe-pane for log capture
-            let log_path = std::env::temp_dir().join(format!("orc-{}.log", name));
-            let _ = crate::tmux::start_pipe_pane(&tmux_name, &log_path).await;
-        }
-
-        // 7. Create state entry with real paths
+        // 5. Create state entry first so we have the session_id for the worker prompt.
         let session = self
             .state
             .create_session(name, task, &worktree_str, &branch, &base_commit, model)
             .await?;
+
+        if tmux_ok {
+            // 6. Write per-worker MCP config + system prompt files.
+            let mcp_cfg = generate_mcp_config(self.mcp_port);
+            let mcp_cfg_path = std::env::temp_dir().join(format!("orc-worker-mcp-{}.json", name));
+            let _ = tokio::fs::write(
+                &mcp_cfg_path,
+                serde_json::to_string_pretty(&mcp_cfg).unwrap_or_default(),
+            )
+            .await;
+
+            let worker_prompt = worker_system_prompt(&session.id, name, task);
+            let prompt_path = std::env::temp_dir().join(format!("orc-worker-prompt-{}.txt", name));
+            let _ = tokio::fs::write(&prompt_path, &worker_prompt).await;
+
+            // 7. Start pipe-pane FIRST so we capture the launch + banner.
+            let log_path = std::env::temp_dir().join(format!("{}.log", tmux_name));
+            let _ = crate::tmux::start_pipe_pane(&tmux_name, &log_path).await;
+
+            // 8. Launch interactive Claude inside tmux with MCP wired.
+            let claude_cmd = format!(
+                "claude --model {} --mcp-config {} --strict-mcp-config --dangerously-skip-permissions --append-system-prompt \"$(cat {})\"",
+                model,
+                mcp_cfg_path.display(),
+                prompt_path.display(),
+            );
+            let _ = crate::tmux::send_text(&tmux_name, &claude_cmd).await;
+            let _ = crate::tmux::send_keys(&tmux_name, &["Enter"]).await;
+
+            // 9. Hand off to a background task: wait for claude REPL ready, then
+            //    deliver the task as the first user message. Don't block this MCP
+            //    call — orc gets a fast spawn response, the worker gets its task
+            //    once it's actually able to receive it.
+            let task_owned = task.to_string();
+            let tmux_name_owned = tmux_name.clone();
+            tokio::spawn(async move {
+                // Markers that indicate the claude TUI has finished initializing.
+                let markers: &[&str] = &["Claude Code v", "bypass permissions", "❯"];
+                let ready = crate::tmux::wait_for_log_match(
+                    &log_path,
+                    markers,
+                    std::time::Duration::from_secs(45),
+                )
+                .await
+                .unwrap_or(false);
+                if !ready {
+                    eprintln!(
+                        "[mcp] worker {} did not show ready marker within 45s; sending task anyway",
+                        tmux_name_owned
+                    );
+                }
+                // Brief settle so claude's input field is the active focus.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let _ = crate::tmux::send_text(&tmux_name_owned, &task_owned).await;
+                // tmux paste-buffer wraps content in bracketed-paste escapes
+                // (\e[200~ ... \e[201~). Modern claude renders the paste as
+                // "[Pasted text #N +M lines]" before it is ready to receive a
+                // submit Enter. Without this delay, Enter races the render and
+                // gets dropped, leaving the worker stuck in INSERT mode with
+                // an unsubmitted prompt. Scale with task length: longer pastes
+                // take claude longer to settle.
+                let settle_ms = (300 + task_owned.len() / 4).min(3000) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                let _ = crate::tmux::send_keys(&tmux_name_owned, &["Enter"]).await;
+            });
+        }
 
         Ok(serde_json::to_string(&serde_json::json!({
             "session_id": session.id,
@@ -445,6 +520,61 @@ impl McpServer {
         }))?)
     }
 
+    async fn tool_submit_for_review(&self, args: &Value) -> Result<String> {
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'session_id'"))?;
+        let summary = args
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let session = self
+            .state
+            .get_session(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {}", session_id))?;
+
+        // Compute diff hash from the worktree against base commit.
+        let diff_hash = match crate::review::compute_diff(
+            &session.worktree_path,
+            &session.base_commit,
+        )
+        .await
+        {
+            Ok(diff) => crate::review::diff_hash(&diff),
+            Err(_) => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                summary.hash(&mut h);
+                session_id.hash(&mut h);
+                format!("{:016x}", h.finish())
+            }
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .send(StateCommand::ApplyEvent {
+                session_id: session_id.to_string(),
+                event: SessionEvent::WorkCompleted {
+                    diff_hash: diff_hash.clone(),
+                },
+                reply: tx,
+            })
+            .await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("state manager dropped reply"))??;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "diff_hash": diff_hash,
+            "summary": summary
+        }))?)
+    }
+
     async fn tool_update_task_graph(&self, args: &Value) -> Result<String> {
         let graph = args
             .get("graph")
@@ -521,7 +651,13 @@ pub async fn run_stdio(server: McpServer) -> Result<()> {
 /// Start the MCP server as an HTTP endpoint on localhost.
 /// Returns the bound port. The server runs as a background tokio task.
 /// Claude Code connects to `http://127.0.0.1:{port}/mcp` via HTTP transport.
-pub async fn start_http_server(server: std::sync::Arc<McpServer>) -> Result<u16> {
+pub async fn bind_http_listener() -> Result<(tokio::net::TcpListener, u16)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+}
+
+pub fn serve_http(listener: tokio::net::TcpListener, server: std::sync::Arc<McpServer>) {
     use axum::{extract::State, routing::post, Json, Router};
 
     async fn mcp_handler(
@@ -538,15 +674,17 @@ pub async fn start_http_server(server: std::sync::Arc<McpServer>) -> Result<u16>
         .route("/mcp", post(mcp_handler))
         .with_state(server);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             eprintln!("[mcp-http] server error: {}", e);
         }
     });
+}
 
+/// Backwards-compat helper: bind + serve.
+pub async fn start_http_server(server: std::sync::Arc<McpServer>) -> Result<u16> {
+    let (listener, port) = bind_http_listener().await?;
+    serve_http(listener, server);
     Ok(port)
 }
 
@@ -556,6 +694,36 @@ pub async fn start_http_server(server: std::sync::Arc<McpServer>) -> Result<u16>
 
 /// Generate MCP config JSON for Claude Code's --mcp-config flag (HTTP transport).
 /// The MCP server runs in-process on localhost, Claude Code connects to it.
+/// System prompt appended to a worker's claude session.
+/// Tells the worker its identity and how to use MCP tools to communicate back.
+pub fn worker_system_prompt(session_id: &str, name: &str, task: &str) -> String {
+    format!(
+        r#"You are an orc worker session.
+
+## Identity
+- session_id: {session_id}
+- name: {name}
+
+## Task
+{task}
+
+## How to communicate back
+You have access to these MCP tools (server: orc):
+- submit_for_review(session_id, summary): Call when your work is ready for human review. Pass your session_id ({session_id}). The user will inspect the diff and approve or reject.
+- mark_done(session_id, summary): Call only if no review is needed (rare).
+- ask_user(question, context?): Ask the human a question. BLOCKS until they respond.
+
+## Rules
+- Do the task in your current worktree. All your file edits live on a dedicated branch.
+- When done, ALWAYS call submit_for_review first. Don't ask the user to confirm; let them review the diff.
+- Keep your responses concise.
+"#,
+        session_id = session_id,
+        name = name,
+        task = task,
+    )
+}
+
 pub fn generate_mcp_config(port: u16) -> Value {
     serde_json::json!({
         "mcpServers": {
@@ -613,7 +781,7 @@ mod tests {
 
         // Leak tempdir so it outlives the test
         std::mem::forget(dir);
-        McpServer::new(handle, project_dir, hook_socket_path)
+        McpServer::new(handle, project_dir, hook_socket_path, 0)
     }
 
     #[tokio::test]
@@ -657,7 +825,7 @@ mod tests {
         let resp = server.handle_request(&req).await.unwrap();
         assert!(resp.error.is_none());
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 7);
+        assert_eq!(tools, 8);
     }
 
     #[tokio::test]

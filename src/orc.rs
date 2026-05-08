@@ -242,7 +242,8 @@ You have MCP tools to manage worker sessions:
 - **kill_session(session_id)**: Kill a worker and clean up resources.
 - **ask_user(question, context?)**: Ask the user a question. This BLOCKS until they respond. Use sparingly.
 - **list_sessions()**: Check status of all workers. Call this before making decisions.
-- **mark_done(session_id, summary)**: Mark a worker's task as complete.
+- **mark_done(session_id, summary)**: Mark a worker's task as complete (skips human review).
+- **submit_for_review(session_id, summary)**: Submit a worker's diff for human review. Workers usually call this themselves when done; you can also call it on their behalf.
 - **update_task_graph(graph)**: Update the task plan.
 
 ## Workflow

@@ -201,6 +201,73 @@ impl StateHandle {
             .await;
         rx.await.unwrap_or_default()
     }
+
+    /// Apply an event to a session. Returns Ok(()) on a valid transition.
+    pub async fn apply_event(&self, session_id: &str, event: SessionEvent) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(StateCommand::ApplyEvent {
+            session_id: session_id.to_string(),
+            event,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("state manager dropped reply"))??;
+        Ok(())
+    }
+
+    /// Hard-remove a session from memory + DB.
+    pub async fn remove_session(&self, session_id: &str) -> Result<()> {
+        self.send(StateCommand::RemoveSession {
+            session_id: session_id.to_string(),
+        })
+        .await
+    }
+}
+
+/// On startup, scan persisted sessions in non-terminal states. For any whose
+/// tmux session no longer exists (dead from a prior crash/quit), either
+/// transition them to `Failed` (so the user can `R` restart) or drop them
+/// outright if the state machine forbids the transition.
+///
+/// Returns the number of zombies acted on.
+pub async fn sweep_zombie_sessions(handle: &StateHandle) -> usize {
+    use crate::session::SessionState;
+    let sessions = handle.list_sessions().await;
+    let mut swept = 0;
+    for s in sessions {
+        let non_terminal = matches!(
+            s.state,
+            SessionState::Running
+                | SessionState::Blocked { .. }
+                | SessionState::AwaitingReview { .. }
+        );
+        if !non_terminal {
+            continue;
+        }
+        if crate::tmux::has_session(&s.tmux_session).await {
+            continue;
+        }
+
+        let reason = "tmux session gone (zombie sweep on startup)".to_string();
+        let result = match s.state {
+            SessionState::Running | SessionState::AwaitingReview { .. } => {
+                handle
+                    .apply_event(&s.id, SessionEvent::Errored { reason })
+                    .await
+            }
+            SessionState::Blocked { .. } => {
+                // The state machine forbids Blocked → Failed. A blocked-
+                // and-dead session is unrecoverable, so just remove it.
+                handle.remove_session(&s.id).await
+            }
+            _ => Ok(()),
+        };
+        if result.is_ok() {
+            swept += 1;
+        }
+    }
+    swept
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +388,7 @@ impl StateManager {
                 }
                 StateCommand::RemoveSession { session_id } => {
                     self.sessions.remove(&session_id);
+                    let _ = self.db.delete_session(&session_id);
                     let _ = self.change_tx.send(StateChange::SessionRemoved {
                         session_id,
                     });
@@ -546,6 +614,88 @@ mod tests {
         // Leak tempdir so it lives long enough
         std::mem::forget(dir);
         StateManager::new(db, policy)
+    }
+
+    #[tokio::test]
+    async fn sweep_marks_running_zombie_failed() {
+        let (handle, manager) = create_test_manager();
+        tokio::spawn(manager.run());
+
+        // Create a session whose tmux name is guaranteed not to exist.
+        let session = handle
+            .create_session(
+                "zombie-runner",
+                "task",
+                "/tmp/wt",
+                "branch",
+                "abc",
+                "sonnet",
+            )
+            .await
+            .unwrap();
+        // The default Session::new sets tmux_session to "orc-{name}", which we
+        // can rely on not existing in the test environment.
+        assert!(matches!(session.state, SessionState::Running));
+
+        let swept = sweep_zombie_sessions(&handle).await;
+        assert_eq!(swept, 1, "expected exactly one zombie swept");
+
+        let after = handle.get_session(&session.id).await.unwrap();
+        assert!(matches!(after.state, SessionState::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_terminal_sessions_alone() {
+        let (handle, manager) = create_test_manager();
+        tokio::spawn(manager.run());
+
+        let session = handle
+            .create_session("done-already", "task", "/tmp/wt", "br", "abc", "sonnet")
+            .await
+            .unwrap();
+        handle
+            .apply_event(
+                &session.id,
+                SessionEvent::Finished {
+                    summary: "ok".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let swept = sweep_zombie_sessions(&handle).await;
+        assert_eq!(swept, 0);
+
+        let after = handle.get_session(&session.id).await.unwrap();
+        assert!(matches!(after.state, SessionState::Done { .. }));
+    }
+
+    #[tokio::test]
+    async fn remove_session_deletes_from_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("rm.db");
+        let session_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            let policy = PolicyEngine::default_policy();
+            let (handle, manager) = StateManager::new(db, policy);
+            tokio::spawn(manager.run());
+            let s = handle
+                .create_session("rm-me", "t", "/tmp/wt", "br", "abc", "sonnet")
+                .await
+                .unwrap();
+            session_id = s.id.clone();
+            handle.remove_session(&s.id).await.unwrap();
+            // Give the manager a tick to process the command.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Reopen and verify the row is gone.
+        let db = Database::open(&db_path).unwrap();
+        let sessions = db.list_sessions().unwrap();
+        assert!(
+            !sessions.iter().any(|s| s.id == session_id),
+            "session row should be deleted from DB"
+        );
     }
 
     #[tokio::test]

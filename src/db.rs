@@ -226,6 +226,26 @@ impl Database {
         Ok(())
     }
 
+    /// Hard-delete a session and its dependent rows. Cascades manually because
+    /// the schema does not declare ON DELETE CASCADE.
+    pub fn delete_session(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM state_transitions WHERE session_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM permission_decisions WHERE session_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM reviews WHERE session_id = ?1",
+            params![id],
+        )?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Session> {
         self.conn
             .query_row(

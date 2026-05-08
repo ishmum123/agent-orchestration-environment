@@ -1,9 +1,11 @@
 // Tmux session lifecycle: create, attach, kill worker panes.
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 // ── private helper ────────────────────────────────────────────────────────────
 
@@ -118,9 +120,191 @@ pub async fn read_pipe_log(logfile: &Path, last_n: usize) -> Result<Vec<String>>
     Ok(lines)
 }
 
+/// Poll a pipe-pane log file until any of the given marker substrings appears
+/// in it, or until the timeout expires.
+///
+/// Returns `Ok(true)` when a marker is seen, `Ok(false)` on timeout. Errors only
+/// on hard IO failures other than "file not yet created" (which is treated as
+/// "not ready, keep polling").
+pub async fn wait_for_log_match(
+    log_path: &Path,
+    markers: &[&str],
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(content) = fs::read_to_string(log_path).await {
+            let cleaned = strip_ansi(&content);
+            if markers.iter().any(|m| cleaned.contains(m)) {
+                return Ok(true);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Strip ANSI escape sequences and control chars from a line.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(&pc) = chars.peek() {
+                        chars.next();
+                        if pc.is_ascii_alphabetic() || pc == '~' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(&pc) = chars.peek() {
+                        chars.next();
+                        if pc == '\x07' {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if c == '\r' {
+            // ignore CR
+        } else if (c as u32) < 0x20 && c != '\t' {
+            // skip other control chars
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Spawn a task that tails a pipe-pane log file and forwards new lines.
+/// Sends `(session_id, cleaned_line)` for every newline-terminated chunk.
+/// Exits when the channel is closed or after persistent file errors.
+pub fn spawn_log_tailer(
+    session_id: String,
+    log_path: PathBuf,
+    tx: mpsc::Sender<(String, String)>,
+) {
+    tokio::spawn(async move {
+        // Wait up to ~30s for the log file to appear.
+        for _ in 0..60 {
+            if log_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if !log_path.exists() {
+            return;
+        }
+
+        let mut offset: u64 = 0;
+        let mut leftover = String::new();
+        let mut error_streak = 0;
+
+        loop {
+            if tx.is_closed() {
+                return;
+            }
+            match tokio::fs::metadata(&log_path).await {
+                Ok(meta) => {
+                    error_streak = 0;
+                    let size = meta.len();
+                    if size < offset {
+                        offset = 0;
+                        leftover.clear();
+                    }
+                    if size > offset {
+                        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                        if let Ok(mut f) = tokio::fs::File::open(&log_path).await {
+                            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                                let mut buf = Vec::new();
+                                if f.read_to_end(&mut buf).await.is_ok() {
+                                    offset = size;
+                                    let chunk = String::from_utf8_lossy(&buf);
+                                    leftover.push_str(&chunk);
+                                    let mut parts: Vec<&str> = leftover.split('\n').collect();
+                                    let trail = parts.pop().unwrap_or("").to_string();
+                                    for line in parts {
+                                        let cleaned = strip_ansi(line);
+                                        if cleaned.is_empty() {
+                                            continue;
+                                        }
+                                        if tx.send((session_id.clone(), cleaned)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    leftover = trail;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    error_streak += 1;
+                    if error_streak >= 10 {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
 /// Capture the current pane content (snapshot).
 pub async fn capture_pane(name: &str) -> Result<String> {
     run_tmux(&["capture-pane", "-t", name, "-p"]).await
+}
+
+/// Snapshot the visible pane, return as one String per row (trailing blank
+/// rows trimmed). This is what the user would see if they attached.
+pub async fn capture_pane_lines(name: &str) -> Result<Vec<String>> {
+    let raw = capture_pane(name).await?;
+    let mut lines: Vec<String> = raw.lines().map(|l| l.trim_end().to_string()).collect();
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    Ok(lines)
+}
+
+/// Spawn a task that periodically captures the visible pane and pushes a
+/// fresh snapshot to the channel. Each event is the entire current view —
+/// the receiver should REPLACE its buffer, not append. This avoids the
+/// noise of pipe-pane (status-bar redraws, cursor escapes, etc.) and gives
+/// the UI the same view the user would see by attaching.
+pub fn spawn_pane_capturer(
+    session_id: String,
+    tmux_session: String,
+    tx: mpsc::Sender<(String, Vec<String>)>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            if tx.is_closed() {
+                return;
+            }
+            if !has_session(&tmux_session).await {
+                // tmux session is gone — stop capturing.
+                return;
+            }
+            if let Ok(lines) = capture_pane_lines(&tmux_session).await {
+                if tx.send((session_id.clone(), lines)).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
 }
 
 /// Attach to a tmux session (blocking — user takes over terminal).
@@ -204,6 +388,108 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .contains("myworker"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m text"), "red text");
+        assert_eq!(strip_ansi("\x1b[2;5Hcursor"), "cursor");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07hello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_removes_cr_and_controls() {
+        assert_eq!(strip_ansi("a\rb"), "ab");
+        assert_eq!(strip_ansi("a\x08b"), "ab");
+        assert_eq!(strip_ansi("a\tb"), "a\tb"); // tab kept
+    }
+
+    #[tokio::test]
+    async fn wait_for_log_match_finds_marker() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ready.log");
+        std::fs::File::create(&path).unwrap();
+
+        // Write the marker after a short delay from a separate task.
+        let path_w = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path_w)
+                .unwrap();
+            // Include an ANSI escape to ensure stripping is in play.
+            writeln!(f, "\x1b[1mClaude Code v2.1.123\x1b[0m").unwrap();
+        });
+
+        let found = wait_for_log_match(&path, &["Claude Code v"], Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(found, "expected marker to be found");
+    }
+
+    #[tokio::test]
+    async fn wait_for_log_match_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never.log");
+        std::fs::File::create(&path).unwrap();
+        let found = wait_for_log_match(&path, &["NEVER_APPEARS"], Duration::from_millis(400))
+            .await
+            .unwrap();
+        assert!(!found, "expected timeout");
+    }
+
+    #[tokio::test]
+    async fn wait_for_log_match_handles_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-yet.log");
+        // File doesn't exist yet — wait_for_log_match should keep polling, not error.
+        let path_w = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::fs::write(&path_w, "ready: ❯ prompt").unwrap();
+        });
+        let found = wait_for_log_match(&path, &["❯"], Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(found);
+    }
+
+    #[tokio::test]
+    async fn log_tailer_streams_new_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.log");
+        std::fs::File::create(&path).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<(String, String)>(64);
+        spawn_log_tailer("s1".to_string(), path.clone(), tx);
+
+        // give the tailer a moment to attach
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "\x1b[31mfirst\x1b[0m").unwrap();
+        writeln!(f, "second").unwrap();
+        drop(f);
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                Ok(Some((id, line))) => {
+                    assert_eq!(id, "s1");
+                    got.push(line);
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(got, vec!["first".to_string(), "second".to_string()]);
     }
 
     #[tokio::test]
