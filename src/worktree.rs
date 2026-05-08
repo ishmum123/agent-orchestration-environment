@@ -1,14 +1,16 @@
+// Git worktree management: create/remove isolated worktrees for agents.
+
 use anyhow::{bail, Context, Result};
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 /// Returns the git repo root for the given project directory.
-pub fn repo_root(project_dir: &str) -> Result<PathBuf> {
+pub async fn repo_root(project_dir: &str) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(project_dir)
         .output()
+        .await
         .context("failed to run git rev-parse --show-toplevel")?;
 
     if !output.status.success() {
@@ -25,19 +27,23 @@ pub fn repo_root(project_dir: &str) -> Result<PathBuf> {
 }
 
 /// Detects the main branch name ("main" or "master").
-pub fn main_branch(project_dir: &str) -> Result<String> {
-    let check = |branch: &str| -> bool {
-        Command::new("git")
-            .args(["rev-parse", "--verify", branch])
-            .current_dir(project_dir)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+pub async fn main_branch(project_dir: &str) -> Result<String> {
+    let check = |branch: &'static str| {
+        let dir = project_dir.to_string();
+        async move {
+            Command::new("git")
+                .args(["rev-parse", "--verify", branch])
+                .current_dir(&dir)
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
     };
 
-    if check("main") {
+    if check("main").await {
         Ok("main".to_string())
-    } else if check("master") {
+    } else if check("master").await {
         Ok("master".to_string())
     } else {
         bail!("neither 'main' nor 'master' branch exists")
@@ -48,9 +54,9 @@ pub fn main_branch(project_dir: &str) -> Result<String> {
 ///
 /// Branch: `orc/{agent_name}`
 /// Directory: `{repo_root_parent}/.orc-worktrees/{agent_name}`
-pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
-    let root = repo_root(project_dir)?;
-    let base = main_branch(project_dir)?;
+pub async fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
+    let root = repo_root(project_dir).await?;
+    let base = main_branch(project_dir).await?;
 
     let branch = format!("orc/{agent_name}");
     let worktree_dir = root
@@ -59,7 +65,8 @@ pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
         .join(".orc-worktrees")
         .join(agent_name);
 
-    fs::create_dir_all(worktree_dir.parent().unwrap())
+    tokio::fs::create_dir_all(worktree_dir.parent().unwrap())
+        .await
         .context("failed to create worktree parent directory")?;
 
     let output = Command::new("git")
@@ -68,11 +75,14 @@ pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
             "add",
             "-b",
             &branch,
-            worktree_dir.to_str().context("worktree path not valid UTF-8")?,
+            worktree_dir
+                .to_str()
+                .context("worktree path not valid UTF-8")?,
             &base,
         ])
         .current_dir(project_dir)
         .output()
+        .await
         .context("failed to run git worktree add")?;
 
     if !output.status.success() {
@@ -84,19 +94,20 @@ pub fn create_worktree(project_dir: &str, agent_name: &str) -> Result<PathBuf> {
 }
 
 /// Removes the worktree and branch for the given agent.
-pub fn remove_worktree(project_dir: &str, worktree_path: &Path, agent_name: &str) -> Result<()> {
-    let worktree_str = worktree_path.to_str()
+pub async fn remove_worktree(
+    project_dir: &str,
+    worktree_path: &Path,
+    agent_name: &str,
+) -> Result<()> {
+    let worktree_str = worktree_path
+        .to_str()
         .context("worktree path not valid UTF-8")?;
 
     let output = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            worktree_str,
-        ])
+        .args(["worktree", "remove", "--force", worktree_str])
         .current_dir(project_dir)
         .output()
+        .await
         .context("failed to run git worktree remove")?;
 
     if !output.status.success() {
@@ -109,6 +120,7 @@ pub fn remove_worktree(project_dir: &str, worktree_path: &Path, agent_name: &str
         .args(["branch", "-D", &branch])
         .current_dir(project_dir)
         .output()
+        .await
         .context("failed to run git branch -D")?;
 
     if !output.status.success() {
