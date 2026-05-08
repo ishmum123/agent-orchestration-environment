@@ -22,11 +22,33 @@ pub enum ContentBlock {
     Unknown,
 }
 
+/// Token usage data from the API response.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl Usage {
+    /// Total context tokens (input + cached).
+    pub fn total_context_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+    }
+}
+
 /// The message body inside an `assistant` event.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantMessage {
     #[serde(default)]
     pub content: Vec<ContentBlock>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// Top-level NDJSON events from `claude -p --output-format stream-json --verbose`.
@@ -149,6 +171,35 @@ mod tests {
         let json = r#"{"type":"rate_limit_event","rate_limit_info":{}}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, StreamEvent::Other));
+    }
+
+    #[test]
+    fn test_parse_assistant_with_usage() {
+        let json = r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-sonnet-4-20250514","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":20000,"cache_read_input_tokens":5000,"output_tokens":10}},"session_id":"s1"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant { message, .. } => {
+                let usage = message.usage.unwrap();
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.cache_creation_input_tokens, 20000);
+                assert_eq!(usage.cache_read_input_tokens, 5000);
+                assert_eq!(usage.output_tokens, 10);
+                assert_eq!(usage.total_context_tokens(), 25100);
+            }
+            _ => panic!("expected Assistant event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_assistant_without_usage() {
+        let json = r#"{"type":"assistant","message":{"id":"msg_1","model":"m","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":null},"session_id":"s1"}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Assistant { message, .. } => {
+                assert!(message.usage.is_none());
+            }
+            _ => panic!("expected Assistant event"),
+        }
     }
 
     #[test]

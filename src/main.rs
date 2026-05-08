@@ -97,6 +97,15 @@ fn run_loop(
 
         app.process_orc_commands()?;
         app.prune_dead_agents()?;
+
+        // Check agent context sizes and alert orc
+        let context_alerts = app.check_agent_context();
+        for alert in &context_alerts {
+            if let Some(ref mut orc) = app.orc {
+                orc.send(alert).ok();
+            }
+        }
+
         app.tick = app.tick.wrapping_add(1);
 
         terminal.draw(|f| ui::render(f, app))?;

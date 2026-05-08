@@ -69,7 +69,6 @@ impl ClaudeArgs {
         self
     }
 
-    #[cfg(test)]
     pub fn model(mut self, model: &str) -> Self {
         self.model = Some(model.to_string());
         self

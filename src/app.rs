@@ -1,4 +1,4 @@
-use crate::agent::{self, Agent, AgentState, OutputEntry};
+use crate::agent::{self, Agent, AgentState, ContextWarning, OutputEntry};
 use crate::claude::{self, ClaudeProcess};
 use crate::events::{ContentBlock, StreamEvent};
 use crate::worktree;
@@ -52,7 +52,7 @@ pub enum ConfirmCallback {
 
 /// Commands the orc brain can embed in its responses.
 pub enum OrcCommand {
-    Spawn { name: String, task: String },
+    Spawn { name: String, task: String, model: Option<String> },
     Tell { name: String, message: String },
     Kill { name: String },
 }
@@ -137,7 +137,8 @@ pub fn parse_orc_commands(text: &str) -> Vec<OrcCommand> {
                     extract_attr(block, "name"),
                     extract_attr_multiline(block, "task"),
                 ) {
-                    cmds.push(OrcCommand::Spawn { name, task });
+                    let model = extract_attr(block, "model");
+                    cmds.push(OrcCommand::Spawn { name, task, model });
                 }
             }
             "tell" => {
@@ -204,6 +205,7 @@ pub struct App {
     pub orc_prompt_count: u64,
     pub tick: u64,
     pub orc_waiting: bool,
+    pub orc_context_tokens: u64,
 }
 
 impl App {
@@ -227,6 +229,7 @@ impl App {
             orc_prompt_count: 0,
             tick: 0,
             orc_waiting: false,
+            orc_context_tokens: 0,
         }
     }
 
@@ -302,7 +305,7 @@ impl App {
             (dedupe_name(&slug, &self.agents), input.to_string())
         };
 
-        self.spawn_agent_by_name(&name, &description)?;
+        self.spawn_agent_by_name(&name, &description, None)?;
 
         if let Some(ref mut orc) = self.orc {
             let msg = format!(
@@ -315,13 +318,15 @@ impl App {
         Ok(())
     }
 
-    pub fn spawn_agent_by_name(&mut self, name: &str, task: &str) -> Result<()> {
+    pub fn spawn_agent_by_name(&mut self, name: &str, task: &str, model: Option<&str>) -> Result<()> {
+        let model = model.unwrap_or("sonnet");
         let name = dedupe_name(name, &self.agents);
 
         let worktree_path = worktree::create_worktree(&self.project_dir, &name)?;
 
         let mut args = claude::ClaudeArgs::new()
-            .permission_mode("dangerously-skip-permissions");
+            .permission_mode("dangerously-skip-permissions")
+            .model(model);
         if let Some(log_path) = stderr_log_path(&name) {
             args = args.stderr_log(log_path);
         }
@@ -335,7 +340,7 @@ impl App {
         let agent = Agent::new(name.clone(), task.to_string(), process, worktree_path);
         self.agents.push(agent);
         self.orc_output.push(OutputEntry::Text(
-            format!("spawning **{}** to: {}", name, truncate_str(task, 120))
+            format!("spawning **{}** [{}] to: {}", name, model, truncate_str(task, 120))
         ));
         self.set_status(format!("spawned '{}'", name));
 
@@ -400,8 +405,8 @@ impl App {
         let cmds: Vec<OrcCommand> = std::mem::take(&mut self.orc_pending_cmds);
         for cmd in cmds {
             match cmd {
-                OrcCommand::Spawn { name, task } => {
-                    self.spawn_agent_by_name(&name, &task)?;
+                OrcCommand::Spawn { name, task, model } => {
+                    self.spawn_agent_by_name(&name, &task, model.as_deref())?;
                 }
                 OrcCommand::Tell { name, message } => {
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
@@ -469,6 +474,46 @@ impl App {
         Ok(())
     }
 
+    /// Check agent context sizes and notify orc when thresholds are crossed.
+    /// Uses real token counts from stream-json usage data.
+    /// Returns alerts to send to orc.
+    pub fn check_agent_context(&mut self) -> Vec<String> {
+        let mut alerts = Vec::new();
+
+        for agent in &mut self.agents {
+            if !matches!(agent.state, AgentState::Working) {
+                continue;
+            }
+
+            let tokens = agent.context_tokens;
+
+            match agent.context_warned {
+                ContextWarning::None if tokens >= 50_000 => {
+                    agent.context_warned = ContextWarning::Warned50k;
+                    alerts.push(format!(
+                        "CONTEXT WARNING: Agent \"{}\" is at {}K tokens. \
+                         Start planning to offload its remaining work. \
+                         Either tell it to summarize progress and wrap up, \
+                         or prepare replacement agent(s) with compressed context.",
+                        agent.name, tokens / 1000
+                    ));
+                }
+                ContextWarning::Warned50k if tokens >= 75_000 => {
+                    agent.context_warned = ContextWarning::Warned75k;
+                    alerts.push(format!(
+                        "CONTEXT CRITICAL: Agent \"{}\" is at {}K tokens and approaching the limit. \
+                         Act now: tell it to commit/save progress, then kill it and spawn \
+                         replacement(s) with a summary of what was done and what remains.",
+                        agent.name, tokens / 1000
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        alerts
+    }
+
     /// Ensure `selected` stays in bounds after agent removal.
     fn clamp_selected(&mut self) {
         if self.selected >= self.agents.len() && !self.agents.is_empty() {
@@ -528,6 +573,9 @@ impl App {
                     match &event {
                         StreamEvent::System { .. } => {}
                         StreamEvent::Assistant { message, .. } => {
+                            if let Some(ref usage) = message.usage {
+                                self.orc_context_tokens = usage.total_context_tokens();
+                            }
                             for block in &message.content {
                                 match block {
                                     ContentBlock::Text { text } => {
@@ -620,6 +668,9 @@ fn drain_agent_events(agent: &mut Agent) {
                         agent.state = AgentState::Working;
                         agent.prune_after_orc_prompt = None;
                         agent.done_at = None;
+                        if let Some(ref usage) = message.usage {
+                            agent.context_tokens = usage.total_context_tokens();
+                        }
                         for block in &message.content {
                             match block {
                                 ContentBlock::Text { text } => {
@@ -752,14 +803,29 @@ mod tests {
     #[test]
     fn test_parse_orc_commands_spawn() {
         let text = r#"I'll spawn an agent for this.
-[SPAWN_AGENT name="fix-bug" task="Fix the login bug in src/auth.rs"]
+[SPAWN_AGENT name="fix-bug" model="sonnet" task="Fix the login bug in src/auth.rs"]
 "#;
         let cmds = parse_orc_commands(text);
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
-            OrcCommand::Spawn { name, task } => {
+            OrcCommand::Spawn { name, task, model } => {
                 assert_eq!(name, "fix-bug");
                 assert_eq!(task, "Fix the login bug in src/auth.rs");
+                assert_eq!(model.as_deref(), Some("sonnet"));
+            }
+            _ => panic!("expected Spawn"),
+        }
+    }
+
+    #[test]
+    fn test_parse_orc_commands_spawn_no_model() {
+        let text = r#"[SPAWN_AGENT name="fix-bug" task="Fix it"]"#;
+        let cmds = parse_orc_commands(text);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            OrcCommand::Spawn { name, model, .. } => {
+                assert_eq!(name, "fix-bug");
+                assert_eq!(*model, None);
             }
             _ => panic!("expected Spawn"),
         }
@@ -847,7 +913,7 @@ Working on it."#;
     #[test]
     fn test_parse_orc_commands_multiline() {
         let text = r#"Here's the plan:
-[SPAWN_AGENT name="dark-mode" task="Add dark mode toggle.
+[SPAWN_AGENT name="dark-mode" model="sonnet" task="Add dark mode toggle.
 Steps:
 1. Read theme files
 2. Add toggle button
@@ -856,10 +922,11 @@ Done."#;
         let cmds = parse_orc_commands(text);
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
-            OrcCommand::Spawn { name, task } => {
+            OrcCommand::Spawn { name, task, model } => {
                 assert_eq!(name, "dark-mode");
                 assert!(task.contains("Steps:"));
                 assert!(task.contains("Persist preference"));
+                assert_eq!(model.as_deref(), Some("sonnet"));
             }
             _ => panic!("expected Spawn"),
         }

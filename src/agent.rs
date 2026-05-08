@@ -102,6 +102,21 @@ pub struct Agent {
     /// orc_prompt_count snapshot when this agent became a prune candidate.
     /// Agent is pruned when orc_prompt_count exceeds this value.
     pub prune_after_orc_prompt: Option<u64>,
+    /// Latest context size in tokens, from stream-json usage data.
+    pub context_tokens: u64,
+    /// Context threshold already reported to orc (avoids repeat alerts).
+    pub context_warned: ContextWarning,
+}
+
+/// Tracks which context size warnings have been sent to the orc.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ContextWarning {
+    #[default]
+    None,
+    /// Warned at ~50K tokens — orc should start planning offload.
+    Warned50k,
+    /// Warned at ~75K tokens — orc must act now.
+    Warned75k,
 }
 
 impl Agent {
@@ -122,6 +137,8 @@ impl Agent {
             cost_usd: 0.0,
             done_at: None,
             prune_after_orc_prompt: None,
+            context_tokens: 0,
+            context_warned: ContextWarning::None,
         }
     }
 
@@ -143,6 +160,8 @@ impl Agent {
             cost_usd: 0.0,
             done_at: None,
             prune_after_orc_prompt: None,
+            context_tokens: 0,
+            context_warned: ContextWarning::None,
         }
     }
 
