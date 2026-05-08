@@ -131,6 +131,8 @@ fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
     let rect = centered_rect(60, 40, area);
     frame.render_widget(Clear, rect);
 
+    let show_welcome = matches!(target, TabId::Orc) && buffer.is_empty();
+
     let title = match target {
         TabId::Orc => "speak to orc".to_string(),
         TabId::Worker(idx) => format!("speak to worker #{}", idx + 1),
@@ -141,19 +143,39 @@ fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
 
     let (body, hint_area) = split_body_hint(inner);
 
+    // Welcome header takes 2 lines (wrapped blurb) when present.
+    let welcome_height: u16 = if show_welcome { 3 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(3)])
+        .constraints([
+            Constraint::Length(welcome_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
         .split(body);
+
+    if show_welcome {
+        let welcome = Paragraph::new(
+            "hey I am orc — give me a task or a list of tasks and I'll help you complete them",
+        )
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(welcome, chunks[0]);
+    }
 
     let label_text = match target {
         TabId::Orc => "describe the task for orc to plan:",
         TabId::Worker(_) => "send a message to this worker:",
     };
     let label = Paragraph::new(label_text).style(Style::default().fg(Color::White));
-    frame.render_widget(label, chunks[0]);
+    frame.render_widget(label, chunks[1]);
 
-    render_input_box(frame, chunks[2], buffer);
+    render_input_box(frame, chunks[3], buffer);
 
     let hints = hint_line(&[
         ("enter", "send"),

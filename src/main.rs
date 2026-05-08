@@ -136,6 +136,12 @@ async fn main() -> Result<()> {
     let mut app = App::new(&project_str).with_state_handle(state_handle.clone());
     app.push_chat(ChatRole::System, format!("orc v2 — MCP on port {mcp_port}"));
 
+    // Welcome prompt — open a NewTask modal targeted at orc on first frame.
+    app.modal = Some(Modal::NewTask {
+        target: TabId::Orc,
+        buffer: String::new(),
+    });
+
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
