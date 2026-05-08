@@ -42,6 +42,7 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub claude_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +184,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             ended_at: None,
+            claude_session_id: None,
         }
     }
 

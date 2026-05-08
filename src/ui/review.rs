@@ -385,6 +385,8 @@ mod tests {
             comments: Vec::new(),
             hunk_approvals: HashSet::new(),
             overall: None,
+            view_mode: crate::review::ViewMode::Diff,
+            worktree_path: String::new(),
         }
     }
 
@@ -468,6 +470,8 @@ mod tests {
             comments: Vec::new(),
             hunk_approvals: HashSet::new(),
             overall: None,
+            view_mode: crate::review::ViewMode::Diff,
+            worktree_path: String::new(),
         }
     }
 

@@ -1,6 +1,5 @@
 // Worker process: a stream-json claude child, owned by orc.
 //
-// Mirrors `orc::OrcProcess` but plural — one per spawned worker session.
 // Workers communicate via stdin/stdout pipes (no tmux). The user interacts
 // with a worker entirely through orc's TUI: a chat-style view that renders
 // the structured event stream and lets the user type instructions back. The
@@ -38,6 +37,11 @@ pub enum WorkerEvent {
         is_error: bool,
         cost_usd: Option<f64>,
     },
+    /// First system event carries claude's session_id — capture for --resume.
+    ClaudeSessionId {
+        session_id: String,
+        claude_session_id: String,
+    },
     /// Stream-json child exited.
     Exited {
         session_id: String,
@@ -68,6 +72,19 @@ impl WorkerHandle {
         Ok(())
     }
 
+    /// Cancel an in-flight turn without killing the conversation. Stream-json
+    /// has no out-of-band interrupt today, so we send SIGINT to the child;
+    /// claude treats it as cancel-current-turn and stays alive.
+    pub async fn interrupt(&self) -> Result<()> {
+        let child = self.child.lock().await;
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGINT);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn kill(&self) -> Result<()> {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
@@ -75,19 +92,11 @@ impl WorkerHandle {
     }
 }
 
-/// Spawn a stream-json claude child as a worker. The task is sent as the
-/// first user message after the child is up. A tokio task drains stdout,
-/// parses each NDJSON line, and forwards `WorkerEvent`s to `events_tx` until
-/// EOF or kill.
-pub async fn spawn_worker(
-    session_id: String,
-    worktree: PathBuf,
-    model: String,
-    mcp_config_path: PathBuf,
-    system_prompt: String,
-    task: String,
-    events_tx: mpsc::UnboundedSender<WorkerEvent>,
-) -> Result<WorkerHandle> {
+fn build_base_command(
+    model: &str,
+    mcp_config_path: &PathBuf,
+    system_prompt: &str,
+) -> Command {
     let mut cmd = Command::new("claude");
     cmd.args([
         "-p",
@@ -97,20 +106,24 @@ pub async fn spawn_worker(
         "stream-json",
         "--verbose",
         "--model",
-        &model,
+        model,
         "--mcp-config",
         mcp_config_path.to_str().unwrap_or(""),
         "--strict-mcp-config",
         "--dangerously-skip-permissions",
         "--append-system-prompt",
-        &system_prompt,
+        system_prompt,
     ]);
-    cmd.current_dir(&worktree);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
+    cmd
+}
 
-    let mut child = cmd.spawn()?;
+async fn finalise_spawn(
+    session_id: String,
+    worktree: PathBuf,
+    model: String,
+    mut child: Child,
+    events_tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<WorkerHandle> {
     let stdin = child
         .stdin
         .take()
@@ -125,13 +138,12 @@ pub async fn spawn_worker(
 
     let handle = WorkerHandle {
         session_id: session_id.clone(),
-        worktree: worktree.clone(),
-        model: model.clone(),
+        worktree,
+        model,
         child: child_arc.clone(),
         stdin: stdin_arc.clone(),
     };
 
-    // Spawn the stdout reader task.
     {
         let session_id = session_id.clone();
         let events_tx = events_tx.clone();
@@ -153,7 +165,6 @@ pub async fn spawn_worker(
                     }
                 }
             }
-            // Stream closed — wait on the child to record exit code.
             let code = {
                 let mut child = child_arc.lock().await;
                 child.wait().await.ok().and_then(|s| s.code())
@@ -162,7 +173,29 @@ pub async fn spawn_worker(
         });
     }
 
-    // Seed the conversation with the task as the first user message.
+    Ok(handle)
+}
+
+/// Spawn a stream-json claude child as a worker. The task is sent as the
+/// first user message after the child is up.
+pub async fn spawn_worker(
+    session_id: String,
+    worktree: PathBuf,
+    model: String,
+    mcp_config_path: PathBuf,
+    system_prompt: String,
+    task: String,
+    events_tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<WorkerHandle> {
+    let mut cmd = build_base_command(&model, &mcp_config_path, &system_prompt);
+    cmd.current_dir(&worktree);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let child = cmd.spawn()?;
+    let handle = finalise_spawn(session_id.clone(), worktree, model, child, events_tx).await?;
+
     if let Err(e) = handle.send(&task).await {
         eprintln!(
             "[worker {}] failed to deliver initial task: {}",
@@ -173,11 +206,41 @@ pub async fn spawn_worker(
     Ok(handle)
 }
 
+/// Resume a worker against a captured `claude --resume <id>` session. No
+/// initial seed; the user's next message resumes the conversation.
+pub async fn spawn_worker_resume(
+    session_id: String,
+    worktree: PathBuf,
+    model: String,
+    mcp_config_path: PathBuf,
+    system_prompt: String,
+    claude_session_id: String,
+    events_tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<WorkerHandle> {
+    let mut cmd = build_base_command(&model, &mcp_config_path, &system_prompt);
+    cmd.args(["--resume", &claude_session_id]);
+    cmd.current_dir(&worktree);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let child = cmd.spawn()?;
+    finalise_spawn(session_id, worktree, model, child, events_tx).await
+}
+
 /// Parse a stream-json line into zero or more typed worker events.
 pub fn parse_worker_events(session_id: &str, raw: &Value) -> Vec<WorkerEvent> {
     let mut out = Vec::new();
     let event_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
+        "system" => {
+            if let Some(sid) = raw.get("session_id").and_then(|v| v.as_str()) {
+                out.push(WorkerEvent::ClaudeSessionId {
+                    session_id: session_id.to_string(),
+                    claude_session_id: sid.to_string(),
+                });
+            }
+        }
         "assistant" => {
             if let Some(content) = raw.pointer("/message/content").and_then(|v| v.as_array()) {
                 for block in content {
@@ -218,8 +281,6 @@ pub fn parse_worker_events(session_id: &str, raw: &Value) -> Vec<WorkerEvent> {
             }
         }
         "user" => {
-            // Tool results come back as a "user" message containing a
-            // tool_result block (claude convention). Surface as ToolResult.
             if let Some(content) = raw.pointer("/message/content").and_then(|v| v.as_array()) {
                 for block in content {
                     if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
@@ -363,6 +424,27 @@ mod tests {
                 assert_eq!(*cost_usd, Some(0.012));
             }
             _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn parse_system_emits_claude_session_id() {
+        let raw = serde_json::json!({
+            "type": "system",
+            "session_id": "abc-123",
+            "model": "claude-sonnet-4"
+        });
+        let events = parse_worker_events("worker-1", &raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WorkerEvent::ClaudeSessionId {
+                session_id,
+                claude_session_id,
+            } => {
+                assert_eq!(session_id, "worker-1");
+                assert_eq!(claude_session_id, "abc-123");
+            }
+            _ => panic!("expected ClaudeSessionId"),
         }
     }
 

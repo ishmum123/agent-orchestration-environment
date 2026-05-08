@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 use crate::session::SessionEvent;
 use crate::state::{StateCommand, StateHandle};
+use crate::worker::WorkerEvent;
+use crate::worker_registry::WorkerRegistry;
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC types
@@ -55,6 +58,8 @@ pub struct McpServer {
     project_dir: PathBuf,
     hook_socket_path: PathBuf,
     mcp_port: u16,
+    workers: WorkerRegistry,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
 }
 
 impl McpServer {
@@ -63,12 +68,16 @@ impl McpServer {
         project_dir: PathBuf,
         hook_socket_path: PathBuf,
         mcp_port: u16,
+        workers: WorkerRegistry,
+        worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     ) -> Self {
         McpServer {
             state,
             project_dir,
             hook_socket_path,
             mcp_port,
+            workers,
+            worker_tx,
         }
     }
 
@@ -278,15 +287,9 @@ impl McpServer {
 
         let project_dir = self.project_dir.to_str().unwrap_or(".");
 
-        // 1. Create worktree
         let worktree_path = crate::worktree::create_worktree(project_dir, name).await?;
         let worktree_str = worktree_path.to_str().unwrap_or("").to_string();
 
-        // 2. Get base commit — read it from inside the worktree so it matches
-        //    whatever ref `worktree add` chose (currently the main branch). If
-        //    we read from project_dir we'd capture the orchestrator's branch
-        //    HEAD, which can diverge from the worktree's HEAD and give review
-        //    diffs polluted with unrelated branch differences.
         let base_output = tokio::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&worktree_path)
@@ -297,90 +300,46 @@ impl McpServer {
             .to_string();
 
         let branch = format!("orc/{}", name);
+
+        // hook relay script — keyed by session name (legacy tmux_session
+        // string), kept so PreToolUse/PostToolUse hooks still wire back.
         let tmux_name = format!("orc-{}", name);
+        let _hook_script =
+            crate::hooks::create_hook_script(&self.hook_socket_path, &tmux_name).await?;
 
-        // 3. Create tmux session (best-effort — may not be available in tests)
-        let tmux_ok = crate::tmux::create_session(&tmux_name, &worktree_path)
-            .await
-            .is_ok();
-
-        // 4. Create hook relay script
-        let _hook_script = crate::hooks::create_hook_script(
-            &self.hook_socket_path,
-            &tmux_name,
-        )
-        .await?;
-
-        // 5. Create state entry first so we have the session_id for the worker prompt.
+        // Create state entry first so we have the session_id for the worker prompt.
         let session = self
             .state
             .create_session(name, task, &worktree_str, &branch, &base_commit, model)
             .await?;
 
-        if tmux_ok {
-            // 6. Write per-worker MCP config + system prompt files.
-            let mcp_cfg = generate_mcp_config(self.mcp_port);
-            let mcp_cfg_path = std::env::temp_dir().join(format!("orc-worker-mcp-{}.json", name));
-            let _ = tokio::fs::write(
-                &mcp_cfg_path,
-                serde_json::to_string_pretty(&mcp_cfg).unwrap_or_default(),
-            )
-            .await;
+        // Spawn the stream-json worker child via the registry.
+        let mcp_cfg = generate_mcp_config(self.mcp_port);
+        let mcp_cfg_path = std::env::temp_dir().join(format!("orc-worker-mcp-{}.json", name));
+        let _ = tokio::fs::write(
+            &mcp_cfg_path,
+            serde_json::to_string_pretty(&mcp_cfg).unwrap_or_default(),
+        )
+        .await;
 
-            let worker_prompt = worker_system_prompt(&session.id, name, task);
-            let prompt_path = std::env::temp_dir().join(format!("orc-worker-prompt-{}.txt", name));
-            let _ = tokio::fs::write(&prompt_path, &worker_prompt).await;
-
-            // 7. Start pipe-pane FIRST so we capture the launch + banner.
-            let log_path = std::env::temp_dir().join(format!("{}.log", tmux_name));
-            let _ = crate::tmux::start_pipe_pane(&tmux_name, &log_path).await;
-
-            // 8. Launch interactive Claude inside tmux with MCP wired.
-            let claude_cmd = format!(
-                "claude --model {} --mcp-config {} --strict-mcp-config --dangerously-skip-permissions --append-system-prompt \"$(cat {})\"",
-                model,
-                mcp_cfg_path.display(),
-                prompt_path.display(),
-            );
-            let _ = crate::tmux::send_text(&tmux_name, &claude_cmd).await;
-            let _ = crate::tmux::send_keys(&tmux_name, &["Enter"]).await;
-
-            // 9. Hand off to a background task: wait for claude REPL ready, then
-            //    deliver the task as the first user message. Don't block this MCP
-            //    call — orc gets a fast spawn response, the worker gets its task
-            //    once it's actually able to receive it.
-            let task_owned = task.to_string();
-            let tmux_name_owned = tmux_name.clone();
-            tokio::spawn(async move {
-                // Markers that indicate the claude TUI has finished initializing.
-                let markers: &[&str] = &["Claude Code v", "bypass permissions", "❯"];
-                let ready = crate::tmux::wait_for_log_match(
-                    &log_path,
-                    markers,
-                    std::time::Duration::from_secs(45),
-                )
-                .await
-                .unwrap_or(false);
-                if !ready {
-                    eprintln!(
-                        "[mcp] worker {} did not show ready marker within 45s; sending task anyway",
-                        tmux_name_owned
-                    );
-                }
-                // Brief settle so claude's input field is the active focus.
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                let _ = crate::tmux::send_text(&tmux_name_owned, &task_owned).await;
-                // tmux paste-buffer wraps content in bracketed-paste escapes
-                // (\e[200~ ... \e[201~). Modern claude renders the paste as
-                // "[Pasted text #N +M lines]" before it is ready to receive a
-                // submit Enter. Without this delay, Enter races the render and
-                // gets dropped, leaving the worker stuck in INSERT mode with
-                // an unsubmitted prompt. Scale with task length: longer pastes
-                // take claude longer to settle.
-                let settle_ms = (300 + task_owned.len() / 4).min(3000) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
-                let _ = crate::tmux::send_keys(&tmux_name_owned, &["Enter"]).await;
-            });
+        let worker_prompt = worker_system_prompt(&session.id, name, task);
+        match crate::worker::spawn_worker(
+            session.id.clone(),
+            worktree_path.clone(),
+            model.to_string(),
+            mcp_cfg_path,
+            worker_prompt,
+            task.to_string(),
+            self.worker_tx.clone(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                self.workers.insert(handle).await;
+            }
+            Err(e) => {
+                eprintln!("[mcp] failed to spawn worker {}: {}", name, e);
+            }
         }
 
         Ok(serde_json::to_string(&serde_json::json!({
@@ -402,13 +361,13 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'message'"))?;
 
-        let session = self
+        let _session = self
             .state
             .get_session(session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
 
-        crate::tmux::send_text(&session.tmux_session, message).await?;
+        self.workers.send(session_id, message).await?;
 
         Ok(serde_json::to_string(&serde_json::json!({
             "delivered": true,
@@ -428,8 +387,8 @@ impl McpServer {
             .await
             .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
 
-        // Kill tmux session
-        let _ = crate::tmux::kill_session(&session.tmux_session).await;
+        // Kill the worker stream-json child if registered.
+        let _ = self.workers.kill(session_id).await;
 
         // Remove worktree if it exists
         if !session.worktree_path.is_empty() {
@@ -781,7 +740,8 @@ mod tests {
 
         // Leak tempdir so it outlives the test
         std::mem::forget(dir);
-        McpServer::new(handle, project_dir, hook_socket_path, 0)
+        let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
+        McpServer::new(handle, project_dir, hook_socket_path, 0, WorkerRegistry::new(), worker_tx)
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 // - Authoritative: projections of StateManager data, updated via broadcast
 // - UI-local: focused tab, scroll, modals, pending input — ephemeral
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -23,16 +23,30 @@ pub enum TabId {
 }
 
 // ---------------------------------------------------------------------------
-// Chat messages (orc tab)
+// Structured event log entry — used for both orc and worker tabs.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub role: ChatRole,
-    pub text: String,
-    pub timestamp: Instant,
+pub enum LogEntry {
+    UserText(String),
+    AssistantText(String),
+    Thinking(String),
+    ToolUse {
+        name: String,
+        input_summary: String,
+    },
+    ToolResult {
+        text: String,
+        is_error: bool,
+    },
+    /// `[interrupted]`, `answered by orc`, `worker exited code 0`, etc.
+    System(String),
+    TurnEnd {
+        cost_usd: Option<f64>,
+    },
 }
 
+// Legacy chat-message API kept as a thin shim for existing callsites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
     User,
@@ -59,9 +73,43 @@ pub struct PermissionEntry {
 #[derive(Debug, Clone)]
 pub struct SessionView {
     pub session: Session,
-    pub pty_tail: VecDeque<String>,
+    pub event_log: Vec<LogEntry>,
     pub permissions: Vec<PermissionEntry>,
     pub tab_index: usize,
+    pub claude_session_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Orc view — uses the same event_log model.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct OrcView {
+    pub event_log: Vec<LogEntry>,
+    pub alive: bool,
+}
+
+impl OrcView {
+    pub fn new() -> Self {
+        Self {
+            event_log: Vec::new(),
+            alive: true,
+        }
+    }
+
+    pub fn push(&mut self, entry: LogEntry) {
+        self.event_log.push(entry);
+        if self.event_log.len() > 5000 {
+            let drop = self.event_log.len() - 5000;
+            self.event_log.drain(0..drop);
+        }
+    }
+}
+
+impl Default for OrcView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,12 +119,20 @@ pub struct SessionView {
 #[derive(Debug, Clone)]
 pub enum Modal {
     NewTask {
+        target: TabId,
         buffer: String,
     },
     AskUser {
         session_id: String,
+        question_id: String,
         question: String,
         context: Option<String>,
+        buffer: String,
+    },
+    Comment {
+        session_id: String,
+        file: String,
+        line: usize,
         buffer: String,
     },
     ConfirmKill {
@@ -98,7 +154,7 @@ pub struct App {
     // Authoritative projections (updated via broadcast)
     pub sessions: Vec<SessionView>,
     pub session_index: HashMap<String, usize>, // session_id -> sessions vec index
-    pub orc_chat: Vec<ChatMessage>,
+    pub orc_view: OrcView,
 
     // UI-local state
     pub focused_tab: TabId,
@@ -120,7 +176,7 @@ impl App {
             state_handle: None,
             sessions: Vec::new(),
             session_index: HashMap::new(),
-            orc_chat: Vec::new(),
+            orc_view: OrcView::new(),
             focused_tab: TabId::Orc,
             modal: None,
             scroll: HashMap::new(),
@@ -145,9 +201,10 @@ impl App {
         self.session_index.insert(session.id.clone(), idx);
         self.sessions.push(SessionView {
             session,
-            pty_tail: VecDeque::with_capacity(500),
+            event_log: Vec::new(),
             permissions: Vec::new(),
             tab_index: idx,
+            claude_session_id: None,
         });
     }
 
@@ -187,41 +244,33 @@ impl App {
         }
     }
 
-    /// Replace the pty_tail buffer with a snapshot of the currently visible
-    /// pane. Called on every tick from the pane-capturer task — semantically
-    /// "this is what the user would see right now if they attached."
-    pub fn set_pty_tail(&mut self, session_id: &str, lines: Vec<String>) {
+    /// Append a structured log entry to a worker's event log.
+    pub fn push_log(&mut self, session_id: &str, entry: LogEntry) {
         if let Some(&idx) = self.session_index.get(session_id) {
-            let tail = &mut self.sessions[idx].pty_tail;
-            tail.clear();
-            // Cap at 500 to match the existing buffer bound; the snapshot is
-            // already only the visible pane height (~40 lines) but a user with
-            // a tall terminal could exceed that if we ever switch to scrollback.
-            let take_from = lines.len().saturating_sub(500);
-            for line in lines.into_iter().skip(take_from) {
-                tail.push_back(line);
+            let log = &mut self.sessions[idx].event_log;
+            log.push(entry);
+            if log.len() > 5000 {
+                let drop = log.len() - 5000;
+                log.drain(0..drop);
             }
         }
     }
 
-    pub fn append_pty_line(&mut self, session_id: &str, line: String) {
+    pub fn set_claude_session_id(&mut self, session_id: &str, sid: String) {
         if let Some(&idx) = self.session_index.get(session_id) {
-            let tail = &mut self.sessions[idx].pty_tail;
-            tail.push_back(line);
-            if tail.len() > 500 {
-                tail.pop_front();
-            }
+            self.sessions[idx].claude_session_id = Some(sid);
         }
     }
 
-    // -- Chat management ------------------------------------------------------
-
+    // -- Chat shim — keeps legacy push_chat callsites working by routing
+    //    into the orc tab's event_log.
     pub fn push_chat(&mut self, role: ChatRole, text: String) {
-        self.orc_chat.push(ChatMessage {
-            role,
-            text,
-            timestamp: Instant::now(),
-        });
+        let entry = match role {
+            ChatRole::User => LogEntry::UserText(text),
+            ChatRole::Orc => LogEntry::AssistantText(text),
+            ChatRole::System => LogEntry::System(text),
+        };
+        self.orc_view.push(entry);
     }
 
     // -- Tab navigation -------------------------------------------------------
@@ -343,6 +392,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             ended_at: None,
+            claude_session_id: None,
         }
     }
 
@@ -351,11 +401,9 @@ mod tests {
         let mut app = App::new(".");
         assert_eq!(app.focused_tab, TabId::Orc);
 
-        // No workers — cycling stays on orc
         app.next_tab();
         assert_eq!(app.focused_tab, TabId::Orc);
 
-        // Add workers
         app.add_session(test_session("s1", "worker1"));
         app.add_session(test_session("s2", "worker2"));
 
@@ -364,10 +412,10 @@ mod tests {
         app.next_tab();
         assert_eq!(app.focused_tab, TabId::Worker(1));
         app.next_tab();
-        assert_eq!(app.focused_tab, TabId::Orc); // wraps
+        assert_eq!(app.focused_tab, TabId::Orc);
 
         app.prev_tab();
-        assert_eq!(app.focused_tab, TabId::Worker(1)); // wraps back
+        assert_eq!(app.focused_tab, TabId::Worker(1));
     }
 
     #[test]
@@ -381,19 +429,17 @@ mod tests {
         app.focus_tab(TabId::Worker(2));
         app.remove_session("s2");
         assert_eq!(app.sessions.len(), 2);
-        // Tab should adjust
         assert_eq!(app.focused_tab, TabId::Worker(1));
     }
 
     #[test]
-    fn pty_tail_capacity() {
+    fn event_log_capacity() {
         let mut app = App::new(".");
         app.add_session(test_session("s1", "w1"));
-        for i in 0..600 {
-            app.append_pty_line("s1", format!("line {i}"));
+        for i in 0..6000 {
+            app.push_log("s1", LogEntry::System(format!("e{i}")));
         }
-        assert_eq!(app.sessions[0].pty_tail.len(), 500);
-        assert!(app.sessions[0].pty_tail.front().unwrap().contains("100"));
+        assert_eq!(app.sessions[0].event_log.len(), 5000);
     }
 
     #[test]
@@ -424,15 +470,15 @@ mod tests {
         app.scroll_up(TabId::Orc, 3);
         assert_eq!(app.scroll_pos(TabId::Orc), 2);
         app.scroll_up(TabId::Orc, 10);
-        assert_eq!(app.scroll_pos(TabId::Orc), 0); // doesn't underflow
+        assert_eq!(app.scroll_pos(TabId::Orc), 0);
     }
 
     #[test]
-    fn chat_push() {
+    fn chat_push_routes_to_orc_view() {
         let mut app = App::new(".");
         app.push_chat(ChatRole::User, "hello".to_string());
         app.push_chat(ChatRole::Orc, "hi back".to_string());
-        assert_eq!(app.orc_chat.len(), 2);
-        assert_eq!(app.orc_chat[0].role, ChatRole::User);
+        assert_eq!(app.orc_view.event_log.len(), 2);
+        assert!(matches!(app.orc_view.event_log[0], LogEntry::UserText(_)));
     }
 }

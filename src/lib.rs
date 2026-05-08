@@ -11,4 +11,5 @@ pub mod state;
 pub mod tmux;
 pub mod ui;
 pub mod worker;
+pub mod worker_registry;
 pub mod worktree;

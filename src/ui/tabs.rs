@@ -30,7 +30,8 @@ pub fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let orc_label = format!(" ● ORC {orc_elapsed} ");
+    let orc_badge = if app.orc_view.alive { "◐" } else { "✗" };
+    let orc_label = format!(" {orc_badge} ORC {orc_elapsed} ");
     if orc_focused {
         spans.push(Span::styled(
             orc_label,
@@ -114,6 +115,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             ended_at: None,
+            claude_session_id: None,
         }
     }
 
@@ -144,7 +146,7 @@ mod tests {
         let lines = render_to_strings(&app, 40, 2);
         // First line should contain ORC
         assert!(lines[0].contains("ORC"), "expected ORC in: {:?}", lines[0]);
-        assert!(lines[0].contains("●"), "expected ● in: {:?}", lines[0]);
+        assert!(lines[0].contains("◐"), "expected ◐ in: {:?}", lines[0]);
     }
 
     #[test]

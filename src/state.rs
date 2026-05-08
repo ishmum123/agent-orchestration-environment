@@ -69,10 +69,26 @@ pub enum StateCommand {
     AnswerUser {
         session_id: String,
         answer: String,
+        answered_by: AnsweredBy,
+    },
+    AnswerUserById {
+        question_id: String,
+        answer: String,
+        answered_by: AnsweredBy,
     },
     GetPendingEscalations {
         reply: oneshot::Sender<Vec<PendingEscalation>>,
     },
+    SetClaudeSessionId {
+        session_id: String,
+        claude_session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnsweredBy {
+    User,
+    Orc,
 }
 
 /// A permission escalation waiting for orc/user decision.
@@ -95,7 +111,8 @@ pub enum StateChange {
     SessionRemoved { session_id: String },
     TaskGraphUpdated { run_id: String },
     PermissionNeeded { session_id: String, request: PermissionRequest },
-    UserQuestionPending { session_id: String, question: String, context: Option<String> },
+    UserQuestionPending { session_id: String, question_id: String, question: String, context: Option<String> },
+    QuestionResolved { session_id: String, question_id: String, answered_by: AnsweredBy },
     HookReceived { session_id: String, event: HookEvent },
 }
 
@@ -184,11 +201,27 @@ impl StateHandle {
         rx.await.map_err(|_| anyhow::anyhow!("question was never answered"))
     }
 
-    /// Answer a pending user question.
+    /// Answer a pending user question (by session — first-responder).
     pub async fn answer_user(&self, session_id: &str, answer: &str) -> Result<()> {
         self.send(StateCommand::AnswerUser {
             session_id: session_id.to_string(),
             answer: answer.to_string(),
+            answered_by: AnsweredBy::User,
+        })
+        .await
+    }
+
+    /// Answer a pending user question identified by question_id (orc-side).
+    pub async fn answer_user_with_id(
+        &self,
+        question_id: &str,
+        answer: &str,
+        answered_by: AnsweredBy,
+    ) -> Result<()> {
+        self.send(StateCommand::AnswerUserById {
+            question_id: question_id.to_string(),
+            answer: answer.to_string(),
+            answered_by,
         })
         .await
     }
@@ -225,43 +258,24 @@ impl StateHandle {
     }
 }
 
-/// On startup, scan persisted sessions in non-terminal states. For any whose
-/// tmux session no longer exists (dead from a prior crash/quit), either
-/// transition them to `Failed` (so the user can `R` restart) or drop them
-/// outright if the state machine forbids the transition.
-///
-/// Returns the number of zombies acted on.
+/// On startup, every non-terminal session is a zombie: workers don't survive
+/// an orc restart in v2 (they're stream-json children of orc). Transition
+/// Running/AwaitingReview → Failed; drop Blocked outright (state machine
+/// forbids the Failed transition from there).
 pub async fn sweep_zombie_sessions(handle: &StateHandle) -> usize {
     use crate::session::SessionState;
     let sessions = handle.list_sessions().await;
     let mut swept = 0;
     for s in sessions {
-        let non_terminal = matches!(
-            s.state,
-            SessionState::Running
-                | SessionState::Blocked { .. }
-                | SessionState::AwaitingReview { .. }
-        );
-        if !non_terminal {
-            continue;
-        }
-        if crate::tmux::has_session(&s.tmux_session).await {
-            continue;
-        }
-
-        let reason = "tmux session gone (zombie sweep on startup)".to_string();
+        let reason = "worker did not survive orc restart".to_string();
         let result = match s.state {
             SessionState::Running | SessionState::AwaitingReview { .. } => {
                 handle
                     .apply_event(&s.id, SessionEvent::Errored { reason })
                     .await
             }
-            SessionState::Blocked { .. } => {
-                // The state machine forbids Blocked → Failed. A blocked-
-                // and-dead session is unrecoverable, so just remove it.
-                handle.remove_session(&s.id).await
-            }
-            _ => Ok(()),
+            SessionState::Blocked { .. } => handle.remove_session(&s.id).await,
+            _ => continue,
         };
         if result.is_ok() {
             swept += 1;
@@ -278,7 +292,12 @@ pub struct StateManager {
     db: Database,
     sessions: HashMap<String, Session>,
     policy: PolicyEngine,
+    /// question_id → reply channel
     pending_questions: HashMap<String, oneshot::Sender<String>>,
+    /// session_id → outstanding question_id (for first-responder by session)
+    outstanding_by_session: HashMap<String, String>,
+    /// question_id → session_id (for resolving by id)
+    question_to_session: HashMap<String, String>,
     pending_escalations: Vec<PendingEscalation>,
     cmd_rx: mpsc::Receiver<StateCommand>,
     change_tx: broadcast::Sender<StateChange>,
@@ -309,6 +328,8 @@ impl StateManager {
             sessions,
             policy,
             pending_questions: HashMap::new(),
+            outstanding_by_session: HashMap::new(),
+            question_to_session: HashMap::new(),
             pending_escalations: Vec::new(),
             cmd_rx,
             change_tx,
@@ -402,21 +423,67 @@ impl StateManager {
                     context,
                     reply,
                 } => {
-                    self.pending_questions.insert(session_id.clone(), reply);
+                    let question_id = uuid::Uuid::new_v4().to_string();
+                    self.pending_questions.insert(question_id.clone(), reply);
+                    self.outstanding_by_session
+                        .insert(session_id.clone(), question_id.clone());
+                    self.question_to_session
+                        .insert(question_id.clone(), session_id.clone());
                     let _ = self.change_tx.send(StateChange::UserQuestionPending {
                         session_id,
+                        question_id,
                         question,
                         context,
                     });
                 }
-                StateCommand::AnswerUser { session_id, answer } => {
-                    if let Some(reply) = self.pending_questions.remove(&session_id) {
-                        let _ = reply.send(answer);
+                StateCommand::AnswerUser {
+                    session_id,
+                    answer,
+                    answered_by,
+                } => {
+                    if let Some(qid) = self.outstanding_by_session.remove(&session_id) {
+                        self.question_to_session.remove(&qid);
+                        if let Some(reply) = self.pending_questions.remove(&qid) {
+                            let _ = reply.send(answer);
+                        }
+                        let _ = self.change_tx.send(StateChange::QuestionResolved {
+                            session_id,
+                            question_id: qid,
+                            answered_by,
+                        });
+                    }
+                }
+                StateCommand::AnswerUserById {
+                    question_id,
+                    answer,
+                    answered_by,
+                } => {
+                    if let Some(session_id) = self.question_to_session.remove(&question_id) {
+                        self.outstanding_by_session.remove(&session_id);
+                        if let Some(reply) = self.pending_questions.remove(&question_id) {
+                            let _ = reply.send(answer);
+                        }
+                        let _ = self.change_tx.send(StateChange::QuestionResolved {
+                            session_id,
+                            question_id,
+                            answered_by,
+                        });
                     }
                 }
                 StateCommand::GetPendingEscalations { reply } => {
                     let escalations = std::mem::take(&mut self.pending_escalations);
                     let _ = reply.send(escalations);
+                }
+                StateCommand::SetClaudeSessionId {
+                    session_id,
+                    claude_session_id,
+                } => {
+                    if let Some(s) = self.sessions.get_mut(&session_id) {
+                        s.claude_session_id = Some(claude_session_id.clone());
+                        let _ = self
+                            .db
+                            .update_claude_session_id(&session_id, &claude_session_id);
+                    }
                 }
             }
         }

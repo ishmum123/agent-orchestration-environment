@@ -30,6 +30,7 @@ fn test_session(id: &str, name: &str, state: SessionState) -> Session {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         ended_at: None,
+            claude_session_id: None,
     }
 }
 
@@ -106,23 +107,24 @@ fn l3_worker_tab_focused() {
     let mut app = App::new(".");
     app.add_session(test_session("s1", "auth-fix", SessionState::Running));
     app.sessions[0]
-        .pty_tail
-        .push_back("reading src/auth.rs".to_string());
+        .event_log
+        .push(orc::app::LogEntry::AssistantText("reading src/auth.rs".to_string()));
     app.sessions[0]
-        .pty_tail
-        .push_back("found 3 handlers".to_string());
+        .event_log
+        .push(orc::app::LogEntry::AssistantText("found 3 handlers".to_string()));
 
     app.focus_tab(TabId::Worker(0));
     let output = render_to_string(&app, 120, 40);
     assert!(output.contains("auth-fix"), "should show session name");
     assert!(output.contains("sonnet"), "should show model");
-    assert!(output.contains("attach"), "action bar should show attach hint");
+    assert!(output.contains("kill"), "action bar should show kill hint");
 }
 
 #[test]
 fn l3_new_task_modal() {
     let mut app = App::new(".");
     app.modal = Some(Modal::NewTask {
+        target: TabId::Orc,
         buffer: "add OAuth".to_string(),
     });
     let output = render_to_string(&app, 120, 40);
@@ -135,6 +137,7 @@ fn l3_ask_user_modal() {
     let mut app = App::new(".");
     app.modal = Some(Modal::AskUser {
         session_id: "s1".to_string(),
+        question_id: "q1".to_string(),
         question: "Which branch to target?".to_string(),
         context: Some("for the PR".to_string()),
         buffer: String::new(),
@@ -169,6 +172,7 @@ fn l3_help_modal() {
 }
 
 #[test]
+#[ignore = "task-graph dashboard removed in v2 spec rewrite"]
 fn l3_graph_toggle() {
     let mut app = App::new(".");
     app.add_session(test_session("s1", "worker1", SessionState::Running));

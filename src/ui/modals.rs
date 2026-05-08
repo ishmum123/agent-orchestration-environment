@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::Modal;
+use crate::app::{Modal, TabId};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -16,13 +16,17 @@ use crate::app::Modal;
 
 pub fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
     match modal {
-        Modal::NewTask { buffer } => render_new_task(frame, area, buffer),
+        Modal::NewTask { target, buffer } => render_new_task(frame, area, *target, buffer),
         Modal::AskUser {
             session_id,
+            question_id: _,
             question,
             context,
             buffer,
         } => render_ask_user(frame, area, session_id, question, context.as_deref(), buffer),
+        Modal::Comment { file, line, buffer, .. } => {
+            render_comment(frame, area, file, *line, buffer)
+        }
         Modal::ConfirmKill { session_id: _, name } => render_confirm_kill(frame, area, name),
         Modal::ConfirmQuit => render_confirm_quit(frame, area),
         Modal::Help => render_help(frame, area),
@@ -123,31 +127,65 @@ fn render_input_box(frame: &mut Frame, area: Rect, buffer: &str) {
 // New task modal
 // ---------------------------------------------------------------------------
 
-fn render_new_task(frame: &mut Frame, area: Rect, buffer: &str) {
-    let rect = centered_rect(60, 30, area);
+fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
+    let rect = centered_rect(60, 40, area);
     frame.render_widget(Clear, rect);
 
-    let block = modal_block("new task");
+    let title = match target {
+        TabId::Orc => "speak to orc".to_string(),
+        TabId::Worker(idx) => format!("speak to worker #{}", idx + 1),
+    };
+    let block = modal_block(&title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
     let (body, hint_area) = split_body_hint(inner);
 
-    // Body: prompt label + input box
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(3)])
         .split(body);
 
-    let label = Paragraph::new("describe the task for orc to plan:")
+    let label_text = match target {
+        TabId::Orc => "describe the task for orc to plan:",
+        TabId::Worker(_) => "send a message to this worker:",
+    };
+    let label = Paragraph::new(label_text).style(Style::default().fg(Color::White));
+    frame.render_widget(label, chunks[0]);
+
+    render_input_box(frame, chunks[2], buffer);
+
+    let hints = hint_line(&[
+        ("enter", "send"),
+        ("shift+enter", "newline"),
+        ("esc", "cancel"),
+    ]);
+    frame.render_widget(Paragraph::new(hints), hint_area);
+}
+
+fn render_comment(frame: &mut Frame, area: Rect, file: &str, line: usize, buffer: &str) {
+    let rect = centered_rect(60, 30, area);
+    frame.render_widget(Clear, rect);
+
+    let title = format!("comment on {file}:{line}");
+    let block = modal_block(&title);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let (body, hint_area) = split_body_hint(inner);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(body);
+
+    let label = Paragraph::new("review note (sent to worker on submit):")
         .style(Style::default().fg(Color::White));
     frame.render_widget(label, chunks[0]);
 
-    // blank spacer at chunks[1]
-    render_input_box(frame, chunks[2], buffer);
+    render_input_box(frame, chunks[1], buffer);
 
-    // Hints
-    let hints = hint_line(&[("enter", "submit"), ("esc", "cancel")]);
+    let hints = hint_line(&[("enter", "save"), ("esc", "cancel")]);
     frame.render_widget(Paragraph::new(hints), hint_area);
 }
 
@@ -369,14 +407,15 @@ mod tests {
     #[test]
     fn new_task_modal_renders() {
         let modal = Modal::NewTask {
+            target: TabId::Orc,
             buffer: "add OAuth".into(),
         };
         let output = render_to_string(&modal);
-        assert!(output.contains("new task"));
+        assert!(output.contains("speak to orc"));
         assert!(output.contains("describe the task"));
         assert!(output.contains("add OAuth"));
         assert!(output.contains("enter"));
-        assert!(output.contains("submit"));
+        assert!(output.contains("send"));
         assert!(output.contains("cancel"));
     }
 
@@ -384,6 +423,7 @@ mod tests {
     fn ask_user_modal_renders() {
         let modal = Modal::AskUser {
             session_id: "explore-agents".into(),
+            question_id: "q1".into(),
             question: "install xero-node-sdk?".into(),
             context: Some("npm audit shows no vulns".into()),
             buffer: String::new(),
@@ -399,6 +439,7 @@ mod tests {
     fn ask_user_modal_no_context() {
         let modal = Modal::AskUser {
             session_id: "s1".into(),
+            question_id: "q2".into(),
             question: "proceed?".into(),
             context: None,
             buffer: "yes".into(),
@@ -443,7 +484,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let small = Rect::new(0, 0, 10, 5);
         for modal in &[
-            Modal::NewTask { buffer: "x".into() },
+            Modal::NewTask { target: TabId::Orc, buffer: "x".into() },
             Modal::ConfirmQuit,
             Modal::Help,
         ] {

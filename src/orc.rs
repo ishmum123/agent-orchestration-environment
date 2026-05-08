@@ -222,6 +222,33 @@ impl OrcProcess {
         self.child.kill().await?;
         Ok(())
     }
+
+    /// Cancel the orc brain's in-flight turn (SIGINT). The conversation stays
+    /// alive — claude treats SIGINT as cancel-current-turn.
+    pub async fn interrupt(&mut self) -> Result<()> {
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGINT);
+            }
+        }
+        Ok(())
+    }
+
+    /// Inject a synthetic user message describing a worker's pending question.
+    /// Orc may answer via the `answer_worker` MCP tool.
+    pub async fn inject_question(
+        &mut self,
+        worker_session_id: &str,
+        question_id: &str,
+        question: &str,
+    ) -> Result<()> {
+        let content = format!(
+            "[worker {worker_session_id} asked, question_id={question_id}]: {question}\n\
+             You may answer it by calling the `answer_worker` MCP tool with the question_id and your answer. \
+             If you don't have enough context, stay quiet — the user will be prompted."
+        );
+        self.send(&content).await
+    }
 }
 
 /// Generate the system prompt for the orc brain.

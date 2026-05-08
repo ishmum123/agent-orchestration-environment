@@ -65,6 +65,12 @@ pub struct DraftComment {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Diff,
+    WholeFile,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewState {
     pub session_id: String,
@@ -74,6 +80,8 @@ pub struct ReviewState {
     pub comments: Vec<DraftComment>,
     pub hunk_approvals: HashSet<String>,
     pub overall: Option<String>,
+    pub view_mode: ViewMode,
+    pub worktree_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +343,10 @@ impl DiffCursor {
 
 impl ReviewState {
     pub fn new(session_id: String, diff: ParsedDiff) -> Self {
+        Self::with_worktree(session_id, diff, String::new())
+    }
+
+    pub fn with_worktree(session_id: String, diff: ParsedDiff, worktree_path: String) -> Self {
         let hash = diff_hash(&diff);
         Self {
             session_id,
@@ -344,7 +356,21 @@ impl ReviewState {
             comments: Vec::new(),
             hunk_approvals: HashSet::new(),
             overall: None,
+            view_mode: ViewMode::Diff,
+            worktree_path,
         }
+    }
+
+    pub fn toggle_view(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Diff => ViewMode::WholeFile,
+            ViewMode::WholeFile => ViewMode::Diff,
+        };
+    }
+
+    /// Add a comment at an explicit (file, line) — used by the comment modal.
+    pub fn add_comment_at(&mut self, file: String, line: usize, body: String) {
+        self.comments.push(DraftComment { file, line, body });
     }
 
     /// Total additions across all files.

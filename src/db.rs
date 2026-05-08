@@ -196,6 +196,27 @@ impl Database {
             );
             ",
         )?;
+        // m003: claude_session_id (used by R restart to resume a worker's
+        // claude conversation). Idempotent — guarded by pragma table_info.
+        let has_csid: bool = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='claude_session_id'")?
+            .query([])?
+            .next()?
+            .is_some();
+        if !has_csid {
+            self.conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT;",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn update_claude_session_id(&self, id: &str, claude_session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET claude_session_id = ?1 WHERE id = ?2",
+            params![claude_session_id, id],
+        )?;
         Ok(())
     }
 
@@ -204,8 +225,8 @@ impl Database {
     pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (id, name, task, worktree_path, branch, base_commit, tmux_session,
-                state, state_data, mode, model, created_at, updated_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                state, state_data, mode, model, created_at, updated_at, ended_at, claude_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session.id,
                 session.name,
@@ -221,6 +242,7 @@ impl Database {
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
                 session.ended_at.map(|t| t.to_rfc3339()),
+                session.claude_session_id,
             ],
         )?;
         Ok(())
@@ -250,7 +272,8 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT id, name, task, worktree_path, branch, base_commit, tmux_session,
-                        state, state_data, mode, model, created_at, updated_at, ended_at
+                        state, state_data, mode, model, created_at, updated_at, ended_at,
+                        claude_session_id
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -261,7 +284,8 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, task, worktree_path, branch, base_commit, tmux_session,
-                    state, state_data, mode, model, created_at, updated_at, ended_at
+                    state, state_data, mode, model, created_at, updated_at, ended_at,
+                    claude_session_id
              FROM sessions ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -536,6 +560,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         .transpose()
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(DbError(e.to_string()))))?;
 
+    let claude_session_id: Option<String> = row.get(14).ok();
     Ok(Session {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -550,6 +575,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         created_at,
         updated_at,
         ended_at,
+        claude_session_id,
     })
 }
 

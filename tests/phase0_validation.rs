@@ -50,7 +50,10 @@ fn setup_mcp() -> McpServer {
         .output();
 
     std::mem::forget(dir);
-    McpServer::new(setup_state(), project_dir, hook_socket_path, 0)
+    {
+        let (worker_tx, _wrx) = mpsc::unbounded_channel();
+        McpServer::new(setup_state(), project_dir, hook_socket_path, 0, orc::worker_registry::WorkerRegistry::new(), worker_tx)
+    }
 }
 
 /// Send a JSON-RPC request and return the response, asserting no JSON-RPC error.
@@ -503,7 +506,8 @@ async fn full_pipeline_mcp_hooks_state() {
         .output();
     let mcp_hook_sock = mcp_dir.path().join("hooks.sock");
     std::mem::forget(mcp_dir);
-    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock, 0);
+    let (mcp_wtx, _mcp_wrx) = mpsc::unbounded_channel();
+    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock, 0, orc::worker_registry::WorkerRegistry::new(), mcp_wtx);
 
     // 6a: MCP call to spawn_session
     let worker_name = format!("pipeline-{}", unique_suffix());
@@ -586,7 +590,8 @@ async fn full_pipeline_ask_user_flow() {
         .output();
     let ask_hook_sock = ask_dir.path().join("hooks.sock");
     std::mem::forget(ask_dir);
-    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock, 0);
+    let (ask_wtx, _ask_wrx) = mpsc::unbounded_channel();
+    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock, 0, orc::worker_registry::WorkerRegistry::new(), ask_wtx);
 
     // Create a session (so ask_user has something to associate with)
     let spawn_req = JsonRpcRequest {
