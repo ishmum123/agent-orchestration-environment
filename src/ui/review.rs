@@ -34,7 +34,10 @@ pub fn render_review(frame: &mut Frame, area: Rect, review: &ReviewState) {
         .split(vsplit[0]);
 
     render_file_tree(frame, hsplit[0], review);
-    render_diff_view(frame, hsplit[1], review);
+    match review.view_mode {
+        ViewMode::Diff => render_diff_view(frame, hsplit[1], review),
+        ViewMode::WholeFile => render_whole_file_view(frame, hsplit[1], review),
+    }
     render_review_action_bar(frame, vsplit[1]);
 }
 
@@ -144,6 +147,101 @@ fn truncate_path(path: &str, max: usize) -> String {
     } else {
         path[..max].to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Whole-file view pane
+// ---------------------------------------------------------------------------
+
+fn render_whole_file_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
+    let file = match review.current_file() {
+        Some(f) => f,
+        None => {
+            let block = Block::default()
+                .title(" file ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(block, area);
+            return;
+        }
+    };
+
+    let title = format!(" file: {} ", file.path);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+
+    // Resolve absolute path: worktree_path / file.path
+    let abs_path = if review.worktree_path.is_empty() {
+        std::path::PathBuf::from(&file.path)
+    } else {
+        std::path::PathBuf::from(&review.worktree_path).join(&file.path)
+    };
+
+    let body = match std::fs::read_to_string(&abs_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let p = Paragraph::new(format!("  cannot read {}: {e}", abs_path.display()))
+                .style(Style::default().fg(Color::Red));
+            frame.render_widget(p, inner);
+            return;
+        }
+    };
+
+    // Lines that have a draft comment in this file.
+    let commented: std::collections::HashSet<usize> = review
+        .comments
+        .iter()
+        .filter(|c| c.file == file.path)
+        .map(|c| c.line)
+        .collect();
+
+    // Compute cursor's source-file line, if any.
+    let cursor_lineno: Option<usize> = review
+        .current_line()
+        .and_then(|l| l.new_lineno.or(l.old_lineno));
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, content) in body.lines().enumerate() {
+        let lineno = i + 1;
+        let gutter = if commented.contains(&lineno) { "*" } else { " " };
+        let is_cursor = cursor_lineno == Some(lineno);
+        let row_style = if is_cursor {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default()
+        };
+        let truncated = truncate_content(
+            content,
+            inner.width.saturating_sub(8) as usize,
+        );
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {gutter} "), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:>4} ", lineno), Style::default().fg(Color::DarkGray)),
+            Span::styled(truncated, row_style),
+        ]));
+    }
+
+    // Scroll: keep cursor visible
+    let cursor_idx = cursor_lineno.map(|n| n.saturating_sub(1)).unwrap_or(0);
+    let visible = inner.height as usize;
+    let scroll_offset = if cursor_idx >= visible {
+        cursor_idx.saturating_sub(visible / 2)
+    } else {
+        0
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .scroll((scroll_offset as u16, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +453,10 @@ fn render_review_action_bar(frame: &mut Frame, area: Rect) {
         Span::styled(" comment  ", Style::default().fg(Color::DarkGray)),
         Span::styled("a", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled(" approve  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("o", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(" file-view  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("e", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(" editor  ", Style::default().fg(Color::DarkGray)),
         Span::styled("s", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled(" submit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
