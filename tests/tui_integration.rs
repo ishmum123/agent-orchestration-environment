@@ -57,9 +57,10 @@ fn render_to_string(app: &App, width: u16, height: u16) -> String {
 fn l3_empty_dashboard_renders() {
     let app = App::new(".");
     let output = render_to_string(&app, 80, 24);
-    assert!(output.contains("ORC"), "should show ORC tab");
+    // After UX overhaul: agents panel always shows orc card.
+    assert!(output.contains("orc"), "should show orc agent card");
     assert!(
-        output.contains("graph") || output.contains("quit") || output.contains("help"),
+        output.contains("quit") || output.contains("help"),
         "should show action bar hints"
     );
 }

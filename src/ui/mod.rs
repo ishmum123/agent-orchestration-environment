@@ -1,14 +1,17 @@
 // Top-level UI render dispatch.
 //
 // Layout:
-//   Row 0: tab strip (2 lines)
-//   Row 1: main content area (orc tab or worker tab — both render event_log)
-//   Row 2: action bar (1 line)
+//   Row 0: main area split horizontally into [content | agents panel]
+//   Row 1: action bar (1 line)
 //   Modal overlay if active
+//
+// The top tab strip was removed in the UX overhaul; the agents panel
+// (right-hand side) doubles as the visual tab list.
 
 pub mod modals;
 pub mod panel;
 pub mod review;
+#[allow(dead_code)]
 pub mod tabs;
 pub mod worker;
 
@@ -26,22 +29,16 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
-    tabs::render_tabs(frame, layout[0], app);
-
     // Split main area into [content | agents panel].
-    let panel_w = panel::PANEL_WIDTH.min(layout[1].width.saturating_sub(20));
+    let panel_w = panel::PANEL_WIDTH.min(layout[0].width.saturating_sub(20));
     let main_split = Layout::horizontal([
         Constraint::Min(20),
         Constraint::Length(panel_w),
     ])
-    .split(layout[1]);
+    .split(layout[0]);
     let content_area = main_split[0];
     let panel_area = main_split[1];
 
@@ -67,7 +64,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     panel::render_panel(frame, panel_area, app);
 
-    render_action_bar(frame, layout[2], app);
+    render_action_bar(frame, layout[1], app);
 
     if let Some(modal) = &app.modal {
         modals::render_modal(frame, area, modal);
