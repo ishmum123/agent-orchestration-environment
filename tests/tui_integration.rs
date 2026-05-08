@@ -117,7 +117,6 @@ fn l3_worker_tab_focused() {
     app.focus_tab(TabId::Worker(0));
     let output = render_to_string(&app, 120, 40);
     assert!(output.contains("auth-fix"), "should show session name");
-    assert!(output.contains("sonnet"), "should show model");
     assert!(output.contains("kill"), "action bar should show kill hint");
 }
 

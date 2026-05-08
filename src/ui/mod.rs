@@ -29,16 +29,22 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1), // header
+            Constraint::Min(1),    // main
+            Constraint::Length(1), // action bar
+        ])
         .split(area);
 
+    render_header(frame, layout[0], app);
+
     // Split main area into [content | agents panel].
-    let panel_w = panel::PANEL_WIDTH.min(layout[0].width.saturating_sub(20));
+    let panel_w = panel::PANEL_WIDTH.min(layout[1].width.saturating_sub(20));
     let main_split = Layout::horizontal([
         Constraint::Min(20),
         Constraint::Length(panel_w),
     ])
-    .split(layout[0]);
+    .split(layout[1]);
     let content_area = main_split[0];
     let panel_area = main_split[1];
 
@@ -64,7 +70,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     panel::render_panel(frame, panel_area, app);
 
-    render_action_bar(frame, layout[1], app);
+    render_action_bar(frame, layout[2], app);
 
     if let Some(modal) = &app.modal {
         modals::render_modal(frame, area, modal);
@@ -73,24 +79,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 /// Render the orc tab as an event-log peer to worker tabs.
 fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
-
-    let alive_str = if app.orc_view.alive { "alive" } else { "dead" };
-    let header = Line::from(vec![
-        Span::styled("orc", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" · "),
-        Span::styled("brain", Style::default().fg(Color::Cyan)),
-        Span::raw(" · "),
-        Span::styled(alive_str, Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(header), chunks[0]);
-
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " events ",
         Style::default().fg(Color::DarkGray),
     ));
-    let inner = block.inner(chunks[1]);
-    frame.render_widget(block, chunks[1]);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -100,6 +94,51 @@ fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0));
     frame.render_widget(para, inner);
+}
+
+/// Minimal one-line header showing the focused entity.
+fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let line = match app.focused_tab {
+        TabId::Orc => {
+            let badge = if app.orc_view.alive { "◐" } else { "✗" };
+            let badge_color = if app.orc_view.alive {
+                Color::Cyan
+            } else {
+                Color::Red
+            };
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    badge.to_string(),
+                    Style::default()
+                        .fg(badge_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled("orc", Style::default().add_modifier(Modifier::BOLD)),
+            ])
+        }
+        TabId::Worker(idx) => {
+            if let Some(sv) = app.sessions.get(idx) {
+                let (badge, color) = App::state_badge(&sv.session.state);
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        badge.to_string(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        sv.session.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from("")
+            }
+        }
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Bottom action bar — context-sensitive keybinds.

@@ -10,11 +10,10 @@ use crate::app::{App, LogEntry, SessionView};
 use crate::session::SessionState;
 
 /// Render the worker tab for a single session.
+///
+/// Header is rendered by `ui::render_header` above this area, so we only
+/// need event log + (optional) decisions strip.
 pub fn render_worker(frame: &mut Frame, area: Rect, session_view: &SessionView, scroll: usize) {
-    let s = &session_view.session;
-    let (badge, badge_color) = App::state_badge(&s.state);
-    let elapsed = App::elapsed_str(s);
-
     let decision_count = session_view.permissions.len().min(8);
     let decisions_height = if decision_count > 0 {
         (decision_count + 2) as u16
@@ -23,19 +22,18 @@ pub fn render_worker(frame: &mut Frame, area: Rect, session_view: &SessionView, 
     };
 
     let chunks = Layout::vertical([
-        Constraint::Length(5),
         Constraint::Min(4),
         Constraint::Length(decisions_height),
     ])
     .split(area);
 
-    render_session_info(frame, chunks[0], session_view, badge, badge_color, &elapsed);
-    render_event_log(frame, chunks[1], &session_view.event_log, scroll);
+    render_event_log(frame, chunks[0], &session_view.event_log, scroll);
     if decisions_height > 0 {
-        render_decisions(frame, chunks[2], session_view);
+        render_decisions(frame, chunks[1], session_view);
     }
 }
 
+#[allow(dead_code)]
 fn state_label(state: &SessionState) -> &'static str {
     match state {
         SessionState::Running => "Running",
@@ -46,6 +44,7 @@ fn state_label(state: &SessionState) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn render_session_info(
     frame: &mut Frame,
     area: Rect,
@@ -391,8 +390,11 @@ mod tests {
             })
             .unwrap();
         let content = buffer_text(&terminal);
-        assert!(content.contains("explore-agents"));
-        assert!(content.contains("sonnet"));
+        // Worker tab no longer renders its own session-info header — the
+        // header is now rendered by ui::render_header above this area, and
+        // session name appears in the agents panel. Keep the smoke test
+        // by checking event log content.
+        assert!(content.contains("looking at auth-service"), "{}", content);
     }
 
     #[test]
