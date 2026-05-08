@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerEvent>();
     let worker_registry = WorkerRegistry::new();
+    let (orc_inject_tx, mut orc_inject_rx) = mpsc::channel::<String>(64);
 
     let (mcp_listener, mcp_port) = mcp::bind_http_listener().await?;
     let mcp_server = Arc::new(McpServer::new(
@@ -115,6 +116,7 @@ async fn main() -> Result<()> {
         mcp_port,
         worker_registry.clone(),
         worker_tx.clone(),
+        orc_inject_tx.clone(),
     ));
     mcp::serve_http(mcp_listener, mcp_server);
 
@@ -150,6 +152,7 @@ async fn main() -> Result<()> {
         &mut orc_process,
         &worker_registry,
         &mut worker_rx,
+        &mut orc_inject_rx,
         &project_dir,
         &hook_sock,
         mcp_port,
@@ -175,6 +178,7 @@ async fn run_event_loop(
     orc_process: &mut OrcProcess,
     worker_registry: &WorkerRegistry,
     worker_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+    orc_inject_rx: &mut mpsc::Receiver<String>,
     project_dir: &PathBuf,
     hook_sock: &PathBuf,
     mcp_port: u16,
@@ -248,6 +252,10 @@ async fn run_event_loop(
 
             Some(ev) = worker_rx.recv() => {
                 handle_worker_event(app, state_handle, worker_registry, ev).await;
+            }
+
+            Some(msg) = orc_inject_rx.recv() => {
+                let _ = orc_process.send(&msg).await;
             }
 
             events = orc_process.read_events() => {

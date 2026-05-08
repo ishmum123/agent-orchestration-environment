@@ -52,7 +52,7 @@ fn setup_mcp() -> McpServer {
     std::mem::forget(dir);
     {
         let (worker_tx, _wrx) = mpsc::unbounded_channel();
-        McpServer::new(setup_state(), project_dir, hook_socket_path, 0, orc::worker_registry::WorkerRegistry::new(), worker_tx)
+        McpServer::new(setup_state(), project_dir, hook_socket_path, 0, orc::worker_registry::WorkerRegistry::new(), worker_tx, tokio::sync::mpsc::channel::<String>(8).0)
     }
 }
 
@@ -102,7 +102,7 @@ async fn mcp_tools_list_returns_all_seven_tools() {
     };
     let result = call_ok(&server, &req).await;
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 8, "expected 8 tools, got {}", tools.len());
+    assert_eq!(tools.len(), 9, "expected 9 tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let expected = [
@@ -507,7 +507,7 @@ async fn full_pipeline_mcp_hooks_state() {
     let mcp_hook_sock = mcp_dir.path().join("hooks.sock");
     std::mem::forget(mcp_dir);
     let (mcp_wtx, _mcp_wrx) = mpsc::unbounded_channel();
-    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock, 0, orc::worker_registry::WorkerRegistry::new(), mcp_wtx);
+    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock, 0, orc::worker_registry::WorkerRegistry::new(), mcp_wtx, tokio::sync::mpsc::channel::<String>(8).0);
 
     // 6a: MCP call to spawn_session
     let worker_name = format!("pipeline-{}", unique_suffix());
@@ -591,7 +591,7 @@ async fn full_pipeline_ask_user_flow() {
     let ask_hook_sock = ask_dir.path().join("hooks.sock");
     std::mem::forget(ask_dir);
     let (ask_wtx, _ask_wrx) = mpsc::unbounded_channel();
-    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock, 0, orc::worker_registry::WorkerRegistry::new(), ask_wtx);
+    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock, 0, orc::worker_registry::WorkerRegistry::new(), ask_wtx, tokio::sync::mpsc::channel::<String>(8).0);
 
     // Create a session (so ask_user has something to associate with)
     let spawn_req = JsonRpcRequest {

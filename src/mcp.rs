@@ -60,6 +60,7 @@ pub struct McpServer {
     mcp_port: u16,
     workers: WorkerRegistry,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+    orc_inject: Option<mpsc::Sender<String>>,
 }
 
 impl McpServer {
@@ -70,6 +71,7 @@ impl McpServer {
         mcp_port: u16,
         workers: WorkerRegistry,
         worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+        orc_inject: mpsc::Sender<String>,
     ) -> Self {
         McpServer {
             state,
@@ -78,6 +80,7 @@ impl McpServer {
             mcp_port,
             workers,
             worker_tx,
+            orc_inject: Some(orc_inject),
         }
     }
 
@@ -128,7 +131,8 @@ impl McpServer {
                     "type": "object",
                     "properties": {
                         "question": { "type": "string", "description": "Question to ask the user" },
-                        "context": { "type": "string", "description": "Additional context for the question" }
+                        "context": { "type": "string", "description": "Additional context for the question" },
+                        "session_id": { "type": "string", "description": "Worker session_id (lets orc race to answer first); omit if you ARE orc" }
                     },
                     "required": ["question"]
                 }),
@@ -163,6 +167,19 @@ impl McpServer {
                         "summary": { "type": "string", "description": "Summary of changes made (shown to user)" }
                     },
                     "required": ["session_id", "summary"]
+                }),
+            },
+            ToolDef {
+                name: "answer_worker".into(),
+                description: "Answer a worker's pending ask_user question. First-responder wins (user OR orc). Pass the worker's session_id and your answer."
+                    .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Worker session_id whose question you are answering" },
+                        "answer": { "type": "string", "description": "Your answer to the worker's question" }
+                    },
+                    "required": ["session_id", "answer"]
                 }),
             },
             ToolDef {
@@ -243,6 +260,7 @@ impl McpServer {
             "list_sessions" => self.tool_list_sessions(&args).await,
             "mark_done" => self.tool_mark_done(&args).await,
             "submit_for_review" => self.tool_submit_for_review(&args).await,
+            "answer_worker" => self.tool_answer_worker(&args).await,
             "update_task_graph" => self.tool_update_task_graph(&args).await,
             _ => Err(anyhow::anyhow!("unknown tool: {}", tool_name)),
         };
@@ -422,11 +440,66 @@ impl McpServer {
             .get("context")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // The session_id of the asking worker, if provided. Falls back to "orc"
+        // for back-compat — the orc brain can also call ask_user directly.
+        let asker_session = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("orc")
+            .to_string();
 
-        let answer = self.state.ask_user("orc", question, context).await?;
+        // Fire-and-forget: inject a synthetic user message into orc so it can
+        // race the user to answer via the `answer_worker` MCP tool.
+        if asker_session != "orc" {
+            if let Some(tx) = &self.orc_inject {
+                let ctx_part = context
+                    .as_deref()
+                    .map(|c| format!(" context={c}"))
+                    .unwrap_or_default();
+                let msg = format!(
+                    "[worker {asker} asked]: {question}{ctx_part}\n\
+                     You may answer it by calling the MCP tool \
+                     `answer_worker` with arguments {{\"session_id\": \"{asker}\", \"answer\": \"...\"}}. \
+                     If you don't have enough context, stay quiet and let the user respond.",
+                    asker = asker_session,
+                    question = question,
+                    ctx_part = ctx_part,
+                );
+                let _ = tx.send(msg).await;
+            }
+        }
+
+        let answer = self
+            .state
+            .ask_user(&asker_session, question, context)
+            .await?;
 
         Ok(serde_json::to_string(&serde_json::json!({
             "response": answer
+        }))?)
+    }
+
+    async fn tool_answer_worker(&self, args: &Value) -> Result<String> {
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'session_id'"))?;
+        let answer = args
+            .get("answer")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'answer'"))?;
+
+        self.state
+            .send(StateCommand::AnswerUser {
+                session_id: session_id.to_string(),
+                answer: answer.to_string(),
+                answered_by: crate::state::AnsweredBy::Orc,
+            })
+            .await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "ok": true,
+            "session_id": session_id
         }))?)
     }
 
@@ -670,7 +743,7 @@ pub fn worker_system_prompt(session_id: &str, name: &str, task: &str) -> String 
 You have access to these MCP tools (server: orc):
 - submit_for_review(session_id, summary): Call when your work is ready for human review. Pass your session_id ({session_id}). The user will inspect the diff and approve or reject.
 - mark_done(session_id, summary): Call only if no review is needed (rare).
-- ask_user(question, context?): Ask the human a question. BLOCKS until they respond.
+- ask_user(question, context?, session_id?): Ask the human a question. BLOCKS until they respond. Pass your session_id ({session_id}) so orc can race to answer first if it has context.
 
 ## Rules
 - Do the task in your current worktree. All your file edits live on a dedicated branch.
@@ -741,7 +814,8 @@ mod tests {
         // Leak tempdir so it outlives the test
         std::mem::forget(dir);
         let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
-        McpServer::new(handle, project_dir, hook_socket_path, 0, WorkerRegistry::new(), worker_tx)
+        let (inj_tx, _inj_rx) = mpsc::channel(8);
+        McpServer::new(handle, project_dir, hook_socket_path, 0, WorkerRegistry::new(), worker_tx, inj_tx)
     }
 
     #[tokio::test]
@@ -785,7 +859,7 @@ mod tests {
         let resp = server.handle_request(&req).await.unwrap();
         assert!(resp.error.is_none());
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 8);
+        assert_eq!(tools, 9);
     }
 
     #[tokio::test]

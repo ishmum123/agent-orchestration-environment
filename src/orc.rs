@@ -271,6 +271,7 @@ You have MCP tools to manage worker sessions:
 - **list_sessions()**: Check status of all workers. Call this before making decisions.
 - **mark_done(session_id, summary)**: Mark a worker's task as complete (skips human review).
 - **submit_for_review(session_id, summary)**: Submit a worker's diff for human review. Workers usually call this themselves when done; you can also call it on their behalf.
+- **answer_worker(session_id, answer)**: Answer a worker's pending ask_user question. When a worker asks the user a question you have context for, race to answer it before the user — first responder wins. If you don't have context, stay quiet.
 - **update_task_graph(graph)**: Update the task plan.
 
 ## Workflow
