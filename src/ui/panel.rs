@@ -225,6 +225,41 @@ mod tests {
     }
 
     #[test]
+    fn panel_renders_on_worker_focused_tab() {
+        // Panel content is identical regardless of which tab is focused —
+        // it renders every agent (orc + workers) every time.
+        let backend = TestBackend::new(40, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(".");
+        app.add_session(Session {
+            id: "s1".into(),
+            name: "alpha".into(),
+            task: "t".into(),
+            worktree_path: "/tmp".into(),
+            branch: "br".into(),
+            base_commit: "abc".into(),
+            tmux_session: "orc-x".into(),
+            state: SessionState::Running,
+            mode: SessionMode::Watch,
+            model: "sonnet".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ended_at: None,
+            claude_session_id: None,
+        });
+        app.focus_tab(crate::app::TabId::Worker(0));
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, PANEL_WIDTH, 30);
+                render_panel(f, area, &app);
+            })
+            .unwrap();
+        let s = buf_text(&terminal);
+        assert!(s.contains("orc"), "{}", s);
+        assert!(s.contains("alpha"), "{}", s);
+    }
+
+    #[test]
     fn panel_includes_workers() {
         let backend = TestBackend::new(40, 30);
         let mut terminal = Terminal::new(backend).unwrap();
