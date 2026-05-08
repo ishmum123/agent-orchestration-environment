@@ -150,6 +150,10 @@ async fn main() -> Result<()> {
         &mut orc_process,
         &worker_registry,
         &mut worker_rx,
+        &project_dir,
+        &hook_sock,
+        mcp_port,
+        worker_tx.clone(),
     )
     .await;
 
@@ -171,6 +175,10 @@ async fn run_event_loop(
     orc_process: &mut OrcProcess,
     worker_registry: &WorkerRegistry,
     worker_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+    project_dir: &PathBuf,
+    hook_sock: &PathBuf,
+    mcp_port: u16,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
@@ -198,6 +206,25 @@ async fn run_event_loop(
                     }
                     KeyAction::Editor { command, target } => {
                         run_editor(terminal, &command, &target).await?;
+                    }
+                    KeyAction::RestartWorker { session_id } => {
+                        if let Err(e) = restart_worker(
+                            app,
+                            state_handle,
+                            worker_registry,
+                            &session_id,
+                            project_dir,
+                            hook_sock,
+                            mcp_port,
+                            worker_tx.clone(),
+                        )
+                        .await
+                        {
+                            app.push_chat(
+                                ChatRole::System,
+                                format!("restart failed: {e}"),
+                            );
+                        }
                     }
                 }
             }
@@ -310,6 +337,7 @@ enum KeyAction {
     InterruptOrc,
     InterruptWorker(String),
     Editor { command: String, target: String },
+    RestartWorker { session_id: String },
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) -> KeyAction {
@@ -399,18 +427,11 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         }
         KeyCode::Char('R') => {
             if let TabId::Worker(idx) = app.focused_tab {
-                if let Some(sv) = app.sessions.get(idx).cloned() {
+                if let Some(sv) = app.sessions.get(idx) {
                     if matches!(sv.session.state, session::SessionState::Failed { .. }) {
-                        // For now, log that R restart needs a working worker registry
-                        // wired with worktree-aware spawn. v2: full resume path to
-                        // be added once Phase 6 wires the spawn site.
-                        app.push_chat(
-                            ChatRole::System,
-                            format!(
-                                "restart not implemented for session {} (claude_session_id={:?})",
-                                sv.session.name, sv.claude_session_id
-                            ),
-                        );
+                        return KeyAction::RestartWorker {
+                            session_id: sv.session.id.clone(),
+                        };
                     }
                 }
             }
@@ -845,6 +866,73 @@ async fn run_editor(
         eprintln!("[orc] editor error: {e}");
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_worker(
+    app: &mut App,
+    state_handle: &StateHandle,
+    worker_registry: &WorkerRegistry,
+    session_id: &str,
+    project_dir: &std::path::Path,
+    hook_sock: &std::path::Path,
+    mcp_port: u16,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<()> {
+    let session = state_handle
+        .get_session(session_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+
+    // Drop any existing handle (no-op if absent).
+    let _ = worker_registry.kill(session_id).await;
+
+    // Build MCP config + hook relay (mirror tool_spawn_session shape).
+    let mcp_cfg = mcp::generate_mcp_config(mcp_port);
+    let mcp_cfg_path = std::env::temp_dir()
+        .join(format!("orc-worker-mcp-{}.json", session.name));
+    let _ = tokio::fs::write(
+        &mcp_cfg_path,
+        serde_json::to_string_pretty(&mcp_cfg).unwrap_or_default(),
+    )
+    .await;
+    let tmux_name = format!("orc-{}", session.name);
+    let _ = hooks::create_hook_script(hook_sock, &tmux_name).await;
+
+    let prompt = mcp::worker_system_prompt(&session.id, &session.name, &session.task);
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
+
+    let handle = if let Some(claude_sid) = session.claude_session_id.clone() {
+        worker::spawn_worker_resume(
+            session.id.clone(),
+            worktree,
+            session.model.clone(),
+            mcp_cfg_path,
+            prompt,
+            claude_sid,
+            worker_tx,
+        )
+        .await?
+    } else {
+        worker::spawn_worker(
+            session.id.clone(),
+            worktree,
+            session.model.clone(),
+            mcp_cfg_path,
+            prompt,
+            session.task.clone(),
+            worker_tx,
+        )
+        .await?
+    };
+    worker_registry.insert(handle).await;
+
+    state_handle
+        .apply_event(session_id, session::SessionEvent::Restarted)
+        .await?;
+
+    let _ = (project_dir, app);
     Ok(())
 }
 

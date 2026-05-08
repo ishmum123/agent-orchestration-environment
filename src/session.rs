@@ -58,6 +58,7 @@ pub enum SessionEvent {
     ReviewSubmitted { approved: bool, feedback: Option<String> },
     Finished { summary: String },
     Errored { reason: String },
+    Restarted,
 }
 
 pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionState> {
@@ -127,6 +128,9 @@ pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionS
         (SessionState::Done { .. }, _) => {
             bail!("invalid transition: Done is a terminal state")
         }
+        (SessionState::Failed { .. }, SessionEvent::Restarted) => {
+            Ok(SessionState::Running)
+        }
         (SessionState::Failed { .. }, _) => {
             bail!("invalid transition: Failed is a terminal state")
         }
@@ -152,6 +156,7 @@ pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionS
                 SessionEvent::ReviewSubmitted { .. } => "ReviewSubmitted",
                 SessionEvent::Finished { .. } => "Finished",
                 SessionEvent::Errored { .. } => "Errored",
+                SessionEvent::Restarted => "Restarted",
             };
             bail!("invalid transition: {} + {}", state_name, event_name)
         }
