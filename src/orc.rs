@@ -109,6 +109,15 @@ pub fn parse_orc_events(raw: &Value) -> Vec<OrcEvent> {
     events
 }
 
+/// Tracks cumulative token usage and cost for the orc brain.
+#[derive(Debug, Clone, Default)]
+pub struct OrcUsage {
+    pub total_input: u64,
+    pub total_output: u64,
+    pub total_cost: f64,
+    pub turns: u32,
+}
+
 /// Configuration for spawning the orc brain.
 pub struct OrcConfig {
     pub project_dir: PathBuf,
@@ -121,6 +130,7 @@ pub struct OrcProcess {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
+    usage: OrcUsage,
 }
 
 impl OrcProcess {
@@ -168,11 +178,38 @@ impl OrcProcess {
 
     /// Read and parse the next batch of typed events from the orc brain.
     /// Returns an empty vec if no data is available.
+    /// Automatically tracks usage from Result events.
     pub async fn read_events(&mut self) -> Result<Vec<OrcEvent>> {
         match self.try_read_raw().await? {
-            Some(raw) => Ok(parse_orc_events(&raw)),
+            Some(raw) => {
+                let events = parse_orc_events(&raw);
+                // Track usage from Result events
+                for event in &events {
+                    if let OrcEvent::Result { cost_usd, .. } = event {
+                        self.usage.turns += 1;
+                        if let Some(cost) = cost_usd {
+                            self.usage.total_cost = *cost; // total_cost_usd is cumulative
+                        }
+                    }
+                }
+                // Track token counts from assistant messages
+                if let Some(usage) = raw.pointer("/message/usage") {
+                    if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        self.usage.total_input += input;
+                    }
+                    if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        self.usage.total_output += output;
+                    }
+                }
+                Ok(events)
+            }
             None => Ok(vec![]),
         }
+    }
+
+    /// Get current cumulative usage stats.
+    pub fn usage(&self) -> &OrcUsage {
+        &self.usage
     }
 
     /// Check if the process is still running.
@@ -237,10 +274,11 @@ Working directory: {project_dir}
     )
 }
 
-/// Generate MCP config file for the orc brain.
+/// Generate MCP config file for the orc brain (HTTP transport).
+/// The MCP server must already be running on the given port.
 /// Returns the path to the generated config file.
-pub async fn write_mcp_config(orc_binary: &Path) -> Result<PathBuf> {
-    let config = crate::mcp::generate_mcp_config(orc_binary.to_str().unwrap_or("orc"));
+pub async fn write_mcp_config(port: u16) -> Result<PathBuf> {
+    let config = crate::mcp::generate_mcp_config(port);
     let config_path = std::env::temp_dir().join("orc-mcp-config.json");
     tokio::fs::write(&config_path, serde_json::to_string_pretty(&config)?).await?;
     Ok(config_path)
@@ -265,8 +303,7 @@ pub async fn spawn_orc(config: &OrcConfig) -> Result<OrcProcess> {
         "--mcp-config",
         config.mcp_config_path.to_str().unwrap_or(""),
         "--strict-mcp-config",
-        "--permission-mode",
-        "plan",
+        "--dangerously-skip-permissions",
     ]);
     cmd.current_dir(&config.project_dir);
     cmd.stdin(std::process::Stdio::piped());
@@ -289,6 +326,7 @@ pub async fn spawn_orc(config: &OrcConfig) -> Result<OrcProcess> {
         child,
         stdin,
         reader,
+        usage: OrcUsage::default(),
     })
 }
 
@@ -323,13 +361,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_config_written() {
-        let binary = Path::new("/usr/local/bin/orc");
-        let path = write_mcp_config(binary).await.unwrap();
+    async fn mcp_config_written_http() {
+        let path = write_mcp_config(9999).await.unwrap();
         assert!(path.exists());
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(parsed["mcpServers"]["orc"].is_object());
+        assert_eq!(parsed["mcpServers"]["orc"]["type"], "http");
+        assert!(parsed["mcpServers"]["orc"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("9999"));
         tokio::fs::remove_file(&path).await.ok();
     }
 
@@ -441,6 +482,15 @@ mod tests {
             OrcEvent::Result { is_error, .. } => assert!(is_error),
             other => panic!("expected Result, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn orc_usage_default() {
+        let usage = OrcUsage::default();
+        assert_eq!(usage.total_input, 0);
+        assert_eq!(usage.total_output, 0);
+        assert_eq!(usage.total_cost, 0.0);
+        assert_eq!(usage.turns, 0);
     }
 
     #[test]

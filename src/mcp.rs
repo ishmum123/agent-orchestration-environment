@@ -515,11 +515,60 @@ pub async fn run_stdio(server: McpServer) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP transport
+// ---------------------------------------------------------------------------
+
+/// Start the MCP server as an HTTP endpoint on localhost.
+/// Returns the bound port. The server runs as a background tokio task.
+/// Claude Code connects to `http://127.0.0.1:{port}/mcp` via HTTP transport.
+pub async fn start_http_server(server: std::sync::Arc<McpServer>) -> Result<u16> {
+    use axum::{extract::State, routing::post, Json, Router};
+
+    async fn mcp_handler(
+        State(server): State<std::sync::Arc<McpServer>>,
+        Json(request): Json<JsonRpcRequest>,
+    ) -> Json<Value> {
+        match server.handle_request(&request).await {
+            Some(resp) => Json(serde_json::to_value(resp).unwrap_or(Value::Null)),
+            None => Json(serde_json::json!({})),
+        }
+    }
+
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler))
+        .with_state(server);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("[mcp-http] server error: {}", e);
+        }
+    });
+
+    Ok(port)
+}
+
+// ---------------------------------------------------------------------------
 // MCP config generation
 // ---------------------------------------------------------------------------
 
-/// Generate MCP config JSON for Claude Code's --mcp-config flag.
-pub fn generate_mcp_config(orc_binary: &str) -> Value {
+/// Generate MCP config JSON for Claude Code's --mcp-config flag (HTTP transport).
+/// The MCP server runs in-process on localhost, Claude Code connects to it.
+pub fn generate_mcp_config(port: u16) -> Value {
+    serde_json::json!({
+        "mcpServers": {
+            "orc": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{}/mcp", port)
+            }
+        }
+    })
+}
+
+/// Generate MCP config for stdio transport (used for testing / fallback).
+pub fn generate_mcp_config_stdio(orc_binary: &str) -> Value {
     serde_json::json!({
         "mcpServers": {
             "orc": {
@@ -828,10 +877,48 @@ mod tests {
     }
 
     #[test]
-    fn generate_mcp_config_structure() {
-        let config = generate_mcp_config("/usr/local/bin/orc");
+    fn generate_mcp_config_http() {
+        let config = generate_mcp_config(9123);
+        assert_eq!(config["mcpServers"]["orc"]["type"], "http");
+        assert_eq!(
+            config["mcpServers"]["orc"]["url"],
+            "http://127.0.0.1:9123/mcp"
+        );
+    }
+
+    #[test]
+    fn generate_mcp_config_stdio_structure() {
+        let config = generate_mcp_config_stdio("/usr/local/bin/orc");
         assert_eq!(config["mcpServers"]["orc"]["command"], "/usr/local/bin/orc");
         assert_eq!(config["mcpServers"]["orc"]["args"][0], "--mcp-server");
+    }
+
+    #[tokio::test]
+    async fn http_server_handles_request() {
+        let server = std::sync::Arc::new(test_server().await);
+        let port = start_http_server(server).await.unwrap();
+
+        // Give server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Make HTTP request to the MCP endpoint
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/mcp", port))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"}
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert!(resp.status().is_success());
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(body["result"]["serverInfo"]["name"], "orc");
     }
 
     #[test]

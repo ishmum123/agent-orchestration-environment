@@ -15,6 +15,11 @@ use tokio::sync::mpsc;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Generate a unique name suffix to avoid worktree collisions between test runs.
+fn unique_suffix() -> String {
+    uuid::Uuid::new_v4().to_string()[..8].to_string()
+}
+
 /// Create an in-memory state manager and return the handle.
 /// Spawns the manager run loop as a background task.
 fn setup_state() -> StateHandle {
@@ -57,8 +62,10 @@ async fn call_ok(server: &McpServer, req: &JsonRpcRequest) -> Value {
 
 /// Extract the text content from a tools/call response and parse as JSON.
 fn extract_tool_text(result: &Value) -> Value {
-    let text = result["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
+    let text = result["content"][0]["text"].as_str()
+        .unwrap_or_else(|| panic!("no text in result: {:?}", result));
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("failed to parse tool text as JSON: {} -- text was: {}", e, text))
 }
 
 // ===========================================================================
@@ -118,6 +125,7 @@ async fn mcp_tools_list_returns_all_seven_tools() {
 #[tokio::test]
 async fn mcp_spawn_list_markdone_lifecycle() {
     let server = setup_mcp();
+    let name = format!("lifecycle-{}", unique_suffix());
 
     // Step 1: spawn a session
     let spawn_req = JsonRpcRequest {
@@ -126,7 +134,7 @@ async fn mcp_spawn_list_markdone_lifecycle() {
         method: "tools/call".into(),
         params: serde_json::json!({
             "name": "spawn_session",
-            "arguments": { "name": "lifecycle-test", "task": "prove MCP works", "model": "sonnet" }
+            "arguments": { "name": &name, "task": "prove MCP works", "model": "sonnet" }
         }),
     };
     let spawn_result = call_ok(&server, &spawn_req).await;
@@ -146,7 +154,7 @@ async fn mcp_spawn_list_markdone_lifecycle() {
     let list_data = extract_tool_text(&list_result);
     let sessions = list_data["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["name"], "lifecycle-test");
+    assert_eq!(sessions[0]["name"], name);
     assert_eq!(sessions[0]["state"], "Running");
 
     // Step 3: mark done — state transition
@@ -219,12 +227,12 @@ async fn hook_server_receives_events_from_tokio_client() {
     tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Send multiple event types over separate connections
+    // Send multiple event types over separate connections (our internal format,
+    // as the relay script would produce after mapping Claude Code's fields)
     let events = vec![
         serde_json::json!({
             "session_id": "s1", "hook": "PreToolUse",
-            "tool_name": "Write", "input": {"file": "test.rs"},
-            "timestamp": "2025-01-01T00:00:00Z"
+            "tool_name": "Write", "input": {"file": "test.rs"}
         }),
         serde_json::json!({
             "session_id": "s2", "hook": "PostToolUse",
@@ -233,8 +241,7 @@ async fn hook_server_receives_events_from_tokio_client() {
         }),
         serde_json::json!({
             "session_id": "s3", "hook": "Stop",
-            "reason": "task complete", "result": "success",
-            "timestamp": "2025-01-01T00:00:02Z"
+            "reason": "task complete", "result": "success"
         }),
     ];
 
@@ -292,13 +299,15 @@ async fn hook_relay_script_sends_to_socket() {
         .await
         .unwrap();
 
-    // Pipe a hook payload into the relay script via a child process.
-    // The relay script injects session_id but expects hook type in the input.
+    // Pipe a payload using Claude Code's ACTUAL field names.
+    // The relay script should map hook_event_name→hook, tool_input→input.
     let hook_input = serde_json::json!({
-        "hook": "PreToolUse",
+        "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "input": {"command": "echo hello"},
-        "timestamp": "2025-06-01T00:00:00Z"
+        "tool_input": {"command": "echo hello"},
+        "session_id": "claude-internal-session",
+        "cwd": "/some/path",
+        "permission_mode": "default"
     });
 
     let mut child = tokio::process::Command::new("python3")
@@ -345,7 +354,7 @@ async fn hook_subprocess_nc_or_bash() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let sock_str = sock_path.to_string_lossy().to_string();
-    let payload = r#"{"session_id":"bash-test","hook":"Notification","message":"from subprocess","timestamp":"2025-01-01T00:00:00Z"}"#;
+    let payload = r#"{"session_id":"bash-test","hook":"Notification","message":"from subprocess"}"#;
 
     // Use python3 one-liner to connect and send
     let script = format!(
@@ -382,9 +391,8 @@ async fn hook_subprocess_nc_or_bash() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore]
 async fn tmux_full_lifecycle() {
-    let session_name = "orc-phase0-test";
+    let session_name = "tst-phase0-lifecycle";
     let dir = std::env::temp_dir();
 
     // 1. Create session
@@ -497,13 +505,14 @@ async fn full_pipeline_mcp_hooks_state() {
     let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock);
 
     // 6a: MCP call to spawn_session
+    let worker_name = format!("pipeline-{}", unique_suffix());
     let spawn_req = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(Value::Number(1.into())),
         method: "tools/call".into(),
         params: serde_json::json!({
             "name": "spawn_session",
-            "arguments": { "name": "pipeline-worker", "task": "end-to-end test" }
+            "arguments": { "name": &worker_name, "task": "end-to-end test" }
         }),
     };
     let spawn_result = call_ok(&mcp, &spawn_req).await;
@@ -512,7 +521,7 @@ async fn full_pipeline_mcp_hooks_state() {
 
     // 6b: Verify session in state
     let session = handle.get_session(&session_id).await.unwrap();
-    assert_eq!(session.name, "pipeline-worker");
+    assert_eq!(session.name, worker_name);
     assert!(matches!(session.state, SessionState::Running));
 
     // 6c: Simulate hook event (Stop) by sending to the socket
@@ -522,8 +531,7 @@ async fn full_pipeline_mcp_hooks_state() {
         let stop_event = serde_json::json!({
             "session_id": &session_id,
             "hook": "Stop",
-            "reason": "task finished",
-            "timestamp": "2025-01-01T00:00:00Z"
+            "reason": "task finished"
         });
         let payload = serde_json::to_string(&stop_event).unwrap();
         stream.write_all(payload.as_bytes()).await.unwrap();
@@ -626,4 +634,136 @@ async fn full_pipeline_ask_user_flow() {
         .expect("ask_user timed out")
         .expect("ask task panicked");
     assert_eq!(answer, "main");
+}
+
+// ===========================================================================
+// Test 6: tmux attach/detach flow (validates the TUI suspend/resume pattern)
+// ===========================================================================
+//
+// Proves that from inside one tmux session we can `tmux attach` to another,
+// interact with it, detach via C-q, and the original session regains control.
+// This is exactly what orc's TUI does: leave alt-screen → attach → resume on detach.
+
+/// Validates the tmux attach/detach pattern that orc's TUI will use:
+/// 1. `tmux attach-session` blocks the calling process until detach
+/// 2. `detach-client` (or C-q binding) causes attach to return cleanly
+/// 3. The calling shell regains control after detach
+/// 4. The worker session survives the detach
+///
+/// Uses bash (not zsh) for the app session to avoid async prompt rendering
+/// interfering with pane capture assertions.
+#[tokio::test]
+async fn tmux_attach_detach_flow() {
+    use orc::tmux;
+    use tokio::process::Command;
+
+    let app_session = "tst-attach-app";
+    let worker_session = "tst-attach-worker";
+    let dir = std::env::temp_dir();
+    let proof_file = dir.join("tst-attach-detach-proof.txt");
+
+    // Clean slate
+    let _ = tmux::kill_session(app_session).await;
+    let _ = tmux::kill_session(worker_session).await;
+    let _ = tokio::fs::remove_file(&proof_file).await;
+
+    // 1. Create worker session (the one we'll attach to)
+    tmux::create_session(worker_session, &dir)
+        .await
+        .expect("create worker session");
+
+    // 2. Create app session with bash (simulating orc's process environment)
+    Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            app_session,
+            "-x",
+            "80",
+            "-y",
+            "40",
+            "bash",
+            "--norc",
+            "--noprofile",
+        ])
+        .output()
+        .await
+        .expect("create app session with bash");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 3. Verify app shell works before attach
+    tmux::send_keys(app_session, &["echo PRE_ATTACH_OK", "Enter"])
+        .await
+        .expect("send pre-attach");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let pre_pane = tmux::capture_pane(app_session)
+        .await
+        .expect("capture pre-attach");
+    assert!(
+        pre_pane.contains("PRE_ATTACH_OK"),
+        "app shell should work before attach. got: {}",
+        pre_pane
+    );
+
+    // 4. From app session, attach to worker (blocks the shell)
+    tmux::send_keys(
+        app_session,
+        &[
+            &format!("TMUX='' tmux attach-session -t {worker_session}"),
+            "Enter",
+        ],
+    )
+    .await
+    .expect("send attach command");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // 5. Detach: kick all clients off the worker session
+    // In real orc, the worker's C-q binding does this. Here we use detach-client directly.
+    Command::new("tmux")
+        .args(["detach-client", "-s", worker_session])
+        .output()
+        .await
+        .expect("detach-client");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 6. Verify: the "[detached ...]" message should appear, proving attach returned
+    let detach_pane = tmux::capture_pane(app_session)
+        .await
+        .expect("capture after detach");
+    assert!(
+        detach_pane.contains("detached"),
+        "should see [detached ...] message after detach. got: {}",
+        detach_pane
+    );
+
+    // 7. Verify: shell is responsive after detach (can execute new commands)
+    let proof_path = proof_file.to_string_lossy();
+    tmux::send_keys(
+        app_session,
+        &[&format!("echo POST_DETACH_OK > {proof_path}"), "Enter"],
+    )
+    .await
+    .expect("send post-detach command");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let proof = tokio::fs::read_to_string(&proof_file)
+        .await
+        .expect("proof file should exist — shell must be responsive after detach");
+    assert!(
+        proof.contains("POST_DETACH_OK"),
+        "proof file should contain marker"
+    );
+
+    // 8. Worker session should still be alive (detach != kill)
+    assert!(
+        tmux::has_session(worker_session).await,
+        "worker session should survive detach"
+    );
+
+    // Cleanup
+    let _ = tmux::kill_session(app_session).await;
+    let _ = tmux::kill_session(worker_session).await;
+    let _ = tokio::fs::remove_file(&proof_file).await;
 }

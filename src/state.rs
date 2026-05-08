@@ -89,8 +89,8 @@ pub struct PendingEscalation {
 
 #[derive(Debug, Clone)]
 pub enum StateChange {
-    SessionCreated { session_id: String, name: String },
-    SessionStateChanged { session_id: String, old: String, new: String },
+    SessionCreated { session: Session },
+    SessionStateChanged { session_id: String, old: String, new_state: SessionState },
     SessionModeChanged { session_id: String, mode: SessionMode },
     SessionRemoved { session_id: String },
     TaskGraphUpdated { run_id: String },
@@ -368,8 +368,7 @@ impl StateManager {
         let id = session.id.clone();
         self.sessions.insert(id.clone(), session.clone());
         let _ = self.change_tx.send(StateChange::SessionCreated {
-            session_id: id,
-            name,
+            session: session.clone(),
         });
         Ok(session)
     }
@@ -398,7 +397,7 @@ impl StateManager {
         let _ = self.change_tx.send(StateChange::SessionStateChanged {
             session_id: session_id.to_string(),
             old: old_state,
-            new: new_state,
+            new_state: session.state.clone(),
         });
         Ok(session.state.clone())
     }
@@ -501,7 +500,7 @@ impl StateManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn state_label(state: &SessionState) -> String {
+pub fn state_label(state: &SessionState) -> String {
     match state {
         SessionState::Running => "Running".to_string(),
         SessionState::Blocked { .. } => "Blocked".to_string(),
@@ -626,9 +625,9 @@ mod tests {
 
         let change = sub.recv().await.unwrap();
         match change {
-            StateChange::SessionCreated { session_id, name } => {
-                assert_eq!(session_id, session.id);
-                assert_eq!(name, "broadcast");
+            StateChange::SessionCreated { session: created } => {
+                assert_eq!(created.id, session.id);
+                assert_eq!(created.name, "broadcast");
             }
             other => panic!("expected SessionCreated, got {:?}", other),
         }
@@ -678,7 +677,7 @@ mod tests {
                         reason: Some("all done".to_string()),
                         result: None,
                     },
-                    timestamp: "2025-01-01T00:00:00Z".to_string(),
+                    timestamp: Some("2025-01-01T00:00:00Z".to_string()),
                 },
             })
             .await
@@ -821,7 +820,7 @@ mod tests {
                         tool_name: "SomeUnknownTool".to_string(),
                         input: serde_json::json!({"target": "something"}),
                     },
-                    timestamp: "2025-01-01T00:00:00Z".to_string(),
+                    timestamp: Some("2025-01-01T00:00:00Z".to_string()),
                 },
             })
             .await

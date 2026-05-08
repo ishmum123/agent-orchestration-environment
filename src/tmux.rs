@@ -23,7 +23,7 @@ fn tmux_conf_content() -> &'static str {
      set -g status off\n\
      set -g prefix None\n\
      unbind C-b\n\
-     bind C-q detach-client\n\
+     bind -n C-q detach-client\n\
      set -g mouse off\n\
      set -g default-terminal \"screen-256color\"\n"
 }
@@ -124,8 +124,10 @@ pub async fn capture_pane(name: &str) -> Result<String> {
 }
 
 /// Attach to a tmux session (blocking — user takes over terminal).
+/// Clears `TMUX` env to allow nesting (orc runs inside the user's tmux).
 pub async fn attach(name: &str) -> Result<()> {
     let status = std::process::Command::new("tmux")
+        .env_remove("TMUX")
         .args(["attach-session", "-t", name])
         .status()?;
     if !status.success() {
@@ -179,7 +181,7 @@ mod tests {
         assert!(conf.contains("set -g status off"));
         assert!(conf.contains("set -g prefix None"));
         assert!(conf.contains("unbind C-b"));
-        assert!(conf.contains("bind C-q detach-client"));
+        assert!(conf.contains("bind -n C-q detach-client"));
         assert!(conf.contains("set -g mouse off"));
         assert!(conf.contains("set -g default-terminal \"screen-256color\""));
     }
@@ -243,13 +245,15 @@ mod tests {
         assert_eq!(filtered, vec!["orc-worker1", "orc-worker2"]);
     }
 
-    // ── integration tests (require tmux, run manually with `cargo test -- --ignored`) ──
+    // ── integration tests (require tmux) ───────────────────────────────────
+    // Session names use "tst-" prefix (not "orc-") so cleanup_orphaned() won't
+    // race-kill sessions owned by other parallel tests.
 
     #[tokio::test]
-    #[ignore]
     async fn integration_create_and_kill_session() {
-        let name = "orc-test-integration";
+        let name = "tst-create-kill";
         let dir = std::env::temp_dir();
+        let _ = kill_session(name).await; // ensure clean slate
         assert!(!has_session(name).await, "session should not exist yet");
         create_session(name, &dir).await.expect("create_session");
         assert!(has_session(name).await, "session should exist after create");
@@ -258,10 +262,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn integration_send_text_and_capture() {
-        let name = "orc-test-send";
+        let name = "tst-send-capture";
         let dir = std::env::temp_dir();
+        let _ = kill_session(name).await;
         create_session(name, &dir).await.expect("create_session");
         send_keys(name, &["echo hello-orc-test", "Enter"])
             .await
@@ -273,11 +277,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn integration_list_and_cleanup_orc_sessions() {
+        // These use "orc-" prefix intentionally — they're the ones cleanup targets.
         let names = ["orc-cleanup-a", "orc-cleanup-b"];
         let dir = std::env::temp_dir();
         for n in &names {
+            let _ = kill_session(n).await;
             create_session(n, &dir).await.expect("create_session");
         }
         let sessions = list_orc_sessions().await.expect("list_orc_sessions");
@@ -292,11 +297,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn integration_pipe_pane_log() {
-        let name = "orc-test-pipe";
+        let name = "tst-pipe-pane";
         let dir = std::env::temp_dir();
-        let logfile = dir.join("orc-test-pipe.log");
+        let logfile = dir.join("tst-pipe-pane.log");
+        let _ = kill_session(name).await;
+        let _ = fs::remove_file(&logfile).await;
         create_session(name, &dir).await.expect("create_session");
         start_pipe_pane(name, &logfile).await.expect("start_pipe_pane");
         send_keys(name, &["echo pipe-test-output", "Enter"])
