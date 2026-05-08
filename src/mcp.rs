@@ -4,6 +4,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use std::path::PathBuf;
+
 use crate::session::SessionEvent;
 use crate::state::{StateCommand, StateHandle};
 
@@ -50,11 +52,17 @@ pub struct ToolDef {
 
 pub struct McpServer {
     state: StateHandle,
+    project_dir: PathBuf,
+    hook_socket_path: PathBuf,
 }
 
 impl McpServer {
-    pub fn new(state: StateHandle) -> Self {
-        McpServer { state }
+    pub fn new(state: StateHandle, project_dir: PathBuf, hook_socket_path: PathBuf) -> Self {
+        McpServer {
+            state,
+            project_dir,
+            hook_socket_path,
+        }
     }
 
     /// Tool definitions exposed to the MCP client.
@@ -248,15 +256,63 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .unwrap_or("sonnet");
 
+        let project_dir = self.project_dir.to_str().unwrap_or(".");
+
+        // 1. Create worktree
+        let worktree_path = crate::worktree::create_worktree(project_dir, name).await?;
+        let worktree_str = worktree_path.to_str().unwrap_or("").to_string();
+
+        // 2. Get base commit
+        let base_output = tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project_dir)
+            .output()
+            .await?;
+        let base_commit = String::from_utf8_lossy(&base_output.stdout)
+            .trim()
+            .to_string();
+
+        let branch = format!("orc/{}", name);
+        let tmux_name = format!("orc-{}", name);
+
+        // 3. Create tmux session (best-effort — may not be available in tests)
+        let tmux_ok = crate::tmux::create_session(&tmux_name, &worktree_path)
+            .await
+            .is_ok();
+
+        // 4. Create hook relay script
+        let _hook_script = crate::hooks::create_hook_script(
+            &self.hook_socket_path,
+            &tmux_name,
+        )
+        .await?;
+
+        if tmux_ok {
+            // 5. Start Claude Code inside tmux with the task
+            let claude_cmd = format!(
+                "claude -p --model {} --permission-mode plan \"{}\"",
+                model,
+                task.replace('"', "\\\"")
+            );
+            let _ = crate::tmux::send_text(&tmux_name, &claude_cmd).await;
+            let _ = crate::tmux::send_keys(&tmux_name, &["Enter"]).await;
+
+            // 6. Start pipe-pane for log capture
+            let log_path = std::env::temp_dir().join(format!("orc-{}.log", name));
+            let _ = crate::tmux::start_pipe_pane(&tmux_name, &log_path).await;
+        }
+
+        // 7. Create state entry with real paths
         let session = self
             .state
-            .create_session(name, task, "", &format!("orc/{}", name), "", model)
+            .create_session(name, task, &worktree_str, &branch, &base_commit, model)
             .await?;
 
         Ok(serde_json::to_string(&serde_json::json!({
             "session_id": session.id,
             "name": session.name,
-            "branch": session.branch,
+            "worktree_path": worktree_str,
+            "branch": branch,
             "status": "created"
         }))?)
     }
@@ -297,8 +353,20 @@ impl McpServer {
             .await
             .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
 
+        // Kill tmux session
         let _ = crate::tmux::kill_session(&session.tmux_session).await;
 
+        // Remove worktree if it exists
+        if !session.worktree_path.is_empty() {
+            let _ = crate::worktree::remove_worktree(
+                self.project_dir.to_str().unwrap_or("."),
+                std::path::Path::new(&session.worktree_path),
+                &session.name,
+            )
+            .await;
+        }
+
+        // Remove from state
         self.state
             .send(StateCommand::RemoveSession {
                 session_id: session_id.to_string(),
@@ -477,9 +545,26 @@ mod tests {
         let policy = crate::policy::PolicyEngine::default_policy();
         let (handle, manager) = crate::state::StateManager::new(db, policy);
         tokio::spawn(manager.run());
+
+        // Put git repo inside a "repo" subdir so worktrees go into the tempdir
+        // (not /tmp/.orc-worktrees which collides across tests)
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let hook_socket_path = dir.path().join("hooks.sock");
+
+        // Initialize a git repo so worktree creation works in tests
+        let _ = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&project_dir)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(&project_dir)
+            .output();
+
         // Leak tempdir so it outlives the test
         std::mem::forget(dir);
-        McpServer::new(handle)
+        McpServer::new(handle, project_dir, hook_socket_path)
     }
 
     #[tokio::test]

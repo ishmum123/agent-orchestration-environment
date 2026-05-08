@@ -7,3 +7,4 @@ pub mod policy;
 pub mod session;
 pub mod state;
 pub mod tmux;
+pub mod worktree;

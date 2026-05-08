@@ -1,9 +1,113 @@
 // Orchestrator brain: spawn and manage the planning agent.
 
 use anyhow::Result;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+/// Parsed events from the orc brain's stream-json output.
+#[derive(Debug, Clone)]
+pub enum OrcEvent {
+    /// Orc is producing text (display in chat pane)
+    Text(String),
+    /// Orc is calling an MCP tool
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Orc finished a turn
+    Result {
+        is_error: bool,
+        result: String,
+        cost_usd: Option<f64>,
+        duration_ms: Option<u64>,
+    },
+    /// System event (init, model info)
+    System {
+        model: Option<String>,
+        session_id: Option<String>,
+    },
+    /// Thinking/reasoning block
+    Thinking(String),
+}
+
+/// Parse a raw stream-json Value into zero or more OrcEvents.
+pub fn parse_orc_events(raw: &Value) -> Vec<OrcEvent> {
+    let mut events = Vec::new();
+
+    let event_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match event_type {
+        "system" => {
+            events.push(OrcEvent::System {
+                model: raw.get("model").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                session_id: raw
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            });
+        }
+        "assistant" => {
+            if let Some(content) = raw
+                .pointer("/message/content")
+                .and_then(|v| v.as_array())
+            {
+                for block in content {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match block_type {
+                        "text" => {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                events.push(OrcEvent::Text(text.to_string()));
+                            }
+                        }
+                        "tool_use" => {
+                            let id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let input = block.get("input").cloned().unwrap_or(Value::Null);
+                            events.push(OrcEvent::ToolUse { id, name, input });
+                        }
+                        "thinking" => {
+                            if let Some(text) = block.get("thinking").and_then(|v| v.as_str()) {
+                                events.push(OrcEvent::Thinking(text.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "result" => {
+            let subtype = raw.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+            let is_error = subtype == "error";
+            let result_text = raw
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cost_usd = raw.get("total_cost_usd").and_then(|v| v.as_f64());
+            let duration_ms = raw.get("duration_ms").and_then(|v| v.as_u64());
+            events.push(OrcEvent::Result {
+                is_error,
+                result: result_text,
+                cost_usd,
+                duration_ms,
+            });
+        }
+        _ => {}
+    }
+
+    events
+}
 
 /// Configuration for spawning the orc brain.
 pub struct OrcConfig {
@@ -36,9 +140,9 @@ impl OrcProcess {
         Ok(())
     }
 
-    /// Try to read the next event from the orc brain.
+    /// Try to read the next raw JSON event from the orc brain.
     /// Returns None if no data is available yet or on timeout.
-    pub async fn try_read_event(&mut self) -> Result<Option<serde_json::Value>> {
+    pub async fn try_read_raw(&mut self) -> Result<Option<Value>> {
         let mut line = String::new();
         match tokio::time::timeout(
             std::time::Duration::from_millis(10),
@@ -59,6 +163,15 @@ impl OrcProcess {
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => Ok(None), // timeout, no data
+        }
+    }
+
+    /// Read and parse the next batch of typed events from the orc brain.
+    /// Returns an empty vec if no data is available.
+    pub async fn read_events(&mut self) -> Result<Vec<OrcEvent>> {
+        match self.try_read_raw().await? {
+            Some(raw) => Ok(parse_orc_events(&raw)),
+            None => Ok(vec![]),
         }
     }
 
@@ -218,5 +331,132 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(parsed["mcpServers"]["orc"].is_object());
         tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[test]
+    fn parse_system_event() {
+        let raw = serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "sess-123",
+            "model": "claude-sonnet-4-20250514"
+        });
+        let events = parse_orc_events(&raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrcEvent::System { model, session_id } => {
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-20250514"));
+                assert_eq!(session_id.as_deref(), Some("sess-123"));
+            }
+            other => panic!("expected System, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_assistant_text_and_tool_use() {
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I'll spawn a worker."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "spawn_session", "input": {"name": "auth", "task": "fix auth"}}
+                ],
+                "usage": {"input_tokens": 100, "output_tokens": 50}
+            }
+        });
+        let events = parse_orc_events(&raw);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            OrcEvent::Text(t) => assert_eq!(t, "I'll spawn a worker."),
+            other => panic!("expected Text, got {:?}", other),
+        }
+        match &events[1] {
+            OrcEvent::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "spawn_session");
+                assert_eq!(input["name"], "auth");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_assistant_thinking() {
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me reason about this..."}
+                ]
+            }
+        });
+        let events = parse_orc_events(&raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrcEvent::Thinking(t) => assert_eq!(t, "Let me reason about this..."),
+            other => panic!("expected Thinking, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_result_success() {
+        let raw = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "done",
+            "session_id": "sess-123",
+            "duration_ms": 5000,
+            "total_cost_usd": 0.05
+        });
+        let events = parse_orc_events(&raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrcEvent::Result {
+                is_error,
+                result,
+                cost_usd,
+                duration_ms,
+            } => {
+                assert!(!is_error);
+                assert_eq!(result, "done");
+                assert_eq!(*cost_usd, Some(0.05));
+                assert_eq!(*duration_ms, Some(5000));
+            }
+            other => panic!("expected Result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_result_error() {
+        let raw = serde_json::json!({
+            "type": "result",
+            "subtype": "error",
+            "result": "something failed"
+        });
+        let events = parse_orc_events(&raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrcEvent::Result { is_error, .. } => assert!(is_error),
+            other => panic!("expected Result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_type_returns_empty() {
+        let raw = serde_json::json!({"type": "unknown_type", "data": 42});
+        let events = parse_orc_events(&raw);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_content_array() {
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": []}
+        });
+        let events = parse_orc_events(&raw);
+        assert!(events.is_empty());
     }
 }

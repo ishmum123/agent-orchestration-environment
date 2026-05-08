@@ -30,7 +30,22 @@ fn setup_state() -> StateHandle {
 
 /// Build an MCP server backed by a fresh state manager.
 fn setup_mcp() -> McpServer {
-    McpServer::new(setup_state())
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().to_path_buf();
+    let hook_socket_path = dir.path().join("hooks.sock");
+
+    // Initialize a git repo so worktree creation works
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&project_dir)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&project_dir)
+        .output();
+
+    std::mem::forget(dir);
+    McpServer::new(setup_state(), project_dir, hook_socket_path)
 }
 
 /// Send a JSON-RPC request and return the response, asserting no JSON-RPC error.
@@ -467,7 +482,19 @@ async fn full_pipeline_mcp_hooks_state() {
     });
 
     // 5: Create MCP server with the same StateHandle
-    let mcp = McpServer::new(handle.clone());
+    let mcp_dir = tempfile::tempdir().unwrap();
+    let mcp_project = mcp_dir.path().to_path_buf();
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&mcp_project)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&mcp_project)
+        .output();
+    let mcp_hook_sock = mcp_dir.path().join("hooks.sock");
+    std::mem::forget(mcp_dir);
+    let mcp = McpServer::new(handle.clone(), mcp_project, mcp_hook_sock);
 
     // 6a: MCP call to spawn_session
     let spawn_req = JsonRpcRequest {
@@ -538,7 +565,19 @@ async fn full_pipeline_mcp_hooks_state() {
 async fn full_pipeline_ask_user_flow() {
     // 7: Test ask_user: spawn a task that calls ask_user, answer from another task
     let handle = setup_state();
-    let mcp = McpServer::new(handle.clone());
+    let ask_dir = tempfile::tempdir().unwrap();
+    let ask_project = ask_dir.path().to_path_buf();
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&ask_project)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&ask_project)
+        .output();
+    let ask_hook_sock = ask_dir.path().join("hooks.sock");
+    std::mem::forget(ask_dir);
+    let mcp = McpServer::new(handle.clone(), ask_project, ask_hook_sock);
 
     // Create a session (so ask_user has something to associate with)
     let spawn_req = JsonRpcRequest {
