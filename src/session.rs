@@ -27,6 +27,7 @@ pub enum SessionMode {
     Control,
 }
 
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub name: String,
