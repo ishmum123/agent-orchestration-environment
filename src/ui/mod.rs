@@ -7,6 +7,7 @@
 //   Modal overlay if active
 
 pub mod modals;
+pub mod panel;
 pub mod review;
 pub mod tabs;
 pub mod worker;
@@ -34,18 +35,28 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     tabs::render_tabs(frame, layout[0], app);
 
+    // Split main area into [content | agents panel].
+    let panel_w = panel::PANEL_WIDTH.min(layout[1].width.saturating_sub(20));
+    let main_split = Layout::horizontal([
+        Constraint::Min(20),
+        Constraint::Length(panel_w),
+    ])
+    .split(layout[1]);
+    let content_area = main_split[0];
+    let panel_area = main_split[1];
+
     if let Some(rev) = &app.review {
-        review::render_review(frame, layout[1], rev);
+        review::render_review(frame, content_area, rev);
     } else {
         match app.focused_tab {
             TabId::Orc => {
-                render_orc_tab(frame, layout[1], app);
+                render_orc_tab(frame, content_area, app);
             }
             TabId::Worker(idx) => {
                 if let Some(sv) = app.sessions.get(idx) {
                     worker::render_worker(
                         frame,
-                        layout[1],
+                        content_area,
                         sv,
                         app.scroll_pos(TabId::Worker(idx)),
                     );
@@ -53,6 +64,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             }
         }
     }
+
+    panel::render_panel(frame, panel_area, app);
 
     render_action_bar(frame, layout[2], app);
 

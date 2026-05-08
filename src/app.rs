@@ -161,7 +161,9 @@ pub struct App {
     pub modal: Option<Modal>,
     pub scroll: HashMap<TabId, usize>,
     pub pending_input: String,
-    pub show_graph: bool,
+    /// Per-session/orc one-line summary set via `current_summary` MCP tool.
+    /// Key "orc" reserved for the orchestrator; otherwise session_id.
+    pub summaries: HashMap<String, String>,
     pub review: Option<ReviewState>,
     pub started_at: Instant,
 
@@ -181,7 +183,7 @@ impl App {
             modal: None,
             scroll: HashMap::new(),
             pending_input: String::new(),
-            show_graph: false,
+            summaries: HashMap::new(),
             review: None,
             started_at: Instant::now(),
             should_quit: false,
@@ -254,6 +256,16 @@ impl App {
                 log.drain(0..drop);
             }
         }
+    }
+
+    /// Look up a one-line summary for an agent (orc or worker session_id).
+    pub fn session_summary(&self, key: &str) -> Option<String> {
+        self.summaries.get(key).cloned()
+    }
+
+    /// Update the summary for an agent (orc or worker session_id).
+    pub fn set_session_summary(&mut self, key: String, summary: String) {
+        self.summaries.insert(key, summary);
     }
 
     pub fn set_claude_session_id(&mut self, session_id: &str, sid: String) {

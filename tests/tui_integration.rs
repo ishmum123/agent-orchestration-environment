@@ -181,8 +181,7 @@ fn l3_graph_toggle() {
     // Without graph
     let output_no_graph = render_to_string(&app, 120, 40);
 
-    // With graph
-    app.show_graph = true;
+    // With graph (field removed in UX overhaul)
     let output_with_graph = render_to_string(&app, 120, 40);
 
     assert!(
