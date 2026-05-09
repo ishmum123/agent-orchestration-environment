@@ -34,7 +34,7 @@ fn test_session(id: &str, name: &str, state: SessionState) -> Session {
     }
 }
 
-fn render_to_string(app: &App, width: u16, height: u16) -> String {
+fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| orc::ui::render(f, app)).unwrap();
@@ -55,8 +55,8 @@ fn render_to_string(app: &App, width: u16, height: u16) -> String {
 
 #[test]
 fn l3_empty_dashboard_renders() {
-    let app = App::new(".");
-    let output = render_to_string(&app, 80, 24);
+    let mut app = App::new(".");
+    let output = render_to_string(&mut app, 80, 24);
     // After UX overhaul: agents panel always shows orc card.
     assert!(output.contains("orc"), "should show orc agent card");
     assert!(
@@ -70,7 +70,7 @@ fn l3_dashboard_with_chat() {
     let mut app = App::new(".");
     app.push_chat(ChatRole::User, "deploy to staging".to_string());
     app.push_chat(ChatRole::Orc, "planning 3 sessions".to_string());
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(output.contains("deploy to staging"), "should show user message");
     assert!(output.contains("planning 3 sessions"), "should show orc message");
 }
@@ -95,7 +95,7 @@ fn l3_worker_tabs_show_badges() {
         },
     ));
 
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(output.contains("auth-fix"), "should show worker name");
     assert!(output.contains("test-write"), "should show second worker");
     assert!(output.contains("◐"), "running badge");
@@ -115,7 +115,7 @@ fn l3_worker_tab_focused() {
         .push(orc::app::LogEntry::AssistantText("found 3 handlers".to_string()));
 
     app.focus_tab(TabId::Worker(0));
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(output.contains("auth-fix"), "should show session name");
     assert!(output.contains("kill"), "action bar should show kill hint");
 }
@@ -127,7 +127,7 @@ fn l3_new_task_modal() {
         target: TabId::Orc,
         buffer: "add OAuth".to_string(),
     });
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(output.contains("new task") || output.contains("task"),
         "should show new task title");
 }
@@ -141,8 +141,9 @@ fn l3_ask_user_modal() {
         question: "Which branch to target?".to_string(),
         context: Some("for the PR".to_string()),
         buffer: String::new(),
+        hidden: false,
     });
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(
         output.contains("branch") || output.contains("input"),
         "should show the question or input prompt"
@@ -153,7 +154,7 @@ fn l3_ask_user_modal() {
 fn l3_confirm_quit_modal() {
     let mut app = App::new(".");
     app.modal = Some(Modal::ConfirmQuit);
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(
         output.contains("quit") || output.contains("Quit"),
         "should show quit confirmation"
@@ -164,7 +165,7 @@ fn l3_confirm_quit_modal() {
 fn l3_help_modal() {
     let mut app = App::new(".");
     app.modal = Some(Modal::Help);
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(
         output.contains("help") || output.contains("Help"),
         "should show help content"
@@ -179,10 +180,10 @@ fn l3_graph_toggle() {
     app.push_chat(ChatRole::Orc, "planned 1 session".to_string());
 
     // Without graph
-    let output_no_graph = render_to_string(&app, 120, 40);
+    let output_no_graph = render_to_string(&mut app, 120, 40);
 
     // With graph (field removed in UX overhaul)
-    let output_with_graph = render_to_string(&app, 120, 40);
+    let output_with_graph = render_to_string(&mut app, 120, 40);
 
     assert!(
         output_with_graph.contains("task graph") || output_with_graph.contains("graph"),
@@ -198,9 +199,9 @@ fn l3_graph_toggle() {
 
 #[test]
 fn l3_small_terminal_no_panic() {
-    let app = App::new(".");
+    let mut app = App::new(".");
     // Very small terminal — should not panic
-    let _output = render_to_string(&app, 20, 5);
+    let _output = render_to_string(&mut app, 20, 5);
 }
 
 #[test]
@@ -235,7 +236,7 @@ fn l3_all_session_states_render() {
         app.add_session(test_session(&format!("s{i}"), &format!("w{i}"), state));
         app.focus_tab(TabId::Worker(0));
         // Should not panic for any state
-        let _output = render_to_string(&app, 120, 40);
+        let _output = render_to_string(&mut app, 120, 40);
     }
 }
 
@@ -302,7 +303,7 @@ fn sample_diff() -> ParsedDiff {
 fn l3_review_view_renders() {
     let mut app = App::new(".");
     app.review = Some(ReviewState::new("s1".to_string(), sample_diff()));
-    let output = render_to_string(&app, 120, 40);
+    let output = render_to_string(&mut app, 120, 40);
     assert!(output.contains("src/auth.rs"), "should show file path");
     assert!(
         output.contains("submit") || output.contains("approve"),
@@ -316,7 +317,7 @@ fn l3_review_with_comments() {
     let mut review = ReviewState::new("s1".to_string(), sample_diff());
     review.add_comment("why this change?".to_string());
     app.review = Some(review);
-    let _output = render_to_string(&app, 120, 40);
+    let _output = render_to_string(&mut app, 120, 40);
     // Should not panic
 }
 
@@ -327,6 +328,6 @@ fn l3_review_empty_diff() {
         "s1".to_string(),
         ParsedDiff { files: vec![] },
     ));
-    let _output = render_to_string(&app, 120, 40);
+    let _output = render_to_string(&mut app, 120, 40);
     // Should not panic
 }
