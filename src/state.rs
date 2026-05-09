@@ -83,6 +83,10 @@ pub enum StateCommand {
         session_id: String,
         claude_session_id: String,
     },
+    SetSummary {
+        session_id: String,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +118,7 @@ pub enum StateChange {
     UserQuestionPending { session_id: String, question_id: String, question: String, context: Option<String> },
     QuestionResolved { session_id: String, question_id: String, answered_by: AnsweredBy },
     HookReceived { session_id: String, event: HookEvent },
+    SummaryUpdated { session_id: String, summary: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +304,9 @@ pub struct StateManager {
     /// question_id → session_id (for resolving by id)
     question_to_session: HashMap<String, String>,
     pending_escalations: Vec<PendingEscalation>,
+    /// Agent → one-line summary set via the `current_summary` MCP tool.
+    /// Key is "orc" for the orchestrator; otherwise session_id.
+    summaries: HashMap<String, String>,
     cmd_rx: mpsc::Receiver<StateCommand>,
     change_tx: broadcast::Sender<StateChange>,
 }
@@ -331,6 +339,7 @@ impl StateManager {
             outstanding_by_session: HashMap::new(),
             question_to_session: HashMap::new(),
             pending_escalations: Vec::new(),
+            summaries: HashMap::new(),
             cmd_rx,
             change_tx,
         };
@@ -484,6 +493,16 @@ impl StateManager {
                             .db
                             .update_claude_session_id(&session_id, &claude_session_id);
                     }
+                }
+                StateCommand::SetSummary {
+                    session_id,
+                    summary,
+                } => {
+                    self.summaries
+                        .insert(session_id.clone(), summary.clone());
+                    let _ = self
+                        .change_tx
+                        .send(StateChange::SummaryUpdated { session_id, summary });
                 }
             }
         }

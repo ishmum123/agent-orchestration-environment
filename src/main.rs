@@ -813,6 +813,12 @@ fn handle_state_change(app: &mut App, change: StateChange) {
         }
         StateChange::TaskGraphUpdated { .. } => {}
         StateChange::HookReceived { .. } => {}
+        StateChange::SummaryUpdated {
+            session_id,
+            summary,
+        } => {
+            app.set_session_summary(session_id, summary);
+        }
     }
 }
 

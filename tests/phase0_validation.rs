@@ -102,7 +102,7 @@ async fn mcp_tools_list_returns_all_seven_tools() {
     };
     let result = call_ok(&server, &req).await;
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 9, "expected 9 tools, got {}", tools.len());
+    assert_eq!(tools.len(), 10, "expected 10 tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let expected = [
@@ -113,6 +113,8 @@ async fn mcp_tools_list_returns_all_seven_tools() {
         "list_sessions",
         "mark_done",
         "submit_for_review",
+        "answer_worker",
+        "current_summary",
         "update_task_graph",
     ];
     for name in &expected {

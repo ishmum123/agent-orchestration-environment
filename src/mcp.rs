@@ -183,6 +183,18 @@ impl McpServer {
                 }),
             },
             ToolDef {
+                name: "current_summary".into(),
+                description: "Record a one-sentence summary of what you are currently working on. Pass session_id (omit if you ARE orc) and a short summary string. Call this periodically after meaningful progress, not after every line.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string", "description": "One-sentence summary of current work" },
+                        "session_id": { "type": "string", "description": "Worker session_id; omit if you ARE orc" }
+                    },
+                    "required": ["summary"]
+                }),
+            },
+            ToolDef {
                 name: "update_task_graph".into(),
                 description: "Update the task plan/graph".into(),
                 input_schema: serde_json::json!({
@@ -261,6 +273,7 @@ impl McpServer {
             "mark_done" => self.tool_mark_done(&args).await,
             "submit_for_review" => self.tool_submit_for_review(&args).await,
             "answer_worker" => self.tool_answer_worker(&args).await,
+            "current_summary" => self.tool_current_summary(&args).await,
             "update_task_graph" => self.tool_update_task_graph(&args).await,
             _ => Err(anyhow::anyhow!("unknown tool: {}", tool_name)),
         };
@@ -607,6 +620,30 @@ impl McpServer {
         }))?)
     }
 
+    async fn tool_current_summary(&self, args: &Value) -> Result<String> {
+        let summary = args
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'summary'"))?;
+        let key = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("orc")
+            .to_string();
+
+        self.state
+            .send(StateCommand::SetSummary {
+                session_id: key.clone(),
+                summary: summary.to_string(),
+            })
+            .await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "ok": true,
+            "session_id": key
+        }))?)
+    }
+
     async fn tool_update_task_graph(&self, args: &Value) -> Result<String> {
         let graph = args
             .get("graph")
@@ -744,11 +781,13 @@ You have access to these MCP tools (server: orc):
 - submit_for_review(session_id, summary): Call when your work is ready for human review. Pass your session_id ({session_id}). The user will inspect the diff and approve or reject.
 - mark_done(session_id, summary): Call only if no review is needed (rare).
 - ask_user(question, context?, session_id?): Ask the human a question. BLOCKS until they respond. Pass your session_id ({session_id}) so orc can race to answer first if it has context.
+- current_summary(summary, session_id?): Record a one-sentence summary of what you are currently working on. Pass your session_id ({session_id}). Call this periodically after meaningful progress, not after every line — the user reads this in the agents panel.
 
 ## Rules
 - Do the task in your current worktree. All your file edits live on a dedicated branch.
 - When done, ALWAYS call submit_for_review first. Don't ask the user to confirm; let them review the diff.
 - Keep your responses concise.
+- Periodically call `current_summary` to keep the user oriented. After meaningful progress, not after every line.
 "#,
         session_id = session_id,
         name = name,
@@ -859,7 +898,7 @@ mod tests {
         let resp = server.handle_request(&req).await.unwrap();
         assert!(resp.error.is_none());
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 9);
+        assert_eq!(tools, 10);
     }
 
     #[tokio::test]
