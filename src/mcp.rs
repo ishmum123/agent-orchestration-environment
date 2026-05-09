@@ -39,6 +39,44 @@ pub fn is_orc_mcp_tool(name: &str) -> bool {
     ORC_MCP_TOOL_NAMES.iter().any(|n| *n == bare)
 }
 
+/// Names of harness-level meta tools the user shouldn't see in agent logs.
+/// These come from the Claude harness itself, not orc's MCP server, so we
+/// filter by name rather than via `is_orc_mcp_tool`.
+pub const HARNESS_META_TOOLS: &[&str] = &[
+    "ToolSearch",
+    "ScheduleWakeup",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+    "TaskGet",
+    "TaskOutput",
+    "TaskStop",
+    "TodoWrite",
+    "ExitPlanMode",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Skill",
+    "SendMessage",
+    "AskUserQuestion",
+    "PushNotification",
+    "Monitor",
+    "RemoteTrigger",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+];
+
+/// Returns true if `name` is a harness meta tool. Matches the bare name.
+pub fn is_harness_meta_tool(name: &str) -> bool {
+    HARNESS_META_TOOLS.iter().any(|n| *n == name)
+}
+
+/// Returns true if a tool call should be hidden from the user-facing log:
+/// either an orc MCP call or a harness meta tool.
+pub fn should_hide_tool(name: &str) -> bool {
+    is_orc_mcp_tool(name) || is_harness_meta_tool(name)
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
@@ -426,6 +464,13 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
 
         self.workers.send(session_id, message).await?;
+
+        // Surface the instruction in the worker's UI log so the user can
+        // see what orc just told this worker.
+        let _ = self.worker_tx.send(WorkerEvent::OrcInstruction {
+            session_id: session_id.to_string(),
+            text: message.to_string(),
+        });
 
         Ok(serde_json::to_string(&serde_json::json!({
             "delivered": true,
