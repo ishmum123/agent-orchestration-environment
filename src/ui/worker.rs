@@ -321,6 +321,7 @@ mod tests {
             permissions,
             tab_index: 0,
             claude_session_id: None,
+            skip_next_tool_result: false,
         }
     }
 

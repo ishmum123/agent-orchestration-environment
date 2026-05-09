@@ -13,6 +13,33 @@ use crate::worker_registry::WorkerRegistry;
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
+// Self-MCP tool name filter
+// ---------------------------------------------------------------------------
+
+/// Names of MCP tools served by orc itself. Used to filter agent → orc
+/// tool calls out of the user-facing event log (the user already sees
+/// the effect of these tools elsewhere — modals, panel, state badges).
+pub const ORC_MCP_TOOL_NAMES: &[&str] = &[
+    "spawn_session",
+    "instruct_session",
+    "kill_session",
+    "ask_user",
+    "list_sessions",
+    "mark_done",
+    "submit_for_review",
+    "answer_worker",
+    "current_summary",
+    "update_task_graph",
+];
+
+/// Returns true if `name` is an orc-served MCP tool. Matches both the
+/// bare name and the `mcp__orc__<name>` form Claude reports.
+pub fn is_orc_mcp_tool(name: &str) -> bool {
+    let bare = name.strip_prefix("mcp__orc__").unwrap_or(name);
+    ORC_MCP_TOOL_NAMES.iter().any(|n| *n == bare)
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
 
@@ -1160,6 +1187,16 @@ mod tests {
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(body["result"]["serverInfo"]["name"], "orc");
+    }
+
+    #[test]
+    fn is_orc_mcp_tool_recognizes_names() {
+        assert!(is_orc_mcp_tool("spawn_session"));
+        assert!(is_orc_mcp_tool("current_summary"));
+        assert!(is_orc_mcp_tool("mcp__orc__ask_user"));
+        assert!(!is_orc_mcp_tool("Bash"));
+        assert!(!is_orc_mcp_tool("Read"));
+        assert!(!is_orc_mcp_tool("mcp__other__foo"));
     }
 
     #[test]

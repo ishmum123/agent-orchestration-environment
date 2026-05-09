@@ -77,6 +77,10 @@ pub struct SessionView {
     pub permissions: Vec<PermissionEntry>,
     pub tab_index: usize,
     pub claude_session_id: Option<String>,
+    /// True if the most recent ToolUse for this agent was an orc-served
+    /// MCP call we hid from the log. Used to suppress the matching
+    /// ToolResult that follows.
+    pub skip_next_tool_result: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +91,8 @@ pub struct SessionView {
 pub struct OrcView {
     pub event_log: Vec<LogEntry>,
     pub alive: bool,
+    /// See `SessionView::skip_next_tool_result`.
+    pub skip_next_tool_result: bool,
 }
 
 impl OrcView {
@@ -94,6 +100,7 @@ impl OrcView {
         Self {
             event_log: Vec::new(),
             alive: true,
+            skip_next_tool_result: false,
         }
     }
 
@@ -207,6 +214,7 @@ impl App {
             permissions: Vec::new(),
             tab_index: idx,
             claude_session_id: None,
+            skip_next_tool_result: false,
         });
     }
 

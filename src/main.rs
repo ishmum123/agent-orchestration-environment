@@ -295,20 +295,35 @@ async fn handle_worker_event(
             name,
             input,
         } => {
-            app.push_log(
-                &session_id,
-                LogEntry::ToolUse {
-                    name,
-                    input_summary: truncate_json(&input),
-                },
-            );
+            if mcp::is_orc_mcp_tool(&name) {
+                if let Some(&idx) = app.session_index.get(&session_id) {
+                    app.sessions[idx].skip_next_tool_result = true;
+                }
+            } else {
+                app.push_log(
+                    &session_id,
+                    LogEntry::ToolUse {
+                        name,
+                        input_summary: truncate_json(&input),
+                    },
+                );
+            }
         }
         WorkerEvent::ToolResult {
             session_id,
             text,
             is_error,
         } => {
-            app.push_log(&session_id, LogEntry::ToolResult { text, is_error });
+            let skip = if let Some(&idx) = app.session_index.get(&session_id) {
+                let s = app.sessions[idx].skip_next_tool_result;
+                app.sessions[idx].skip_next_tool_result = false;
+                s
+            } else {
+                false
+            };
+            if !skip {
+                app.push_log(&session_id, LogEntry::ToolResult { text, is_error });
+            }
         }
         WorkerEvent::Result {
             session_id,
@@ -828,10 +843,14 @@ fn handle_orc_event(app: &mut App, event: OrcEvent) {
             app.orc_view.push(LogEntry::AssistantText(text));
         }
         OrcEvent::ToolUse { name, input, .. } => {
-            app.orc_view.push(LogEntry::ToolUse {
-                name,
-                input_summary: truncate_json(&input),
-            });
+            if mcp::is_orc_mcp_tool(&name) {
+                app.orc_view.skip_next_tool_result = true;
+            } else {
+                app.orc_view.push(LogEntry::ToolUse {
+                    name,
+                    input_summary: truncate_json(&input),
+                });
+            }
         }
         OrcEvent::Result {
             is_error,
