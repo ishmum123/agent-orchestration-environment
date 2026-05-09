@@ -16,6 +16,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
