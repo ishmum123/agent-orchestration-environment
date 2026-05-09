@@ -6,7 +6,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, TabId};
@@ -74,7 +74,9 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
         );
     }
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // No wrap: each card line is pre-truncated to fit. Letting Paragraph
+    // wrap would re-flow long names/summaries and misalign cards.
+    let para = Paragraph::new(lines);
     frame.render_widget(para, inner);
 }
 
@@ -102,7 +104,9 @@ fn push_card(
         Style::default()
     };
 
-    // Line 1: bar + badge + name
+    // Line 1: bar + space + badge + space + name. bar(1)+space(1)+badge(1)+space(1) = 4 cols.
+    let name_avail = width.saturating_sub(4);
+    let name_trunc = truncate(name, name_avail);
     lines.push(Line::from(vec![
         Span::styled(bar.to_string(), bar_style),
         Span::raw(" "),
@@ -113,7 +117,7 @@ fn push_card(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(name.to_string(), name_style),
+        Span::styled(name_trunc, name_style),
     ]));
 
     // Lines 2-3: summary truncated to two lines.
@@ -137,23 +141,37 @@ fn push_card(
         ]));
     }
 
-    // Line 4: state · elapsed
+    // Line 4: state · elapsed (state colored by badge; · and elapsed dim).
+    // Truncate state_label first if it would overflow on its own; assume
+    // typical state labels are short enough.
+    let state_truncated = truncate(state_label, avail.saturating_sub(2));
+    let elapsed_room = avail.saturating_sub(state_truncated.chars().count() + 3);
+    let elapsed_truncated = truncate(elapsed, elapsed_room);
     lines.push(Line::from(vec![
         Span::styled(bar.to_string(), bar_style),
         Span::raw("   "),
-        Span::styled(
-            state_label.to_string(),
-            Style::default().fg(badge_color),
-        ),
+        Span::styled(state_truncated, Style::default().fg(badge_color)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            elapsed.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(elapsed_truncated, Style::default().fg(Color::DarkGray)),
     ]));
 
     // Blank separator
     lines.push(Line::from(""));
+}
+
+/// Truncate a string to at most `width` *characters*, appending `…` if cut.
+fn truncate(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    let take = width.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
 }
 
 fn wrap_two(s: &str, width: usize) -> (String, String) {
@@ -164,14 +182,19 @@ fn wrap_two(s: &str, width: usize) -> (String, String) {
     if collapsed.chars().count() <= width {
         return (collapsed, String::new());
     }
-    // Take first `width` chars for line 1.
-    let mut iter = collapsed.chars();
-    let line1: String = iter.by_ref().take(width).collect();
-    let rest: String = iter.collect();
+    // Word-aware split: break line 1 at the last whitespace ≤ width.
+    let line1 = take_first_line(&collapsed, width);
+    let consumed = line1.chars().count();
+    // Skip the breaking space if there was one.
+    let rest_start = if collapsed.chars().nth(consumed) == Some(' ') {
+        consumed + 1
+    } else {
+        consumed
+    };
+    let rest: String = collapsed.chars().skip(rest_start).collect();
     if rest.chars().count() <= width {
         (line1, rest)
     } else {
-        // Truncate line2 with ellipsis.
         let line2: String = rest
             .chars()
             .take(width.saturating_sub(1))
@@ -179,6 +202,27 @@ fn wrap_two(s: &str, width: usize) -> (String, String) {
             + "…";
         (line1, line2)
     }
+}
+
+/// Take the longest prefix of `s` that fits in `width` chars, breaking at
+/// whitespace if possible. If no whitespace before `width` (i.e. the first
+/// word is itself longer than width), hard-cut at the width boundary.
+fn take_first_line(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    // Find last space strictly before width (so we don't include the space
+    // itself in the line). Skip leading spaces — if the first non-space
+    // word is longer than width, fall through to hard-cut.
+    let mut break_at: Option<usize> = None;
+    for (i, c) in chars.iter().enumerate().take(width) {
+        if *c == ' ' && i > 0 {
+            break_at = Some(i);
+        }
+    }
+    let cut = break_at.unwrap_or(width);
+    chars[..cut].iter().collect()
 }
 
 fn elapsed_str_secs(secs: u64) -> String {
