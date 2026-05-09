@@ -3,6 +3,9 @@ name = "orc"
 version = "0.2.0"
 edition = "2021"
 description = "Parallel Claude Code agents with an intelligent orchestrator"
+license = "MIT"
+repository = "https://github.com/ishmum123/agent-orchestration-environment"
+authors = ["Ishmum Jawad Khan <ishmumkhan@yahoo.co.in>"]
 
 [dependencies]
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
