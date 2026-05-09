@@ -47,6 +47,9 @@ pub enum WorkerEvent {
         session_id: String,
         code: Option<i32>,
     },
+    /// Synthetic event: orc sent the worker an instruction (initial task or
+    /// follow-up). Surfaced in the worker tab as an "orc → ..." line.
+    OrcInstruction { session_id: String, text: String },
 }
 
 pub struct WorkerHandle {
