@@ -1,87 +1,91 @@
 # orc
 
-Run a team of Claude Code agents from a single terminal. One orchestrator, many workers, all on screen at once.
+Agent Orchestration Environment (AOE). A TUI that runs multiple Claude Code sessions as agents, with one orchestrator coordinating them.
 
-You type to **orc**. Orc plans, spawns **workers**, delegates subtasks, watches what they do, answers their questions when it can, and bothers you when it can't. Each worker runs in its own git worktree on its own branch, so nothing collides. Every conversation — orc and every worker — is a tab in one TUI. You never see a raw Claude session.
-
-```
-┌─ 1 orc ◐ ─┬─ 2 auth-refactor ◑ ─┬─ 3 add-tests ◐ ─┬─ 4 docs ✓ ─┐
-│                                                                │
-│  orc → spawned worker "auth-refactor" on branch orc/auth       │
-│  orc → spawned worker "add-tests" on branch orc/tests          │
-│  → answer_worker_question({ id: 17, answer: "use jwt" })       │
-│  ← ok                                                          │
-│  worker docs finished — review pending                         │
-│                                                                │
-└─ [t] talk  [Tab] next  [r] review  [k] kill  [q] quit ─────────┘
-```
+     ◐ w1·refactor-api
+    ┌─────────────────────────────────────────────────────────┐┌──────────────┐
+    │assistant: I'll start by mapping the handlers under …    ││ ◐ orc        │
+    │→ Read({ "path": "src/api/mod.rs" })                     ││   orchestr.  │
+    │← ok                                                     ││              │
+    │→ Grep({ "pattern": "fn handle_" })                      ││ ◐ w1·refac…  │
+    │← ok                                                     ││   worker     │
+    │assistant: Three handlers share the auth preamble …      ││  running·2m  │
+    │[answered by orc: yes, factor it out]                    ││              │
+    │→ Edit({ "path": "src/api/mod.rs", … })                  ││ ! w2·flaky…  │
+    │← ok                                                     ││   blocked    │
+    └─────────────────────────────────────────────────────────┘└──────────────┘
+     t talk   r review   x kill   R restart   ^C interrupt   1-9 tab   q quit
 
 ## Why
 
-Running parallel Claude agents in separate terminals doesn't scale past two. You lose track of who asked what, you context-switch between panes to read logs, and there's nothing supervising the agents — every question hits *you*.
+My workflow has shifted to running Claude Code in the terminal and using the IDE as a diff viewer. Running two or three Claude sessions in parallel for multi-tasking made one thing obvious: the bottleneck moves from writing code to jumping between tabs answering trivial questions — which library, which file, which name.
 
-Orc is the supervisor layer. It reads the workers' streams in real time, answers routine questions on your behalf, and only escalates the ones that actually need a human. You're the fallback, not the default.
+Claude Squad solves seeing all sessions at once. Anthropic's Agent Teams automates more of the orchestration. Neither lets me both hand off the routine work *and* drop into a session directly when I want to.
+
+orc is my attempt at that. A central orchestrator I talk to, which spawns workers, handles the small stuff itself, and only pulls me in when something needs a human. I can also jump into any worker's tab and talk to it directly.
+
+Proof of concept more than a product. MIT licensed.
 
 ## Install
 
-```bash
-git clone https://github.com/ishmum123/agent-orchestration-environment orc
-cd orc
-cargo install --path . --force
-```
+    git clone https://github.com/ishmum123/agent-orchestration-environment orc
+    cd orc
+    cargo install --path . --force
 
 Requires:
 
 - Rust (stable)
-- `claude` CLI on `$PATH` ([Claude Code](https://claude.com/claude-code))
+- `claude` CLI on `$PATH` ([Claude Code](https://claude.com/claude-code)), authenticated
 - `git`
 - `tmux` (only used by the test harness, not by orc itself)
 
 Sanity check:
 
-```bash
-orc doctor
-```
+    orc doctor
 
 ## Run
 
-```bash
-orc                       # current directory
-orc -p /path/to/project   # specific project
-```
+    orc                       # current directory
+    orc -p /path/to/project   # specific project
 
-First time, orc opens a "what do you want to build?" modal. Type a goal. Orc plans, spawns workers, and you watch.
+First time, orc opens a talk modal: "describe the task for orc to plan." Type a goal. orc plans, spawns workers, and you watch.
 
 ## Keys
 
 | Key | Does |
-|---|---|
+| --- | --- |
 | `t` | Talk to the focused tab (orc or a worker) |
-| `Tab` / `Shift-Tab` | Next / previous tab |
+| `Tab` / `Shift-Tab` | Cycle tabs |
 | `1`–`9` | Jump to tab N (orc is always 1) |
-| `j` / `k` | Scroll log down / up |
-| `r` | Review worker's diff |
-| `o` | Whole-file view (from review) |
-| `e` | Hand the terminal to `$EDITOR` |
-| `Ctrl-C` | Interrupt the current session (conversation survives) |
+| `j` / `↓` | Scroll log down |
+| `k` / `↑` | Scroll log up |
+| `g` / `G` | Top / bottom of log |
+| `r` | Review focused worker's diff |
+| `x` | Kill focused worker (drops tab and worktree) |
 | `R` | Restart a wedged worker (resumes its session) |
-| `k` | Kill a worker (drops the worktree) |
+| `Ctrl-C` | Interrupt the current session (conversation survives) |
+| `?` | Toggle help overlay |
+| `Esc` | Close modal / dismiss |
 | `q` | Quit |
+
+In review (`r`): `c` comment · `a` approve · `j`/`k` navigate · `o` whole-file · `e` open in `$EDITOR` · `s` submit · `q` cancel.
+
+Tab strip badges: `◐` running · `!` blocked on question · `?` blocked on permission · `◑` awaiting review · `✓` done · `✗` failed.
 
 ## How it works
 
 - **Workers are stream-json `claude` children of orc.** No tmux, no PTY scraping. Their output is parsed into a structured event log per tab.
 - **State lives in SQLite** at `~/.config/orc/state.db`. Sessions, transitions, reviews — all there. Survives restarts.
 - **Each worker gets `git worktree add`** to a dedicated branch under `orc/<task>`. They can't step on each other or on your working tree.
-- **Orc itself is a Claude session** with a small MCP server exposing `spawn_worker`, `answer_worker_question`, `current_summary`, etc. It supervises by *using tools*, not by parsing screens.
-- **Hooks + a policy engine** gate dangerous actions. Hard-deny rules (rm -rf /, modifying secrets) are not overridable; soft rules are configurable.
+- **orc itself is a Claude session** with a small MCP server exposing `spawn_worker`, `answer_worker_question`, `current_summary`, etc. It supervises by *using tools*, not by parsing screens.
+- **Hooks + a policy engine** gate dangerous actions. Hard-deny rules (`rm -rf /`, modifying secrets) are not overridable; soft rules are configurable.
 
-The full architecture spec is in [SPEC.md](./SPEC.md).
+Full architecture spec in [SPEC.md](SPEC.md).
 
 ## Status
 
-Pre-1.0. The architecture is in place, the happy path works, the rough edges are in [docs/superpowers/plans/](./docs/superpowers/plans/). Issues and PRs welcome.
+Pre-1.0. Architecture is in place, happy path works, rough edges tracked in [docs/superpowers/plans/](docs/superpowers/plans). Issues and PRs welcome.
 
 ## License
 
-[MIT](./LICENSE).
+[MIT](LICENSE).
