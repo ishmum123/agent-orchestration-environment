@@ -398,16 +398,24 @@ impl ReviewState {
         let max = self.file_line_count(self.cursor.file_idx);
         if max > 0 && self.cursor.line_idx < max - 1 {
             self.cursor.line_idx += 1;
+        } else if self.cursor.file_idx + 1 < self.diff.files.len() {
+            self.cursor.file_idx += 1;
+            self.cursor.line_idx = 0;
         }
     }
 
     pub fn move_line_up(&mut self) {
         if self.cursor.line_idx > 0 {
             self.cursor.line_idx -= 1;
+        } else if self.cursor.file_idx > 0 {
+            self.cursor.file_idx -= 1;
+            let prev_max = self.file_line_count(self.cursor.file_idx);
+            self.cursor.line_idx = prev_max.saturating_sub(1);
         }
     }
 
-    /// Jump to the start of the next hunk in the current file.
+    /// Jump to the start of the next hunk; at the last hunk, jump to the
+    /// first hunk of the next file.
     pub fn move_hunk_down(&mut self) {
         if let Some(file) = self.diff.files.get(self.cursor.file_idx) {
             let mut offset = 0;
@@ -420,10 +428,29 @@ impl ReviewState {
                 offset = next;
             }
         }
+        if self.cursor.file_idx + 1 < self.diff.files.len() {
+            self.cursor.file_idx += 1;
+            self.cursor.line_idx = 0;
+        }
     }
 
-    /// Jump to the start of the previous hunk in the current file.
+    /// Jump to the start of the previous hunk; from the start of the first
+    /// hunk, jump to the last hunk of the previous file.
     pub fn move_hunk_up(&mut self) {
+        if self.cursor.line_idx == 0 {
+            if self.cursor.file_idx > 0 {
+                self.cursor.file_idx -= 1;
+                let prev = &self.diff.files[self.cursor.file_idx];
+                let mut last_start = 0;
+                let mut offset = 0;
+                for hunk in &prev.hunks {
+                    last_start = offset;
+                    offset += hunk.lines.len();
+                }
+                self.cursor.line_idx = last_start;
+            }
+            return;
+        }
         if let Some(file) = self.diff.files.get(self.cursor.file_idx) {
             let mut offsets: Vec<usize> = Vec::new();
             let mut offset = 0;
@@ -800,13 +827,66 @@ Binary files /dev/null and b/image.png differ
     }
 
     #[test]
-    fn move_line_down_clamps_at_end() {
+    fn move_line_down_clamps_at_end_of_last_file() {
         let mut rs = sample_review();
-        let max = rs.file_line_count(0);
+        let last = rs.diff.files.len() - 1;
+        rs.cursor.file_idx = last;
+        let max = rs.file_line_count(last);
         for _ in 0..max + 5 {
             rs.move_line_down();
         }
+        assert_eq!(rs.cursor.file_idx, last);
         assert_eq!(rs.cursor.line_idx, max - 1);
+    }
+
+    #[test]
+    fn move_line_down_advances_to_next_file_at_end() {
+        let mut rs = sample_review();
+        let max = rs.file_line_count(0);
+        rs.cursor.line_idx = max - 1;
+        rs.move_line_down();
+        assert_eq!(rs.cursor.file_idx, 1);
+        assert_eq!(rs.cursor.line_idx, 0);
+    }
+
+    #[test]
+    fn move_line_up_at_zero_jumps_to_prev_file_end() {
+        let mut rs = sample_review();
+        rs.cursor.file_idx = 1;
+        rs.cursor.line_idx = 0;
+        rs.move_line_up();
+        assert_eq!(rs.cursor.file_idx, 0);
+        assert_eq!(rs.cursor.line_idx, rs.file_line_count(0) - 1);
+    }
+
+    #[test]
+    fn move_hunk_down_advances_to_next_file_from_last_hunk() {
+        let mut rs = sample_review();
+        // Place cursor in the last hunk of file 0.
+        let file0 = &rs.diff.files[0];
+        let last_hunk_start: usize = file0.hunks[..file0.hunks.len() - 1]
+            .iter()
+            .map(|h| h.lines.len())
+            .sum();
+        rs.cursor.line_idx = last_hunk_start;
+        rs.move_hunk_down();
+        assert_eq!(rs.cursor.file_idx, 1);
+        assert_eq!(rs.cursor.line_idx, 0);
+    }
+
+    #[test]
+    fn move_hunk_up_from_file_start_goes_to_prev_file_last_hunk() {
+        let mut rs = sample_review();
+        rs.cursor.file_idx = 1;
+        rs.cursor.line_idx = 0;
+        rs.move_hunk_up();
+        assert_eq!(rs.cursor.file_idx, 0);
+        let file0 = &rs.diff.files[0];
+        let expected_last_start: usize = file0.hunks[..file0.hunks.len() - 1]
+            .iter()
+            .map(|h| h.lines.len())
+            .sum();
+        assert_eq!(rs.cursor.line_idx, expected_last_start);
     }
 
     #[test]

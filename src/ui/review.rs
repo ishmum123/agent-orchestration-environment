@@ -6,7 +6,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::review::*;
@@ -238,6 +238,11 @@ fn render_whole_file_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         0
     };
 
+    // Force-clear inner cells first — Paragraph with Wrap+scroll can leave
+    // stray cells from prior frames (matches the workaround in
+    // worker::render_event_log).
+    frame.render_widget(Clear, inner);
+
     let paragraph = Paragraph::new(lines)
         .scroll((scroll_offset as u16, 0))
         .wrap(Wrap { trim: false });
@@ -395,6 +400,9 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         0
     };
 
+    // Force-clear inner cells first — see render_whole_file_view comment.
+    frame.render_widget(Clear, inner);
+
     let paragraph = Paragraph::new(lines)
         .scroll((scroll_offset as u16, 0))
         .wrap(Wrap { trim: false });
@@ -449,6 +457,10 @@ fn render_review_action_bar(frame: &mut Frame, area: Rect) {
         Span::styled("/", Style::default().fg(Color::DarkGray)),
         Span::styled("K", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled(" hunk  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("]", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(" file  ", Style::default().fg(Color::DarkGray)),
         Span::styled("c", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled(" comment  ", Style::default().fg(Color::DarkGray)),
         Span::styled("a", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),

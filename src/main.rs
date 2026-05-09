@@ -546,7 +546,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
                 }
             }
         }
-        KeyCode::Char('k') => {
+        KeyCode::Char('x') => {
             if let TabId::Worker(idx) = app.focused_tab {
                 if let Some(sv) = app.sessions.get(idx) {
                     app.modal = Some(Modal::ConfirmKill {
@@ -555,8 +555,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
                     });
                 }
             }
-            // Note: `k` no longer scrolls (collides with kill on worker tabs);
-            // use Up/PageUp/gg for scrolling.
         }
         KeyCode::Char('R') => {
             if let TabId::Worker(idx) = app.focused_tab {
@@ -596,7 +594,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
             // Don't change stick here. Autoscroll re-engages stick if the
             // user's downward scroll reaches the bottom.
         }
-        KeyCode::Up | KeyCode::PageUp => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp => {
             let amount = if matches!(key.code, KeyCode::PageUp) { 10 } else { 1 };
             app.scroll_up(app.focused_tab, amount);
             app.set_stick(app.focused_tab, false);
@@ -705,7 +703,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.scroll_down(app.focused_tab, 1);
                     }
-                    KeyCode::Up => {
+                    KeyCode::Up | KeyCode::Char('k') => {
                         app.scroll_up(app.focused_tab, 1);
                         app.set_stick(app.focused_tab, false);
                     }
@@ -853,6 +851,8 @@ async fn handle_review_key(
         KeyCode::Char('k') | KeyCode::Up => review.move_line_up(),
         KeyCode::Char('J') => review.move_hunk_down(),
         KeyCode::Char('K') => review.move_hunk_up(),
+        KeyCode::Char(']') => review.move_file_down(),
+        KeyCode::Char('[') => review.move_file_up(),
 
         KeyCode::Char('a') => {
             review.toggle_hunk_approval();
