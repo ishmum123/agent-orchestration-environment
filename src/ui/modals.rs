@@ -21,9 +21,15 @@ pub fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             session_id,
             question_id: _,
             question,
-            context,
+            context: _,
             buffer,
-        } => render_ask_user(frame, area, session_id, question, context.as_deref(), buffer),
+            hidden,
+        } => {
+            if *hidden {
+                return;
+            }
+            render_ask_user(frame, area, session_id, question, None, buffer);
+        }
         Modal::Comment { file, line, buffer, .. } => {
             render_comment(frame, area, file, *line, buffer)
         }
@@ -333,13 +339,17 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let bindings: &[(&str, &str)] = &[
         ("tab / shift+tab", "cycle tabs"),
         ("1-9", "jump to tab"),
-        ("n", "new task"),
+        ("t", "talk (new task / message)"),
+        ("c", "control mode toggle (worker)"),
         ("k", "kill focused worker"),
+        ("R", "restart failed worker"),
+        ("r", "open review (awaiting review)"),
         ("q", "quit"),
         ("?", "toggle help"),
         ("j / ↓", "scroll down"),
-        ("k / ↑", "scroll up"),
-        ("g / G", "top / bottom"),
+        ("↑ / pgup", "scroll up"),
+        ("gg / home", "jump to top"),
+        ("G / end", "jump to bottom (auto-follow)"),
         ("enter", "send chat input"),
         ("esc", "close modal / deselect"),
     ];
@@ -449,6 +459,7 @@ mod tests {
             question: "install xero-node-sdk?".into(),
             context: Some("npm audit shows no vulns".into()),
             buffer: String::new(),
+            hidden: false,
         };
         let output = render_to_string(&modal);
         assert!(output.contains("orc needs your input"));
@@ -465,6 +476,7 @@ mod tests {
             question: "proceed?".into(),
             context: None,
             buffer: "yes".into(),
+            hidden: false,
         };
         let output = render_to_string(&modal);
         assert!(output.contains("proceed?"));

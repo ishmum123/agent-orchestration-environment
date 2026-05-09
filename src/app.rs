@@ -31,6 +31,10 @@ pub enum LogEntry {
     UserText(String),
     AssistantText(String),
     Thinking(String),
+    /// A directive sent into a worker by orc (initial task, or follow-up
+    /// `instruct_session`). Visually distinct from a UserText so the user
+    /// can tell who said what.
+    OrcInstruction(String),
     ToolUse {
         name: String,
         input_summary: String,
@@ -43,6 +47,14 @@ pub enum LogEntry {
     System(String),
     TurnEnd {
         cost_usd: Option<f64>,
+    },
+    /// Post-turn rollup of consecutive exploratory tool calls (Read, Grep,
+    /// LS, Glob). Inserted by `collapse_last_turn` when a turn ends.
+    Exploration {
+        reads: u32,
+        greps: u32,
+        lists: u32,
+        globs: u32,
     },
 }
 
@@ -81,6 +93,13 @@ pub struct SessionView {
     /// MCP call we hid from the log. Used to suppress the matching
     /// ToolResult that follows.
     pub skip_next_tool_result: bool,
+    /// Auto-follow tail. New entries scroll the view to the bottom while
+    /// true. Manual scroll-up sets this false; `G` re-enables.
+    pub stick_to_bottom: bool,
+    /// True while the agent is in a thinking phase. Drives the spinner
+    /// shown at the tail of the events log. Cleared by the next text /
+    /// tool / turn-end event.
+    pub is_thinking: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +112,13 @@ pub struct OrcView {
     pub alive: bool,
     /// See `SessionView::skip_next_tool_result`.
     pub skip_next_tool_result: bool,
+    /// Whether the `[orc model: …]` line has been pushed once already.
+    /// Subsequent System events with a model field are ignored.
+    pub model_announced: bool,
+    /// Auto-follow tail (see `SessionView::stick_to_bottom`).
+    pub stick_to_bottom: bool,
+    /// See `SessionView::is_thinking`.
+    pub is_thinking: bool,
 }
 
 impl OrcView {
@@ -101,6 +127,9 @@ impl OrcView {
             event_log: Vec::new(),
             alive: true,
             skip_next_tool_result: false,
+            model_announced: false,
+            stick_to_bottom: true,
+            is_thinking: false,
         }
     }
 
@@ -135,6 +164,9 @@ pub enum Modal {
         question: String,
         context: Option<String>,
         buffer: String,
+        /// When true, modal is hidden so the user can scroll the chat
+        /// behind it. `Tab` toggles. State (buffer, question) is preserved.
+        hidden: bool,
     },
     Comment {
         session_id: String,
@@ -176,6 +208,9 @@ pub struct App {
 
     pub should_quit: bool,
     pub tick: u64,
+    /// First half of a `gg` chord (vim-style jump-to-top). Set by `g`,
+    /// consumed by next key. Cleared on any other key.
+    pub pending_g: bool,
 }
 
 impl App {
@@ -195,7 +230,118 @@ impl App {
             started_at: Instant::now(),
             should_quit: false,
             tick: 0,
+            pending_g: false,
         }
+    }
+
+    /// Set tail-follow flag for the given tab.
+    pub fn set_stick(&mut self, tab: TabId, stick: bool) {
+        match tab {
+            TabId::Orc => self.orc_view.stick_to_bottom = stick,
+            TabId::Worker(idx) => {
+                if let Some(sv) = self.sessions.get_mut(idx) {
+                    sv.stick_to_bottom = stick;
+                }
+            }
+        }
+    }
+
+    /// Read tail-follow flag for the given tab.
+    pub fn stick_to_bottom(&self, tab: TabId) -> bool {
+        match tab {
+            TabId::Orc => self.orc_view.stick_to_bottom,
+            TabId::Worker(idx) => self
+                .sessions
+                .get(idx)
+                .map(|sv| sv.stick_to_bottom)
+                .unwrap_or(true),
+        }
+    }
+
+    /// Set scroll position for a tab.
+    pub fn set_scroll(&mut self, tab: TabId, pos: usize) {
+        self.scroll.insert(tab, pos);
+    }
+
+    /// Collapse the just-completed turn's Read/Grep/LS/Glob ToolUse+Result
+    /// pairs into single `Exploration` entries, preserving the order of
+    /// other entries. Call after pushing `LogEntry::TurnEnd`.
+    pub fn collapse_last_turn(&mut self, tab: TabId) {
+        let log: &mut Vec<LogEntry> = match tab {
+            TabId::Orc => &mut self.orc_view.event_log,
+            TabId::Worker(idx) => match self.sessions.get_mut(idx) {
+                Some(sv) => &mut sv.event_log,
+                None => return,
+            },
+        };
+        if log.is_empty() {
+            return;
+        }
+        let end = log.len() - 1;
+        if !matches!(log[end], LogEntry::TurnEnd { .. }) {
+            return;
+        }
+        // Find the previous TurnEnd (or use 0).
+        let mut start = 0;
+        for i in (0..end).rev() {
+            if matches!(log[i], LogEntry::TurnEnd { .. }) {
+                start = i + 1;
+                break;
+            }
+        }
+
+        let mut rebuilt: Vec<LogEntry> = Vec::with_capacity(end - start);
+        let mut acc = (0u32, 0u32, 0u32, 0u32); // reads, greps, lists, globs
+        let flush = |rebuilt: &mut Vec<LogEntry>, acc: &mut (u32, u32, u32, u32)| {
+            if acc.0 + acc.1 + acc.2 + acc.3 > 0 {
+                rebuilt.push(LogEntry::Exploration {
+                    reads: acc.0,
+                    greps: acc.1,
+                    lists: acc.2,
+                    globs: acc.3,
+                });
+                *acc = (0, 0, 0, 0);
+            }
+        };
+
+        let mut i = start;
+        while i < end {
+            // Detect (exploratory ToolUse, ToolResult) pair.
+            if i + 1 < end {
+                if let LogEntry::ToolUse { name, .. } = &log[i] {
+                    let kind = match name.as_str() {
+                        "Read" => Some(0),
+                        "Grep" => Some(1),
+                        "LS" => Some(2),
+                        "Glob" => Some(3),
+                        _ => None,
+                    };
+                    if let Some(k) = kind {
+                        if matches!(log[i + 1], LogEntry::ToolResult { .. }) {
+                            match k {
+                                0 => acc.0 += 1,
+                                1 => acc.1 += 1,
+                                2 => acc.2 += 1,
+                                _ => acc.3 += 1,
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Non-exploratory: flush accumulated rollup, then keep entry.
+            let mut local_acc = acc;
+            flush(&mut rebuilt, &mut local_acc);
+            acc = local_acc;
+            rebuilt.push(log[i].clone());
+            i += 1;
+        }
+        let mut local_acc = acc;
+        flush(&mut rebuilt, &mut local_acc);
+
+        // Splice rebuilt into log[start..end], leaving the TurnEnd in place.
+        log.splice(start..end, rebuilt);
     }
 
     pub fn with_state_handle(mut self, handle: StateHandle) -> Self {
@@ -215,6 +361,8 @@ impl App {
             tab_index: idx,
             claude_session_id: None,
             skip_next_tool_result: false,
+            stick_to_bottom: true,
+            is_thinking: false,
         });
     }
 

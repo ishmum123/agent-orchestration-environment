@@ -19,12 +19,13 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::{App, TabId};
 
-/// Render the full UI frame.
-pub fn render(frame: &mut Frame, app: &App) {
+/// Render the full UI frame. Takes `&mut App` so autoscroll can pin the
+/// scroll position to the tail when `stick_to_bottom` is set.
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     let layout = Layout::default()
@@ -48,6 +49,18 @@ pub fn render(frame: &mut Frame, app: &App) {
     let content_area = main_split[0];
     let panel_area = main_split[1];
 
+    // Autoscroll pass: if a tab is sticky-to-bottom, pin its scroll value
+    // to the end before rendering. Width used for wrap accounting matches
+    // the inner width of the events box.
+    let events_inner_w = content_area.width.saturating_sub(2);
+    let events_inner_h = content_area.height.saturating_sub(2) as usize;
+    autoscroll(app, content_area, events_inner_w, events_inner_h);
+
+    // Hard-clear the chat and panel regions before drawing — works
+    // around stale-cell bleed between tab switches with Paragraph wrap.
+    frame.render_widget(Clear, content_area);
+    frame.render_widget(Clear, panel_area);
+
     if let Some(rev) = &app.review {
         review::render_review(frame, content_area, rev);
     } else {
@@ -56,13 +69,10 @@ pub fn render(frame: &mut Frame, app: &App) {
                 render_orc_tab(frame, content_area, app);
             }
             TabId::Worker(idx) => {
+                let scroll = app.scroll_pos(TabId::Worker(idx));
+                let tick = app.tick;
                 if let Some(sv) = app.sessions.get(idx) {
-                    worker::render_worker(
-                        frame,
-                        content_area,
-                        sv,
-                        app.scroll_pos(TabId::Worker(idx)),
-                    );
+                    worker::render_worker(frame, content_area, sv, scroll, tick);
                 }
             }
         }
@@ -77,23 +87,45 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Pin scroll. If a tab is sticky-to-bottom, set scroll to the tail.
+/// If not sticky but the user has scrolled down to the bottom, re-engage
+/// stick (so subsequent new content keeps following).
+fn autoscroll(app: &mut App, _content_area: Rect, inner_w: u16, inner_h: usize) {
+    let tabs: Vec<TabId> = std::iter::once(TabId::Orc)
+        .chain((0..app.sessions.len()).map(TabId::Worker))
+        .collect();
+
+    for tab in tabs {
+        let log_ref: &[crate::app::LogEntry] = match tab {
+            TabId::Orc => &app.orc_view.event_log,
+            TabId::Worker(i) => &app.sessions[i].event_log,
+        };
+        let wrapped = worker::wrapped_line_count(log_ref, inner_w);
+        let max = wrapped.saturating_sub(inner_h);
+        let stick = app.stick_to_bottom(tab);
+        let cur = app.scroll_pos(tab);
+
+        if stick {
+            app.set_scroll(tab, max);
+        } else if cur >= max {
+            // User scrolled down to (or past) the bottom — re-engage follow.
+            app.set_stick(tab, true);
+            app.set_scroll(tab, max);
+        }
+    }
+}
+
 /// Render the orc tab as an event-log peer to worker tabs.
 fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " events ",
-        Style::default().fg(Color::DarkGray),
-    ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-    let lines = worker::log_lines(&app.orc_view.event_log);
     let scroll = app.scroll_pos(TabId::Orc);
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
-    frame.render_widget(para, inner);
+    worker::render_event_log(
+        frame,
+        area,
+        &app.orc_view.event_log,
+        scroll,
+        app.orc_view.is_thinking,
+        app.tick,
+    );
 }
 
 /// Minimal one-line header showing the focused entity.
@@ -143,29 +175,73 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Bottom action bar — context-sensitive keybinds.
 fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let hints = match (&app.focused_tab, &app.modal) {
-        (_, Some(_)) => return,
-        (TabId::Orc, None) => "n speak   1-9 tab   ^C interrupt   q quit   ? help",
-        (TabId::Worker(idx), None) => {
-            if let Some(sv) = app.sessions.get(*idx) {
+    // While ask_user modal is hidden (peeking chat), show a clear hint.
+    if let Some(crate::app::Modal::AskUser { hidden: true, .. }) = &app.modal {
+        let bar = Paragraph::new(Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                "pending question — Tab resume   j/k Up/Down scroll   G end",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(Color::Black));
+        frame.render_widget(bar, area);
+        return;
+    }
+    if app.modal.is_some() {
+        return;
+    }
+
+    use crate::session::SessionState;
+
+    let mut parts: Vec<&'static str> = Vec::new();
+    parts.push("t talk");
+    parts.push("1-9 tab");
+
+    match app.focused_tab {
+        TabId::Orc => {
+            parts.push("^C interrupt");
+            parts.push("G end");
+        }
+        TabId::Worker(idx) => {
+            if let Some(sv) = app.sessions.get(idx) {
                 match &sv.session.state {
-                    crate::session::SessionState::AwaitingReview { .. } => {
-                        "n speak   r review   c control   k kill   ^C interrupt   q quit   ? help"
+                    SessionState::AwaitingReview { .. } => {
+                        parts.push("r review");
+                        parts.push("c control");
+                        parts.push("k kill");
+                        parts.push("G end");
                     }
-                    crate::session::SessionState::Failed { .. } => {
-                        "R restart   k kill   q quit   ? help"
+                    SessionState::Failed { .. } => {
+                        parts.push("R restart");
+                        parts.push("k kill");
+                        parts.push("G end");
                     }
-                    _ => "n speak   c control   k kill   ^C interrupt   q quit   ? help",
+                    SessionState::Done { .. } => {
+                        parts.push("k kill");
+                        parts.push("G end");
+                    }
+                    SessionState::Running | SessionState::Blocked { .. } => {
+                        parts.push("c control");
+                        parts.push("k kill");
+                        parts.push("^C interrupt");
+                        parts.push("G end");
+                    }
                 }
-            } else {
-                "q quit   ? help"
             }
         }
-    };
+    }
+
+    parts.push("q quit");
+    parts.push("? help");
+
+    let hints = parts.join("   ");
 
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled(hints.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(hints, Style::default().fg(Color::DarkGray)),
     ]))
     .style(Style::default().bg(Color::Black));
 
@@ -183,8 +259,8 @@ mod tests {
     fn render_does_not_panic_empty_app() {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::new(".");
-        terminal.draw(|f| render(f, &app)).unwrap();
+        let mut app = App::new(".");
+        terminal.draw(|f| render(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -212,9 +288,9 @@ mod tests {
             claude_session_id: None,
         });
 
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
         app.focus_tab(TabId::Worker(0));
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
     }
 
     #[test]
@@ -223,6 +299,6 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(".");
         app.modal = Some(Modal::Help);
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
     }
 }

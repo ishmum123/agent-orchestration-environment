@@ -48,8 +48,8 @@ State badges in the tab strip: `◐` running · `?` blocked on permission · `!`
 
 All input is a centered pop-up modal. There is no persistent input box on tabs. This keeps tabs purely about reading — writing is a deliberate act.
 
-- **You → orc**: `n` from anywhere, or from the orc tab.
-- **You → worker**: `n` from that worker's tab.
+- **You → orc**: `t` from anywhere, or from the orc tab.
+- **You → worker**: `t` from that worker's tab.
 - **Orc → worker**: invisible — orc uses tools; you see the result land in the worker's log.
 - **Worker → orc**: invisible — same; appears as a tool call in the worker's log.
 

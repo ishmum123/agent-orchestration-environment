@@ -15,7 +15,10 @@ mod worktree;
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent,
+    KeyModifiers,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -142,8 +145,33 @@ async fn main() -> Result<()> {
         buffer: String::new(),
     });
 
+    // Install a panic hook that restores terminal state before printing
+    // the panic info. Without this, a panic leaves alt-screen + raw mode
+    // + mouse capture on and corrupts the user's shell.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut out = io::stdout();
+        let _ = out.execute(DisableBracketedPaste);
+        let _ = terminal::disable_raw_mode();
+        let _ = out.execute(LeaveAlternateScreen);
+        // Best-effort: persist a copy of the panic to a file so users have
+        // something to share even if the terminal scrollback is gone.
+        if let Some(home) = std::env::var_os("HOME") {
+            let p = std::path::PathBuf::from(home).join(".config/orc/last-panic.log");
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &p,
+                format!("{info}\n\nbacktrace:\n{}\n", std::backtrace::Backtrace::force_capture()),
+            );
+        }
+        default_panic(info);
+    }));
+
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -166,6 +194,7 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    let _ = io::stdout().execute(DisableBracketedPaste);
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
@@ -192,9 +221,15 @@ async fn run_event_loop(
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
+        // (App passed mutably so render() can pin sticky-bottom scroll.)
 
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
+            let evt = event::read()?;
+            if let Event::Paste(text) = &evt {
+                handle_paste(text, app);
+                continue;
+            }
+            if let Event::Key(key) = evt {
                 let action = handle_key(key, app, state_handle).await;
                 match action {
                     KeyAction::None => {}
@@ -285,26 +320,33 @@ async fn handle_worker_event(
 ) {
     match ev {
         WorkerEvent::Text { session_id, text } => {
+            clear_thinking(app, &session_id);
             app.push_log(&session_id, LogEntry::AssistantText(text));
         }
-        WorkerEvent::Thinking { session_id, text } => {
-            app.push_log(&session_id, LogEntry::Thinking(text));
+        WorkerEvent::Thinking { session_id, text: _ } => {
+            // Don't show the text; just flip the spinner on. Cleared by
+            // the next visible event (text / tool / turn-end).
+            if let Some(&idx) = app.session_index.get(&session_id) {
+                app.sessions[idx].is_thinking = true;
+            }
         }
         WorkerEvent::ToolUse {
             session_id,
             name,
             input,
         } => {
-            if mcp::is_orc_mcp_tool(&name) {
+            clear_thinking(app, &session_id);
+            if mcp::should_hide_tool(&name) {
                 if let Some(&idx) = app.session_index.get(&session_id) {
                     app.sessions[idx].skip_next_tool_result = true;
                 }
             } else {
+                let input_summary = ui::worker::summarize_tool_input(&name, &input);
                 app.push_log(
                     &session_id,
                     LogEntry::ToolUse {
                         name,
-                        input_summary: truncate_json(&input),
+                        input_summary,
                     },
                 );
             }
@@ -330,7 +372,11 @@ async fn handle_worker_event(
             cost_usd,
             ..
         } => {
+            clear_thinking(app, &session_id);
             app.push_log(&session_id, LogEntry::TurnEnd { cost_usd });
+            if let Some(&idx) = app.session_index.get(&session_id) {
+                app.collapse_last_turn(TabId::Worker(idx));
+            }
         }
         WorkerEvent::ClaudeSessionId {
             session_id,
@@ -343,6 +389,9 @@ async fn handle_worker_event(
                     claude_session_id,
                 })
                 .await;
+        }
+        WorkerEvent::OrcInstruction { session_id, text } => {
+            app.push_log(&session_id, LogEntry::OrcInstruction(text));
         }
         WorkerEvent::Exited { session_id, code } => {
             app.push_log(
@@ -367,6 +416,61 @@ enum KeyAction {
     InterruptWorker(String),
     Editor { command: String, target: String },
     RestartWorker { session_id: String },
+}
+
+/// Clear the spinner flag for a worker once it produces visible output.
+fn clear_thinking(app: &mut App, session_id: &str) {
+    if let Some(&idx) = app.session_index.get(session_id) {
+        app.sessions[idx].is_thinking = false;
+    }
+}
+
+/// Append a pasted block to the active modal's text buffer. If no input
+/// modal is open, the paste is dropped (orc has no persistent input box).
+fn handle_paste(text: &str, app: &mut App) {
+    let modal = app.modal.take();
+    let new = match modal {
+        Some(Modal::NewTask { target, mut buffer }) => {
+            buffer.push_str(text);
+            Some(Modal::NewTask { target, buffer })
+        }
+        Some(Modal::AskUser {
+            session_id,
+            question_id,
+            question,
+            context,
+            mut buffer,
+            hidden,
+        }) => {
+            if !hidden {
+                buffer.push_str(text);
+            }
+            Some(Modal::AskUser {
+                session_id,
+                question_id,
+                question,
+                context,
+                buffer,
+                hidden,
+            })
+        }
+        Some(Modal::Comment {
+            session_id,
+            file,
+            line,
+            mut buffer,
+        }) => {
+            buffer.push_str(text);
+            Some(Modal::Comment {
+                session_id,
+                file,
+                line,
+                buffer,
+            })
+        }
+        other => other,
+    };
+    app.modal = new;
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) -> KeyAction {
@@ -407,7 +511,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         KeyCode::Char('?') => {
             app.modal = Some(Modal::Help);
         }
-        KeyCode::Char('n') => {
+        KeyCode::Char('t') => {
             app.modal = Some(Modal::NewTask {
                 target: app.focused_tab,
                 buffer: String::new(),
@@ -450,9 +554,9 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
                         name: sv.session.name.clone(),
                     });
                 }
-            } else {
-                app.scroll_up(app.focused_tab, 1);
             }
+            // Note: `k` no longer scrolls (collides with kill on worker tabs);
+            // use Up/PageUp/gg for scrolling.
         }
         KeyCode::Char('R') => {
             if let TabId::Worker(idx) = app.focused_tab {
@@ -486,16 +590,42 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
             }
         }
 
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.scroll_down(app.focused_tab, 1);
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown => {
+            let amount = if matches!(key.code, KeyCode::PageDown) { 10 } else { 1 };
+            app.scroll_down(app.focused_tab, amount);
+            // Don't change stick here. Autoscroll re-engages stick if the
+            // user's downward scroll reaches the bottom.
         }
-        KeyCode::Up => {
-            app.scroll_up(app.focused_tab, 1);
+        KeyCode::Up | KeyCode::PageUp => {
+            let amount = if matches!(key.code, KeyCode::PageUp) { 10 } else { 1 };
+            app.scroll_up(app.focused_tab, amount);
+            app.set_stick(app.focused_tab, false);
         }
-        KeyCode::PageDown => app.scroll_down(app.focused_tab, 10),
-        KeyCode::PageUp => app.scroll_up(app.focused_tab, 10),
+        KeyCode::Home => {
+            app.set_scroll(app.focused_tab, 0);
+            app.set_stick(app.focused_tab, false);
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.set_stick(app.focused_tab, true);
+        }
+        KeyCode::Char('g') => {
+            // `gg` chord: first `g` arms, second jumps to top.
+            if app.pending_g {
+                app.set_scroll(app.focused_tab, 0);
+                app.set_stick(app.focused_tab, false);
+                app.pending_g = false;
+            } else {
+                app.pending_g = true;
+                return KeyAction::None;
+            }
+        }
 
         _ => {}
+    }
+
+    // Clear `gg` chord on any key other than `g`.
+    if !matches!(key.code, KeyCode::Char('g')) {
+        app.pending_g = false;
     }
 
     KeyAction::None
@@ -546,41 +676,97 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
             question,
             context,
             mut buffer,
-        }) => match key.code {
-            KeyCode::Esc => {}
-            KeyCode::Enter if !buffer.is_empty() => {
-                let _ = state_handle.answer_user(&session_id, &buffer).await;
-            }
-            KeyCode::Char(c) => {
-                buffer.push(c);
+            hidden,
+        }) => {
+            // Tab toggles modal visibility so the user can peek the chat.
+            if matches!(key.code, KeyCode::Tab) {
                 app.modal = Some(Modal::AskUser {
                     session_id,
                     question_id,
                     question,
                     context,
                     buffer,
+                    hidden: !hidden,
                 });
+                return KeyAction::None;
             }
-            KeyCode::Backspace => {
-                buffer.pop();
-                app.modal = Some(Modal::AskUser {
-                    session_id,
-                    question_id,
-                    question,
-                    context,
-                    buffer,
-                });
+            // While hidden, route scroll keys to chat; ignore other keys
+            // (so Enter/letters can't accidentally answer the question).
+            if hidden {
+                let restore = || Modal::AskUser {
+                    session_id: session_id.clone(),
+                    question_id: question_id.clone(),
+                    question: question.clone(),
+                    context: context.clone(),
+                    buffer: buffer.clone(),
+                    hidden: true,
+                };
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.scroll_down(app.focused_tab, 1);
+                    }
+                    KeyCode::Up => {
+                        app.scroll_up(app.focused_tab, 1);
+                        app.set_stick(app.focused_tab, false);
+                    }
+                    KeyCode::PageDown => {
+                        app.scroll_down(app.focused_tab, 10);
+                    }
+                    KeyCode::PageUp => {
+                        app.scroll_up(app.focused_tab, 10);
+                        app.set_stick(app.focused_tab, false);
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        app.set_stick(app.focused_tab, true);
+                    }
+                    KeyCode::Home => {
+                        app.set_scroll(app.focused_tab, 0);
+                        app.set_stick(app.focused_tab, false);
+                    }
+                    _ => {}
+                }
+                app.modal = Some(restore());
+                return KeyAction::None;
             }
-            _ => {
-                app.modal = Some(Modal::AskUser {
-                    session_id,
-                    question_id,
-                    question,
-                    context,
-                    buffer,
-                });
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter if !buffer.is_empty() => {
+                    let _ = state_handle.answer_user(&session_id, &buffer).await;
+                }
+                KeyCode::Char(c) => {
+                    buffer.push(c);
+                    app.modal = Some(Modal::AskUser {
+                        session_id,
+                        question_id,
+                        question,
+                        context,
+                        buffer,
+                        hidden,
+                    });
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    app.modal = Some(Modal::AskUser {
+                        session_id,
+                        question_id,
+                        question,
+                        context,
+                        buffer,
+                        hidden,
+                    });
+                }
+                _ => {
+                    app.modal = Some(Modal::AskUser {
+                        session_id,
+                        question_id,
+                        question,
+                        context,
+                        buffer,
+                        hidden,
+                    });
+                }
             }
-        },
+        }
         Some(Modal::Comment {
             session_id,
             file,
@@ -754,8 +940,13 @@ fn handle_state_change(app: &mut App, change: StateChange) {
         StateChange::SessionCreated { session } => {
             if !app.session_index.contains_key(&session.id) {
                 let name = session.name.clone();
+                let id = session.id.clone();
+                let task = session.task.clone();
                 app.add_session(session);
                 app.push_chat(ChatRole::System, format!("session '{name}' spawned"));
+                // Show the initial task in the worker's own log so the user
+                // can see what orc told this worker to do.
+                app.push_log(&id, LogEntry::OrcInstruction(task));
             }
         }
         StateChange::SessionStateChanged {
@@ -790,6 +981,7 @@ fn handle_state_change(app: &mut App, change: StateChange) {
                 question,
                 context,
                 buffer: String::new(),
+                hidden: false,
             });
         }
         StateChange::QuestionResolved {
@@ -840,15 +1032,18 @@ fn handle_state_change(app: &mut App, change: StateChange) {
 fn handle_orc_event(app: &mut App, event: OrcEvent) {
     match event {
         OrcEvent::Text(text) => {
+            app.orc_view.is_thinking = false;
             app.orc_view.push(LogEntry::AssistantText(text));
         }
         OrcEvent::ToolUse { name, input, .. } => {
-            if mcp::is_orc_mcp_tool(&name) {
+            app.orc_view.is_thinking = false;
+            if mcp::should_hide_tool(&name) {
                 app.orc_view.skip_next_tool_result = true;
             } else {
+                let input_summary = ui::worker::summarize_tool_input(&name, &input);
                 app.orc_view.push(LogEntry::ToolUse {
                     name,
-                    input_summary: truncate_json(&input),
+                    input_summary,
                 });
             }
         }
@@ -858,30 +1053,27 @@ fn handle_orc_event(app: &mut App, event: OrcEvent) {
             cost_usd,
             ..
         } => {
+            app.orc_view.is_thinking = false;
             if is_error {
                 app.orc_view
                     .push(LogEntry::System(format!("orc error: {result}")));
             }
             app.orc_view.push(LogEntry::TurnEnd { cost_usd });
+            app.collapse_last_turn(TabId::Orc);
         }
         OrcEvent::System { model, .. } => {
             if let Some(m) = model {
-                app.orc_view
-                    .push(LogEntry::System(format!("orc model: {m}")));
+                if !app.orc_view.model_announced {
+                    app.orc_view
+                        .push(LogEntry::System(format!("orc model: {m}")));
+                    app.orc_view.model_announced = true;
+                }
             }
         }
-        OrcEvent::Thinking(t) => {
-            app.orc_view.push(LogEntry::Thinking(t));
+        OrcEvent::Thinking(_) => {
+            // Hide the text; show only the spinner.
+            app.orc_view.is_thinking = true;
         }
-    }
-}
-
-fn truncate_json(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    if s.len() > 80 {
-        format!("{}...", &s[..77])
-    } else {
-        s
     }
 }
 
