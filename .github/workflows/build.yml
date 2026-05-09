@@ -10,17 +10,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build release binary
         run: cargo build --release
 
-      - name: Upload Artifact
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: orc
+          name: orc-linux
           path: target/release/orc
