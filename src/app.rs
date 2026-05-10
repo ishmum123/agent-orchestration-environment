@@ -100,6 +100,9 @@ pub struct SessionView {
     /// shown at the tail of the events log. Cleared by the next text /
     /// tool / turn-end event.
     pub is_thinking: bool,
+    /// Latest assistant turn's full context-window occupancy in tokens
+    /// (input + cache_read + cache_creation). None until first turn.
+    pub last_context_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +113,8 @@ pub struct SessionView {
 pub struct OrcView {
     pub event_log: Vec<LogEntry>,
     pub alive: bool,
+    /// Configured model alias (e.g. "opus"). Shown in the agents panel.
+    pub model: String,
     /// See `SessionView::skip_next_tool_result`.
     pub skip_next_tool_result: bool,
     /// Whether the `[orc model: …]` line has been pushed once already.
@@ -119,6 +124,8 @@ pub struct OrcView {
     pub stick_to_bottom: bool,
     /// See `SessionView::is_thinking`.
     pub is_thinking: bool,
+    /// See `SessionView::last_context_tokens`.
+    pub last_context_tokens: Option<u64>,
 }
 
 impl OrcView {
@@ -126,10 +133,12 @@ impl OrcView {
         Self {
             event_log: Vec::new(),
             alive: true,
+            model: String::new(),
             skip_next_tool_result: false,
             model_announced: false,
             stick_to_bottom: true,
             is_thinking: false,
+            last_context_tokens: None,
         }
     }
 
@@ -363,6 +372,7 @@ impl App {
             skip_next_tool_result: false,
             stick_to_bottom: true,
             is_thinking: false,
+            last_context_tokens: None,
         });
     }
 

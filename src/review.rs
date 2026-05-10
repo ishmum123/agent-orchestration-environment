@@ -82,6 +82,9 @@ pub struct ReviewState {
     pub overall: Option<String>,
     pub view_mode: ViewMode,
     pub worktree_path: String,
+    /// Scroll offset (in source lines) for the WholeFile view. J/K page
+    /// through this; switching to Diff resets to 0.
+    pub whole_file_scroll: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +361,7 @@ impl ReviewState {
             overall: None,
             view_mode: ViewMode::Diff,
             worktree_path,
+            whole_file_scroll: 0,
         }
     }
 
@@ -366,6 +370,19 @@ impl ReviewState {
             ViewMode::Diff => ViewMode::WholeFile,
             ViewMode::WholeFile => ViewMode::Diff,
         };
+        // Reset paged-scroll on each entry; cursor anchors first frame.
+        self.whole_file_scroll = 0;
+    }
+
+    /// Page-scroll the WholeFile view by `rows` (positive = down).
+    pub fn whole_file_page(&mut self, rows: isize) {
+        if rows >= 0 {
+            self.whole_file_scroll =
+                self.whole_file_scroll.saturating_add(rows as usize);
+        } else {
+            self.whole_file_scroll =
+                self.whole_file_scroll.saturating_sub((-rows) as usize);
+        }
     }
 
     /// Add a comment at an explicit (file, line) — used by the comment modal.

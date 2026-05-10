@@ -125,6 +125,59 @@ fn render_session_info(
     frame.render_widget(info, inner);
 }
 
+/// Strip ANSI escape sequences and C0/C1 control chars from `s`, preserving
+/// `\n` and `\t`. Tool output (e.g. colored bash, git diffs) carries raw
+/// escapes; if those bytes land in ratatui cells the terminal interprets
+/// them on flush, leaving stray glyphs and cursor jumps that bleed across
+/// frames and tabs.
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(pc) = chars.next() {
+                        if pc.is_ascii_alphabetic() || pc == '~' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(pc) = chars.next() {
+                        // OSC terminator: BEL or ESC \
+                        if pc == '\x07' {
+                            break;
+                        }
+                        if pc == '\x1b' {
+                            if matches!(chars.peek(), Some('\\')) {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if c == '\n' || c == '\t' {
+            out.push(c);
+        } else {
+            let cp = c as u32;
+            // Drop C0 (except handled above) and C1 control ranges.
+            if cp < 0x20 || (0x7F..=0x9F).contains(&cp) {
+                continue;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Convert a structured log into renderable lines. Used by both the orc tab
 /// and worker tabs — same model for both.
 pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
@@ -132,33 +185,37 @@ pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
     for entry in log {
         match entry {
             LogEntry::UserText(t) => {
+                let t = sanitize(t);
                 push_prefixed_lines(
                     &mut out,
                     "you   ",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
-                    t,
+                    &t,
                     Style::default(),
                 );
             }
             LogEntry::OrcInstruction(t) => {
+                let t = sanitize(t);
                 push_prefixed_lines(
                     &mut out,
                     "orc → ",
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
-                    t,
+                    &t,
                     Style::default(),
                 );
             }
             LogEntry::AssistantText(t) => {
-                for line in render_markdown(t) {
+                let t = sanitize(t);
+                for line in render_markdown(&t) {
                     out.push(line);
                 }
             }
             LogEntry::Thinking(t) => {
+                let t = sanitize(t);
                 let trimmed = t.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -193,10 +250,11 @@ pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
                 input_summary,
             } => out.push(Line::from(vec![
                 Span::styled("→ ", Style::default().fg(Color::Yellow)),
-                Span::raw(format!("{name}{input_summary}")),
+                Span::raw(format!("{}{}", sanitize(name), sanitize(input_summary))),
             ])),
             LogEntry::ToolResult { text, is_error } => {
                 let color = if *is_error { Color::Red } else { Color::Green };
+                let text = sanitize(text);
                 let lines: Vec<&str> = text.split('\n').collect();
                 let cap = 5usize;
                 let body_style = Style::default();
@@ -224,6 +282,7 @@ pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
                 }
             }
             LogEntry::System(s) => {
+                let s = sanitize(s);
                 for (i, ln) in s.split('\n').enumerate() {
                     let body = if i == 0 {
                         format!("[{ln}")
@@ -347,148 +406,221 @@ pub fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-/// Minimal markdown pass for assistant text:
-/// - `**x**` → bold styled span
-/// - leading `#`/`##`/`###` → bold standalone line, hashes stripped
-/// - everything else passes through unstyled
+/// Render assistant text via `pulldown-cmark` into ratatui Lines. Handles
+/// headings, emphasis, code (inline + fenced), lists, blockquotes, links,
+/// and horizontal rules. Soft breaks render as spaces; hard breaks and
+/// block-level boundaries flush the current line.
 fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+
+    let parser = Parser::new(text);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for raw in text.split('\n') {
-        let trimmed = raw.trim_start();
-        if let Some(rest) = strip_heading(trimmed) {
-            lines.push(Line::from(Span::styled(
-                rest.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            continue;
-        }
-        lines.push(Line::from(parse_inline(raw)));
-    }
-    lines
-}
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![Style::default()];
+    // Track structural state.
+    let mut in_code_block = false;
+    let mut list_depth: usize = 0;
+    let mut list_index_stack: Vec<Option<u64>> = Vec::new();
+    let mut item_pending_marker = false;
+    let mut block_just_ended = false;
 
-/// Detect `#`–`######` heading prefix; return the body without hashes.
-fn strip_heading(s: &str) -> Option<String> {
-    let mut hashes = 0;
-    for c in s.chars() {
-        if c == '#' {
-            hashes += 1;
-        } else {
-            break;
-        }
-    }
-    if hashes == 0 || hashes > 6 {
-        return None;
-    }
-    let rest = &s[hashes..];
-    if !rest.starts_with(' ') {
-        return None;
-    }
-    Some(rest.trim_start().to_string())
-}
+    let style = |stack: &Vec<Style>| -> Style { *stack.last().unwrap() };
 
-/// Inline markdown: `**bold**`, and `[label](url)` rendered as just the
-/// label styled cyan + underlined. Unmatched markers pass through.
-fn parse_inline(line: &str) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut bold = false;
-    let bytes = line.as_bytes();
-    let mut i = 0;
-
-    let flush = |buf: &mut String, bold: bool, spans: &mut Vec<Span<'static>>| {
-        if !buf.is_empty() {
-            let style = if bold {
-                Style::default().add_modifier(Modifier::BOLD)
+    let flush =
+        |current: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
+            if current.is_empty() {
+                lines.push(Line::from(""));
             } else {
-                Style::default()
-            };
-            spans.push(Span::styled(std::mem::take(buf), style));
-        }
-    };
-
-    while i < bytes.len() {
-        // Try **bold** boundary.
-        if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            flush(&mut buf, bold, &mut spans);
-            bold = !bold;
-            i += 2;
-            continue;
-        }
-        // Try [label](url) link.
-        if bytes[i] == b'[' {
-            if let Some((label, url_end)) = parse_link(&bytes[i..]) {
-                let _ = url_end;
-                flush(&mut buf, bold, &mut spans);
-                let mut style = Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::UNDERLINED);
-                if bold {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                spans.push(Span::styled(label, style));
-                i += url_end;
-                continue;
+                lines.push(Line::from(std::mem::take(current)));
             }
-        }
-        // Plain char (utf-8 safe).
-        let ch_start = i;
-        let mut end = ch_start + 1;
-        while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
-            end += 1;
-        }
-        buf.push_str(&line[ch_start..end]);
-        i = end;
-    }
-    flush(&mut buf, bold, &mut spans);
-    if spans.is_empty() {
-        spans.push(Span::raw(""));
-    }
-    spans
-}
+        };
 
-/// Parse a `[label](url)` starting at `bytes[0]`. Returns the label string
-/// and the byte length consumed (including closing `)`). Tolerates label
-/// containing balanced brackets; URL must not contain `)`.
-fn parse_link(bytes: &[u8]) -> Option<(String, usize)> {
-    if bytes.first() != Some(&b'[') {
-        return None;
-    }
-    // Find matching `]`.
-    let mut depth = 1;
-    let mut j = 1;
-    while j < bytes.len() {
-        match bytes[j] {
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
+    for event in parser {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Heading { level, .. } => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    if !lines.is_empty() && !block_just_ended {
+                        lines.push(Line::from(""));
+                    }
+                    let mut s = Style::default().add_modifier(Modifier::BOLD);
+                    if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                        s = s.fg(Color::Cyan);
+                    }
+                    style_stack.push(s);
+                    block_just_ended = false;
                 }
+                Tag::Paragraph => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    if !lines.is_empty() && !block_just_ended {
+                        lines.push(Line::from(""));
+                    }
+                    block_just_ended = false;
+                }
+                Tag::BlockQuote(_) => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    let s = style(&style_stack)
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    style_stack.push(s);
+                }
+                Tag::CodeBlock(_) => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    in_code_block = true;
+                    style_stack.push(Style::default().fg(Color::LightYellow));
+                }
+                Tag::List(start) => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    list_depth += 1;
+                    list_index_stack.push(start);
+                }
+                Tag::Item => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    item_pending_marker = true;
+                }
+                Tag::Emphasis => {
+                    let s = style(&style_stack).add_modifier(Modifier::ITALIC);
+                    style_stack.push(s);
+                }
+                Tag::Strong => {
+                    let s = style(&style_stack).add_modifier(Modifier::BOLD);
+                    style_stack.push(s);
+                }
+                Tag::Strikethrough => {
+                    let s = style(&style_stack).add_modifier(Modifier::CROSSED_OUT);
+                    style_stack.push(s);
+                }
+                Tag::Link { .. } => {
+                    let s = style(&style_stack)
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED);
+                    style_stack.push(s);
+                }
+                _ => {
+                    style_stack.push(style(&style_stack));
+                }
+            },
+            Event::End(end) => match end {
+                TagEnd::Heading(_) | TagEnd::Paragraph => {
+                    style_stack.pop();
+                    flush(&mut current, &mut lines);
+                    block_just_ended = true;
+                }
+                TagEnd::BlockQuote(_) => {
+                    style_stack.pop();
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    block_just_ended = true;
+                }
+                TagEnd::CodeBlock => {
+                    style_stack.pop();
+                    in_code_block = false;
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                    block_just_ended = true;
+                }
+                TagEnd::List(_) => {
+                    list_depth = list_depth.saturating_sub(1);
+                    list_index_stack.pop();
+                    if list_depth == 0 {
+                        block_just_ended = true;
+                    }
+                }
+                TagEnd::Item => {
+                    if !current.is_empty() {
+                        flush(&mut current, &mut lines);
+                    }
+                }
+                TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Link => {
+                    style_stack.pop();
+                }
+                _ => {
+                    style_stack.pop();
+                }
+            },
+            Event::Text(t) => {
+                if item_pending_marker {
+                    let indent = "  ".repeat(list_depth.saturating_sub(1));
+                    let last_idx = list_index_stack.len().saturating_sub(1);
+                    let marker = match list_index_stack.get_mut(last_idx) {
+                        Some(Some(n)) => {
+                            let m = format!("{n}. ");
+                            *n += 1;
+                            m
+                        }
+                        _ => "• ".to_string(),
+                    };
+                    current.push(Span::raw(format!("{indent}{marker}")));
+                    item_pending_marker = false;
+                }
+                if in_code_block {
+                    let body = t.into_string();
+                    for (i, ln) in body.split('\n').enumerate() {
+                        if i > 0 {
+                            flush(&mut current, &mut lines);
+                        }
+                        if !ln.is_empty() {
+                            current.push(Span::styled(
+                                ln.to_string(),
+                                style(&style_stack),
+                            ));
+                        }
+                    }
+                } else {
+                    current.push(Span::styled(t.into_string(), style(&style_stack)));
+                }
+                block_just_ended = false;
+            }
+            Event::Code(c) => {
+                current.push(Span::styled(
+                    c.into_string(),
+                    style(&style_stack).fg(Color::LightYellow),
+                ));
+            }
+            Event::SoftBreak => {
+                current.push(Span::raw(" "));
+            }
+            Event::HardBreak => {
+                flush(&mut current, &mut lines);
+            }
+            Event::Rule => {
+                if !current.is_empty() {
+                    flush(&mut current, &mut lines);
+                }
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(40),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                block_just_ended = true;
             }
             _ => {}
         }
-        j += 1;
     }
-    if depth != 0 || j >= bytes.len() {
-        return None;
+
+    if !current.is_empty() {
+        flush(&mut current, &mut lines);
     }
-    // Expect `(` immediately after `]`.
-    if bytes.get(j + 1) != Some(&b'(') {
-        return None;
+    if lines.is_empty() {
+        lines.push(Line::from(""));
     }
-    // Find matching `)`.
-    let mut k = j + 2;
-    while k < bytes.len() && bytes[k] != b')' {
-        k += 1;
-    }
-    if k >= bytes.len() {
-        return None;
-    }
-    let label = std::str::from_utf8(&bytes[1..j]).ok()?.to_string();
-    // Replace newlines in label (markdown links can wrap source).
-    let label = label.replace('\n', " ");
-    Some((label, k + 1))
+    lines
 }
 
 pub fn render_event_log(
@@ -729,6 +861,7 @@ mod tests {
             skip_next_tool_result: false,
             stick_to_bottom: true,
             is_thinking: false,
+            last_context_tokens: None,
         }
     }
 

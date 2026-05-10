@@ -218,24 +218,29 @@ fn render_whole_file_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         } else {
             Style::default()
         };
-        let truncated = truncate_content(
-            content,
-            inner.width.saturating_sub(8) as usize,
-        );
         lines.push(Line::from(vec![
             Span::styled(format!(" {gutter} "), Style::default().fg(Color::Yellow)),
             Span::styled(format!("{:>4} ", lineno), Style::default().fg(Color::DarkGray)),
-            Span::styled(truncated, row_style),
+            Span::styled(content.to_string(), row_style),
         ]));
     }
 
-    // Scroll: keep cursor visible
-    let cursor_idx = cursor_lineno.map(|n| n.saturating_sub(1)).unwrap_or(0);
+    // Scroll: J/K page through whole_file_scroll; otherwise center cursor
+    // on first entry. Clamp to a real max so the bottom of the file is
+    // reachable (Paragraph wrap counted at the same width).
     let visible = inner.height as usize;
-    let scroll_offset = if cursor_idx >= visible {
-        cursor_idx.saturating_sub(visible / 2)
+    let para_for_count = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+    let wrapped_total = para_for_count.line_count(inner.width) as usize;
+    let max_scroll = wrapped_total.saturating_sub(visible);
+    let scroll_offset = if review.whole_file_scroll > 0 {
+        review.whole_file_scroll.min(max_scroll)
     } else {
-        0
+        let cursor_idx = cursor_lineno.map(|n| n.saturating_sub(1)).unwrap_or(0);
+        if cursor_idx >= visible {
+            cursor_idx.saturating_sub(visible / 2).min(max_scroll)
+        } else {
+            0
+        }
     };
 
     // Force-clear inner cells first — Paragraph with Wrap+scroll can leave
@@ -297,10 +302,13 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         map
     };
 
+    let mut cursor_buffer_row: Option<usize> = None;
     for hunk in &file.hunks {
         let is_approved = review.hunk_approvals.contains(&hunk.id);
 
-        // Hunk header line
+        // Hunk header line — does not advance the cursor index. cursor
+        // counts diff lines only, so `cursor.line_idx == file_line_count - 1`
+        // points at the last actual diff row.
         let header_marker = if is_approved { " \u{2713} " } else { "   " };
         lines.push(Line::from(vec![
             Span::styled(
@@ -314,11 +322,13 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-        flat_line_idx += 1;
 
         // Diff lines
         for diff_line in &hunk.lines {
             let is_cursor = flat_line_idx == review.cursor.line_idx;
+            if is_cursor {
+                cursor_buffer_row = Some(lines.len());
+            }
 
             let old_no: String = diff_line
                 .old_lineno
@@ -355,10 +365,7 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
                 Span::styled(" ", Style::default()),
                 Span::styled(new_no, Style::default().fg(Color::DarkGray)),
                 Span::styled(prefix, base_style),
-                Span::styled(
-                    truncate_content(&diff_line.content, inner.width.saturating_sub(16) as usize),
-                    base_style,
-                ),
+                Span::styled(diff_line.content.clone(), base_style),
                 Span::raw(comment_marker),
             ]));
 
@@ -392,10 +399,16 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         }
     }
 
-    // Scroll: keep cursor visible
+    // Scroll: center the cursor's actual buffer row. Clamp to a real max
+    // (computed against the wrapped paragraph) so the bottom of the diff
+    // is reachable.
     let visible = inner.height as usize;
-    let scroll_offset = if review.cursor.line_idx >= visible {
-        review.cursor.line_idx.saturating_sub(visible / 2)
+    let para_for_count = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+    let wrapped_total = para_for_count.line_count(inner.width) as usize;
+    let max_scroll = wrapped_total.saturating_sub(visible);
+    let row = cursor_buffer_row.unwrap_or(0);
+    let scroll_offset = if row >= visible {
+        row.saturating_sub(visible / 2).min(max_scroll)
     } else {
         0
     };
@@ -407,16 +420,6 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         .scroll((scroll_offset as u16, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
-}
-
-fn truncate_content(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max > 3 {
-        format!("{}...", &s[..max - 3])
-    } else {
-        s[..max].to_string()
-    }
 }
 
 /// Simple word-wrapping for comment bodies.
@@ -501,6 +504,7 @@ mod tests {
             overall: None,
             view_mode: crate::review::ViewMode::Diff,
             worktree_path: String::new(),
+            whole_file_scroll: 0,
         }
     }
 
@@ -586,6 +590,7 @@ mod tests {
             overall: None,
             view_mode: crate::review::ViewMode::Diff,
             worktree_path: String::new(),
+            whole_file_scroll: 0,
         }
     }
 

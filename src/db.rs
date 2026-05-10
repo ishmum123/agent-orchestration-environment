@@ -268,6 +268,22 @@ impl Database {
         Ok(())
     }
 
+    /// Delete every session whose state is `Done` or `Failed`, along with its
+    /// dependent rows. Returns the number of sessions removed.
+    pub fn delete_finished_sessions(&self) -> Result<usize> {
+        let ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM sessions WHERE state IN ('Done', 'Failed')")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for id in &ids {
+            self.delete_session(id)?;
+        }
+        Ok(ids.len())
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Session> {
         self.conn
             .query_row(

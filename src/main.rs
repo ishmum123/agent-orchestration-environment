@@ -55,6 +55,8 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum SubCommand {
     Doctor,
+    /// Remove finished (Done/Failed) sessions from the local sqlite state.
+    Clean,
 }
 
 fn check_dependencies() -> Result<()> {
@@ -78,6 +80,9 @@ async fn main() -> Result<()> {
 
     if let Some(SubCommand::Doctor) = &cli.command {
         return run_doctor().await;
+    }
+    if let Some(SubCommand::Clean) = &cli.command {
+        return run_clean().await;
     }
 
     check_dependencies()?;
@@ -137,6 +142,7 @@ async fn main() -> Result<()> {
     }
 
     let mut app = App::new(&project_str).with_state_handle(state_handle.clone());
+    app.orc_view.model = orc_config.model.clone();
     app.push_chat(ChatRole::System, format!("orc v2 — MCP on port {mcp_port}"));
 
     // Welcome prompt — open a NewTask modal targeted at orc on first frame.
@@ -249,8 +255,8 @@ async fn run_event_loop(
                         let _ = worker_registry.interrupt(&session_id).await;
                         app.push_log(&session_id, LogEntry::System("interrupted".into()));
                     }
-                    KeyAction::Editor { command, target } => {
-                        run_editor(terminal, &command, &target).await?;
+                    KeyAction::Editor { command, target, line } => {
+                        run_editor(terminal, &command, &target, line).await?;
                     }
                     KeyAction::RestartWorker { session_id } => {
                         if let Err(e) = restart_worker(
@@ -281,6 +287,9 @@ async fn run_event_loop(
 
         // Poll orc liveness to update the badge.
         app.orc_view.alive = orc_process.is_alive();
+        // Mirror orc's latest-turn context occupancy into the view.
+        let last_ctx = orc_process.usage().last_context_tokens;
+        app.orc_view.last_context_tokens = if last_ctx > 0 { Some(last_ctx) } else { None };
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(16)) => {}
@@ -393,6 +402,14 @@ async fn handle_worker_event(
         WorkerEvent::OrcInstruction { session_id, text } => {
             app.push_log(&session_id, LogEntry::OrcInstruction(text));
         }
+        WorkerEvent::Usage {
+            session_id,
+            context_tokens,
+        } => {
+            if let Some(&idx) = app.session_index.get(&session_id) {
+                app.sessions[idx].last_context_tokens = Some(context_tokens);
+            }
+        }
         WorkerEvent::Exited { session_id, code } => {
             app.push_log(
                 &session_id,
@@ -414,7 +431,7 @@ enum KeyAction {
     SendToWorker { session_id: String, body: String },
     InterruptOrc,
     InterruptWorker(String),
-    Editor { command: String, target: String },
+    Editor { command: String, target: String, line: Option<usize> },
     RestartWorker { session_id: String },
 }
 
@@ -849,8 +866,14 @@ async fn handle_review_key(
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => review.move_line_down(),
         KeyCode::Char('k') | KeyCode::Up => review.move_line_up(),
-        KeyCode::Char('J') => review.move_hunk_down(),
-        KeyCode::Char('K') => review.move_hunk_up(),
+        KeyCode::Char('J') => match review.view_mode {
+            crate::review::ViewMode::Diff => review.move_hunk_down(),
+            crate::review::ViewMode::WholeFile => review.whole_file_page(15),
+        },
+        KeyCode::Char('K') => match review.view_mode {
+            crate::review::ViewMode::Diff => review.move_hunk_up(),
+            crate::review::ViewMode::WholeFile => review.whole_file_page(-15),
+        },
         KeyCode::Char(']') => review.move_file_down(),
         KeyCode::Char('[') => review.move_file_up(),
 
@@ -874,9 +897,13 @@ async fn handle_review_key(
                     }
                 })
                 .unwrap_or_else(|| review.worktree_path.clone());
+            let line = review
+                .current_line()
+                .and_then(|l| l.new_lineno.or(l.old_lineno));
             return KeyAction::Editor {
                 command: editor,
                 target,
+                line,
             };
         }
 
@@ -1083,11 +1110,36 @@ async fn run_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     command: &str,
     target: &str,
+    line: Option<usize>,
 ) -> Result<()> {
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
-    let status = std::process::Command::new(command).arg(target).status();
+    let status = {
+        let mut cmd = std::process::Command::new(command);
+        // Detect editor family from the first path segment so we pass the
+        // right "go to line" flag. Defaults to the `+N file` convention,
+        // which vi/vim/nano/emacs accept.
+        let bin = std::path::Path::new(command)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(command);
+        match (bin, line) {
+            (_, None) => {
+                cmd.arg(target);
+            }
+            ("code" | "code-insiders" | "cursor" | "windsurf", Some(n)) => {
+                cmd.arg("--goto").arg(format!("{target}:{n}"));
+            }
+            ("subl" | "sublime_text" | "atom" | "zed", Some(n)) => {
+                cmd.arg(format!("{target}:{n}"));
+            }
+            (_, Some(n)) => {
+                cmd.arg(format!("+{n}")).arg(target);
+            }
+        }
+        cmd.status()
+    };
 
     io::stdout().execute(EnterAlternateScreen)?;
     terminal::enable_raw_mode()?;
@@ -1164,6 +1216,23 @@ async fn restart_worker(
         .await?;
 
     let _ = (project_dir, app);
+    Ok(())
+}
+
+async fn run_clean() -> Result<()> {
+    let data_dir = dirs_data_dir().join("orc");
+    let db_path = data_dir.join("state.db");
+    if !db_path.exists() {
+        println!("no state db at {} — nothing to clean", db_path.display());
+        return Ok(());
+    }
+    let db = Database::open(&db_path)?;
+    let removed = db.delete_finished_sessions()?;
+    if removed == 0 {
+        println!("no finished sessions found");
+    } else {
+        println!("removed {removed} finished session(s) from {}", db_path.display());
+    }
     Ok(())
 }
 

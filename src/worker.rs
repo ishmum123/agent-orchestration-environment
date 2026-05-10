@@ -50,6 +50,12 @@ pub enum WorkerEvent {
     /// Synthetic event: orc sent the worker an instruction (initial task or
     /// follow-up). Surfaced in the worker tab as an "orc → ..." line.
     OrcInstruction { session_id: String, text: String },
+    /// Latest assistant turn's context-window occupancy in tokens.
+    /// `tokens` = input + cache_read + cache_creation from /message/usage.
+    Usage {
+        session_id: String,
+        context_tokens: u64,
+    },
 }
 
 pub struct WorkerHandle {
@@ -117,7 +123,21 @@ fn build_base_command(
         "--append-system-prompt",
         system_prompt,
     ]);
+    // Force claude to auto-compact at 50% — past that the model starts
+    // hallucinating in our experience.
+    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "50");
     cmd
+}
+
+/// Context window size for a given model alias. claude doesn't expose this
+/// in the stream, so we mirror the published per-model caps.
+pub fn context_cap_for(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") || m.contains("sonnet-4-6") || m == "sonnet" {
+        1_000_000
+    } else {
+        200_000
+    }
 }
 
 async fn finalise_spawn(
@@ -245,6 +265,24 @@ pub fn parse_worker_events(session_id: &str, raw: &Value) -> Vec<WorkerEvent> {
             }
         }
         "assistant" => {
+            if let Some(usage) = raw.pointer("/message/usage") {
+                let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_read = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cache_creation = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let total = input + cache_read + cache_creation;
+                if total > 0 {
+                    out.push(WorkerEvent::Usage {
+                        session_id: session_id.to_string(),
+                        context_tokens: total,
+                    });
+                }
+            }
             if let Some(content) = raw.pointer("/message/content").and_then(|v| v.as_array()) {
                 for block in content {
                     let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("");

@@ -116,6 +116,9 @@ pub struct OrcUsage {
     pub total_output: u64,
     pub total_cost: f64,
     pub turns: u32,
+    /// Latest assistant turn's full context-window occupancy in tokens
+    /// (input + cache_read + cache_creation). 0 until first turn lands.
+    pub last_context_tokens: u64,
 }
 
 /// Configuration for spawning the orc brain.
@@ -192,13 +195,25 @@ impl OrcProcess {
                         }
                     }
                 }
-                // Track token counts from assistant messages
+                // Track token counts from assistant messages.
+                // input/output accumulate; last_context_tokens reflects
+                // the latest turn's full window occupancy (incl. cache).
                 if let Some(usage) = raw.pointer("/message/usage") {
-                    if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                        self.usage.total_input += input;
-                    }
-                    if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                        self.usage.total_output += output;
+                    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_read = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_creation = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    self.usage.total_input += input;
+                    self.usage.total_output += output;
+                    let total = input + cache_read + cache_creation;
+                    if total > 0 {
+                        self.usage.last_context_tokens = total;
                     }
                 }
                 Ok(events)
@@ -346,6 +361,7 @@ pub async fn spawn_orc(config: &OrcConfig) -> Result<OrcProcess> {
         "--strict-mcp-config",
         "--dangerously-skip-permissions",
     ]);
+    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "50");
     cmd.current_dir(&config.project_dir);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
