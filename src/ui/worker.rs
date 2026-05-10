@@ -424,7 +424,15 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut item_pending_marker = false;
     let mut block_just_ended = false;
 
-    let style = |stack: &Vec<Style>| -> Style { *stack.last().unwrap() };
+    let style = |stack: &Vec<Style>| -> Style {
+        stack.last().copied().unwrap_or_default()
+    };
+    // Pop without underflow — base Style at stack[0] is preserved.
+    let pop = |stack: &mut Vec<Style>| {
+        if stack.len() > 1 {
+            stack.pop();
+        }
+    };
 
     let flush =
         |current: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
@@ -514,19 +522,19 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
             },
             Event::End(end) => match end {
                 TagEnd::Heading(_) | TagEnd::Paragraph => {
-                    style_stack.pop();
+                    pop(&mut style_stack);
                     flush(&mut current, &mut lines);
                     block_just_ended = true;
                 }
                 TagEnd::BlockQuote(_) => {
-                    style_stack.pop();
+                    pop(&mut style_stack);
                     if !current.is_empty() {
                         flush(&mut current, &mut lines);
                     }
                     block_just_ended = true;
                 }
                 TagEnd::CodeBlock => {
-                    style_stack.pop();
+                    pop(&mut style_stack);
                     in_code_block = false;
                     if !current.is_empty() {
                         flush(&mut current, &mut lines);
@@ -549,10 +557,10 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 | TagEnd::Strong
                 | TagEnd::Strikethrough
                 | TagEnd::Link => {
-                    style_stack.pop();
+                    pop(&mut style_stack);
                 }
                 _ => {
-                    style_stack.pop();
+                    pop(&mut style_stack);
                 }
             },
             Event::Text(t) => {
