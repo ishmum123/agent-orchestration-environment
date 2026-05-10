@@ -2,19 +2,14 @@
 
 Agent Orchestration Environment (AOE). A TUI that runs multiple Claude Code sessions as agents, with one orchestrator coordinating them.
 
-     ◐ w1·refactor-api
-    ┌─────────────────────────────────────────────────────────┐┌──────────────┐
-    │assistant: I'll start by mapping the handlers under …    ││ ◐ orc        │
-    │→ Read({ "path": "src/api/mod.rs" })                     ││   orchestr.  │
-    │← ok                                                     ││              │
-    │→ Grep({ "pattern": "fn handle_" })                      ││ ◐ w1·refac…  │
-    │← ok                                                     ││   worker     │
-    │assistant: Three handlers share the auth preamble …      ││  running·2m  │
-    │[answered by orc: yes, factor it out]                    ││              │
-    │→ Edit({ "path": "src/api/mod.rs", … })                  ││ ! w2·flaky…  │
-    │← ok                                                     ││   blocked    │
-    └─────────────────────────────────────────────────────────┘└──────────────┘
-     t talk   r review   x kill   R restart   ^C interrupt   1-9 tab   q quit
+## Demo
+
+End-to-end run of the FLOW integration test (`cargo test --test flow_e2e`)
+driving orc through spawn → clarify → explore → edit → verify → review →
+rework → approve → mark_done → kill, all via the deterministic `fake_claude`
+shim and a local bare-remote git push:
+
+![orc end-to-end flow](flow-e2e-greenfield.gif)
 
 ## Why
 
