@@ -22,13 +22,25 @@ cargo install --path . --force   # install global `orc`
 
 The TUI requires a real PTY — `cargo run | …` fails with `Device not configured (os error 6)`. tmux is the harness: it gives orc a PTY, and `tmux send-keys` / `tmux capture-pane` let you drive it non-interactively. tmux here is *test infrastructure for orc*, not part of orc's architecture (workers are stream-json children, not tmux — see SPEC).
 
+### The fake-claude shim — default for harness runs
+
+Real `claude` invocations cost tokens and produce non-deterministic output, so harness runs use a stream-json stand-in: the `fake_claude` binary built from `src/bin/fake_claude.rs`. Set `ORC_CLAUDE_BIN=fake_claude` (or an absolute path) and orc spawns the shim instead of real claude. The shim emits an init line, then for each user message echoes a brief assistant reply + result. No tools are called, so workers spawned via the shim won't go anywhere — but the orc tab, modals, scroll, review-without-content, exit, etc. all exercise normally.
+
+Build/install the shim alongside orc:
+
+```bash
+cargo install --path . --force --bin orc --bin fake_claude
+```
+
+Use the shim by default; only drop `ORC_CLAUDE_BIN` when you need real claude (e.g. you're verifying a change to actual worker output shape).
+
 ### Harness primitives
 
 ```bash
 # Launch orc inside a tmux session. Session name must NOT start with `orc-`
-# (orc's own startup sweep kills those).
+# (orc's own startup sweep kills those). ORC_CLAUDE_BIN points at the shim.
 TMUX= tmux new-session -d -s test-runner -x 140 -y 50 \
-  "TMUX= cargo run 2>/tmp/orc-stderr.log; echo EXIT=\$? > /tmp/orc-exit.log; sleep 90"
+  "TMUX= ORC_CLAUDE_BIN=fake_claude cargo run 2>/tmp/orc-stderr.log; echo EXIT=\$? > /tmp/orc-exit.log; sleep 90"
 
 # Wait for startup (orc brain takes a few seconds to connect).
 sleep 8
@@ -59,7 +71,7 @@ Drive the binary through whichever flows your change touches. The minimum bar:
 4. **`cargo run -- doctor` passes** with no orphans flagged.
 5. **State is sane** — `sqlite3 ~/.config/orc/state.db "select name, state from sessions"` shows what you'd expect after the run.
 
-If the change touches workers, drive a real worker spawn. That costs tokens. It also catches the bugs unit tests can't see — paste/Enter races, environment leaks, layout breakage, focus issues, modal stacking, real claude output shape.
+If the change touches the actual *content* of worker output (e.g. parsing a new event shape, markdown rendering of real claude text), drive a run without `ORC_CLAUDE_BIN` so a real claude child fires. That costs tokens. For everything else — focus, layout, scroll, modal stacking, paste/Enter races, exit cleanup — the shim is sufficient.
 
 ### Useful inspection while running
 

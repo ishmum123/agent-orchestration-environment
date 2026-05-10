@@ -101,12 +101,19 @@ impl WorkerHandle {
     }
 }
 
+/// Path to the `claude` binary to spawn. Falls back to `claude` on PATH.
+/// Tests/harness override via `ORC_CLAUDE_BIN` to a stream-json shim so
+/// runs are free and deterministic.
+pub fn claude_bin() -> String {
+    std::env::var("ORC_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+}
+
 fn build_base_command(
     model: &str,
     mcp_config_path: &PathBuf,
     system_prompt: &str,
 ) -> Command {
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(claude_bin());
     cmd.args([
         "-p",
         "--input-format",

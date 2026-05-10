@@ -60,7 +60,8 @@ enum SubCommand {
 }
 
 fn check_dependencies() -> Result<()> {
-    for dep in ["git", "claude"] {
+    let claude = worker::claude_bin();
+    for dep in ["git", claude.as_str()] {
         let status = std::process::Command::new("which")
             .arg(dep)
             .stdout(std::process::Stdio::null())
@@ -1251,7 +1252,7 @@ async fn run_doctor() -> Result<()> {
         }
     }
 
-    match std::process::Command::new("claude").arg("--version").output() {
+    match std::process::Command::new(worker::claude_bin()).arg("--version").output() {
         Ok(o) if o.status.success() => {
             let ver = String::from_utf8_lossy(&o.stdout);
             println!("\u{2713} claude: {}", ver.trim());

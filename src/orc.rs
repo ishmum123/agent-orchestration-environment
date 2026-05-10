@@ -344,7 +344,7 @@ pub async fn write_mcp_config(port: u16) -> Result<PathBuf> {
 pub async fn spawn_orc(config: &OrcConfig) -> Result<OrcProcess> {
     let prompt = system_prompt(&config.project_dir);
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(crate::worker::claude_bin());
     cmd.args([
         "-p",
         "--input-format",
