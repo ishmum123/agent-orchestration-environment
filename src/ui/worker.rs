@@ -639,17 +639,19 @@ pub fn render_event_log(
     thinking: bool,
     tick: u64,
 ) {
-    // Compute first to use its line_count for the scroll indicator.
     let mut lines = log_lines(log);
     if thinking {
         lines.push(thinking_line(tick));
     }
     let total_lines = lines.len();
 
-    let block_inner_w = area.width.saturating_sub(2);
-    let para_for_count = Paragraph::new(lines.clone())
-        .wrap(Wrap { trim: false });
-    let wrapped = para_for_count.line_count(block_inner_w) as usize;
+    let block_inner_w = area.width.saturating_sub(2) as usize;
+    // Pre-wrap into terminal rows ourselves. Paragraph's built-in
+    // Wrap+scroll has glitches under autoscroll while a worker is
+    // streaming — half-overwritten cells leak across frames. With
+    // pre-wrapped rows we render a simple slice, no internal wrap/scroll.
+    let rows = wrap_lines_to_rows(&lines, block_inner_w);
+    let wrapped = rows.len();
 
     let inner_h = area.height.saturating_sub(2) as usize;
     let max_scroll = wrapped.saturating_sub(inner_h);
@@ -668,14 +670,62 @@ pub fn render_event_log(
         return;
     }
 
-    // Force-clear inner cells first — Paragraph with Wrap+scroll can leave
-    // stray cells from prior frames (especially after tab switches).
+    // Belt-and-braces clear of inner before rendering the slice.
     frame.render_widget(Clear, inner);
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_clamped as u16, 0));
+    let visible: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(scroll_clamped)
+        .take(inner_h)
+        .collect();
+    let para = Paragraph::new(visible);
     frame.render_widget(para, inner);
+}
+
+/// Pre-wrap a list of logical Lines into terminal rows. Each output Line
+/// is exactly one row of width <= `width`. Span boundaries are preserved
+/// where possible; long spans are split mid-string at column boundaries.
+/// Empty lines round-trip as empty rows.
+pub fn wrap_lines_to_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
+    if width == 0 {
+        return lines.iter().cloned().collect();
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for src in lines {
+        let line_style = src.style;
+        let mut cur: Vec<Span<'static>> = Vec::new();
+        let mut cur_w: usize = 0;
+        let mut emitted_for_line = false;
+
+        for span in &src.spans {
+            let style = span.style;
+            let mut buf = String::new();
+            for ch in span.content.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cw > 0 && cur_w + cw > width {
+                    if !buf.is_empty() {
+                        cur.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    out.push(Line::from(std::mem::take(&mut cur)).style(line_style));
+                    cur_w = 0;
+                    emitted_for_line = true;
+                }
+                buf.push(ch);
+                cur_w += cw;
+            }
+            if !buf.is_empty() {
+                cur.push(Span::styled(buf, style));
+            }
+        }
+
+        if !cur.is_empty() || !emitted_for_line {
+            out.push(Line::from(cur).style(line_style));
+        }
+    }
+    out
 }
 
 /// Build " events  [N–M / TOTAL] " title.
@@ -720,9 +770,7 @@ fn thinking_line(tick: u64) -> Line<'static> {
 /// Used by the autoscroll path to pin the view to the bottom.
 pub fn wrapped_line_count(log: &[LogEntry], inner_width: u16) -> usize {
     let lines = log_lines(log);
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .line_count(inner_width) as usize
+    wrap_lines_to_rows(&lines, inner_width as usize).len()
 }
 
 fn render_decisions(frame: &mut Frame, area: Rect, sv: &SessionView) {

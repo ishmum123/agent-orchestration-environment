@@ -119,6 +119,10 @@ pub enum StateChange {
     QuestionResolved { session_id: String, question_id: String, answered_by: AnsweredBy },
     HookReceived { session_id: String, event: HookEvent },
     SummaryUpdated { session_id: String, summary: String },
+    /// Worker called submit_for_review. Carries the friendly name and the
+    /// review summary so the orc tab can show a single human-readable line
+    /// instead of the raw state-transition badge.
+    WorkerReviewSubmitted { session_id: String, name: String, summary: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +185,12 @@ impl StateHandle {
             })
             .await;
         rx.await.ok().flatten()
+    }
+
+    /// Broadcast a state-change directly (for derived events that don't
+    /// flow through a StateCommand).
+    pub fn broadcast(&self, change: StateChange) {
+        let _ = self.change_tx.send(change);
     }
 
     /// Subscribe to state changes.

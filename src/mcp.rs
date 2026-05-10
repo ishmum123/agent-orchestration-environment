@@ -684,6 +684,15 @@ impl McpServer {
         rx.await
             .map_err(|_| anyhow::anyhow!("state manager dropped reply"))??;
 
+        // Broadcast a friendly review-submitted event so the orc tab can
+        // render one human line ("foo ready for review: ...") instead of
+        // the raw "session abc12345: AwaitingReview" badge.
+        self.state.broadcast(crate::state::StateChange::WorkerReviewSubmitted {
+            session_id: session_id.to_string(),
+            name: session.name.clone(),
+            summary: summary.to_string(),
+        });
+
         Ok(serde_json::to_string(&serde_json::json!({
             "ok": true,
             "session_id": session_id,

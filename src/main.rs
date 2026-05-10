@@ -176,6 +176,28 @@ async fn main() -> Result<()> {
         default_panic(info);
     }));
 
+    // Redirect stderr to a log file before entering the alt-screen. While
+    // the TUI is up, raw eprintln! bytes from anywhere in the process
+    // (state.rs, mcp.rs, hooks.rs, worker.rs, panic handler tail-prints,
+    // etc.) would otherwise land on top of the ratatui buffer and leave
+    // stray characters that bleed across tab switches.
+    let stderr_log = data_dir.join("stderr.log");
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_log)
+        {
+            // Safety: dup2 with valid fds; we keep `file` alive only long
+            // enough to copy the descriptor, then drop it. The duplicated
+            // fd remains as the new stderr.
+            unsafe {
+                libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+            }
+        }
+    }
+
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableBracketedPaste)?;
@@ -243,6 +265,14 @@ async fn run_event_loop(
                     KeyAction::Quit => return Ok(()),
                     KeyAction::SendToOrc(msg) => {
                         app.push_chat(ChatRole::User, msg.clone());
+                        cleanup_idle_done_sessions(
+                            app,
+                            state_handle,
+                            worker_registry,
+                            project_dir,
+                            &msg,
+                        )
+                        .await;
                         let _ = orc_process.send(&msg).await;
                     }
                     KeyAction::SendToWorker { session_id, body } => {
@@ -982,14 +1012,31 @@ fn handle_state_change(app: &mut App, change: StateChange) {
             old: _,
             new_state,
         } => {
-            let label = state::state_label(&new_state);
-            app.update_session_state(&session_id, new_state);
-            let prefix = if session_id.len() >= 8 {
-                &session_id[..8]
-            } else {
-                &session_id
-            };
-            app.push_chat(ChatRole::System, format!("session {prefix}: {label}"));
+            // AwaitingReview gets its own friendly line via
+            // WorkerReviewSubmitted (which carries the summary). Skip the
+            // raw badge here so the user only sees one notification.
+            let suppress = matches!(&new_state, session::SessionState::AwaitingReview { .. });
+            let name = app.session_index.get(&session_id).and_then(|&i| {
+                app.sessions.get(i).map(|s| s.session.name.clone())
+            });
+            app.update_session_state(&session_id, new_state.clone());
+            if !suppress {
+                let pretty = match &new_state {
+                    session::SessionState::Done { .. } => "done".to_string(),
+                    session::SessionState::Failed { .. } => "failed".to_string(),
+                    session::SessionState::Blocked { .. } => "blocked".to_string(),
+                    session::SessionState::Running => "running".to_string(),
+                    other => state::state_label(other).to_lowercase(),
+                };
+                let who = name.unwrap_or_else(|| {
+                    if session_id.len() >= 8 {
+                        session_id[..8].to_string()
+                    } else {
+                        session_id.clone()
+                    }
+                });
+                app.push_chat(ChatRole::System, format!("{who}: {pretty}"));
+            }
         }
         StateChange::SessionModeChanged { session_id, mode } => {
             app.update_session_mode(&session_id, mode);
@@ -1054,6 +1101,14 @@ fn handle_state_change(app: &mut App, change: StateChange) {
         } => {
             app.set_session_summary(session_id, summary);
         }
+        StateChange::WorkerReviewSubmitted { name, summary, .. } => {
+            let line = if summary.is_empty() {
+                format!("{name} ready for review")
+            } else {
+                format!("{name} ready for review: {summary}")
+            };
+            app.push_chat(ChatRole::System, line);
+        }
     }
 }
 
@@ -1102,6 +1157,67 @@ fn handle_orc_event(app: &mut App, event: OrcEvent) {
             // Hide the text; show only the spinner.
             app.orc_view.is_thinking = true;
         }
+    }
+}
+
+/// Auto-cleanup idle Done sessions when the user moves on. Triggered on
+/// each new orc-bound message: any session that has been Done for ≥ 5
+/// minutes and whose name is not mentioned in the new message is killed,
+/// its worktree pruned, and its row removed from sqlite. The session's
+/// summary already lives in the orc-tab event log, so the user keeps the
+/// receipt without the dead tab.
+async fn cleanup_idle_done_sessions(
+    app: &mut App,
+    state_handle: &StateHandle,
+    workers: &WorkerRegistry,
+    project_dir: &PathBuf,
+    user_msg: &str,
+) {
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::minutes(5);
+    let msg_lower = user_msg.to_ascii_lowercase();
+
+    let candidates: Vec<(String, String, String)> = app
+        .sessions
+        .iter()
+        .filter_map(|sv| {
+            let is_done = matches!(sv.session.state, session::SessionState::Done { .. });
+            if !is_done {
+                return None;
+            }
+            let ended = sv.session.ended_at?;
+            if ended > cutoff {
+                return None;
+            }
+            let name_lower = sv.session.name.to_ascii_lowercase();
+            if !name_lower.is_empty() && msg_lower.contains(&name_lower) {
+                return None;
+            }
+            Some((
+                sv.session.id.clone(),
+                sv.session.name.clone(),
+                sv.session.worktree_path.clone(),
+            ))
+        })
+        .collect();
+
+    for (id, name, worktree) in candidates {
+        let _ = workers.kill(&id).await;
+        if !worktree.is_empty() {
+            let _ = crate::worktree::remove_worktree(
+                project_dir.to_str().unwrap_or("."),
+                std::path::Path::new(&worktree),
+                &name,
+            )
+            .await;
+        }
+        let _ = state_handle
+            .send(StateCommand::RemoveSession {
+                session_id: id.clone(),
+            })
+            .await;
+        app.orc_view
+            .push(LogEntry::System(format!("{name} cleaned up (idle > 5m)")));
     }
 }
 
