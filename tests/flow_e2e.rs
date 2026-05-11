@@ -1238,6 +1238,7 @@ fn run_flow_for_project(
     let doctor = Command::new(orc_bin)
         .arg("doctor")
         .env("HOME", &tmux.home)
+        .env("ORC_CLAUDE_BIN", fake_claude)
         .output()
         .expect("doctor run");
     let doctor_out = format!(
