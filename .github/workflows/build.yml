@@ -16,6 +16,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install tmux (required by integration tests)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
       - name: Configure git identity
         run: |
           git config --global user.email "ci@example.com"
