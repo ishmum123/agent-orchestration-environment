@@ -2,6 +2,8 @@
 
 Rust TUI tool for running parallel Claude conversations with an orchestrator.
 
+**This is a solo home project — no backward compatibility constraints anywhere.** Rename, delete, restructure, break APIs freely. There are no external users, no published versions to support, no migration paths to preserve. If something is wrong, fix it directly; don't add shims, flags, or deprecation paths.
+
 **Architecture and UX: see [SPEC.md](./SPEC.md). It is the source of truth.** Don't guess the design from code — read the spec first, then read code.
 
 ## Build & Run

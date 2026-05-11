@@ -1841,11 +1841,26 @@ async fn run_scratch_claude(
 ) -> Result<()> {
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
+    io::stdout().execute(crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+    io::stdout().execute(crossterm::cursor::MoveTo(0, 0))?;
+    let cols = crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80);
+    let pad = " ".repeat(cols.saturating_sub(36) / 2);
+    println!();
+    println!("{pad}\x1b[38;5;244m╭───────── \x1b[38;5;174mscratch claude\x1b[38;5;244m ─────────╮\x1b[0m");
+    println!("{pad}\x1b[38;5;244m│\x1b[0m       \x1b[38;5;246msealed off from orc\x1b[0m        \x1b[38;5;244m│\x1b[0m");
+    println!("{pad}\x1b[38;5;244m╰──────────────────────────────────╯\x1b[0m");
+    println!();
+    use std::io::Write;
+    io::stdout().flush().ok();
 
     let status = std::process::Command::new(worker::claude_bin())
         .current_dir(project_dir)
         .status();
 
+    io::stdout().execute(crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+    io::stdout().execute(crossterm::cursor::MoveTo(0, 0))?;
     io::stdout().execute(EnterAlternateScreen)?;
     terminal::enable_raw_mode()?;
     terminal.clear()?;
