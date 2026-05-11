@@ -87,6 +87,18 @@ pub enum StateCommand {
         session_id: String,
         summary: String,
     },
+    /// Persist a single event log entry to the DB. Fire-and-forget;
+    /// state manager just calls Database::append_event.
+    AppendEvent {
+        session_id: String,
+        kind: String,
+        payload: String,
+    },
+    /// Load all persisted events for a session in chronological order.
+    LoadEvents {
+        session_id: String,
+        reply: oneshot::Sender<Vec<(String, String)>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +184,18 @@ impl StateHandle {
     pub async fn list_sessions(&self) -> Vec<Session> {
         let (tx, rx) = oneshot::channel();
         let _ = self.send(StateCommand::ListSessions { reply: tx }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    /// Load persisted event log for a session in chronological order.
+    pub async fn load_events(&self, session_id: &str) -> Vec<(String, String)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .send(StateCommand::LoadEvents {
+                session_id: session_id.to_string(),
+                reply: tx,
+            })
+            .await;
         rx.await.unwrap_or_default()
     }
 
@@ -513,6 +537,20 @@ impl StateManager {
                     let _ = self
                         .change_tx
                         .send(StateChange::SummaryUpdated { session_id, summary });
+                }
+                StateCommand::AppendEvent {
+                    session_id,
+                    kind,
+                    payload,
+                } => {
+                    let _ = self.db.append_event(&session_id, &kind, &payload);
+                }
+                StateCommand::LoadEvents { session_id, reply } => {
+                    let events = self
+                        .db
+                        .load_events(&session_id)
+                        .unwrap_or_default();
+                    let _ = reply.send(events);
                 }
             }
         }

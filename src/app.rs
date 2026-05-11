@@ -45,6 +45,9 @@ pub enum LogEntry {
     },
     /// `[interrupted]`, `answered by orc`, `worker exited code 0`, etc.
     System(String),
+    /// Call-to-action notifications (e.g. "foo is ready for your review").
+    /// Rendered brighter than System so the user can read them.
+    Notify(String),
     TurnEnd {
         cost_usd: Option<f64>,
     },
@@ -56,6 +59,70 @@ pub enum LogEntry {
         lists: u32,
         globs: u32,
     },
+}
+
+/// Encode a LogEntry into a (kind, payload) pair for DB persistence.
+/// Payload is JSON so multi-field variants round-trip cleanly.
+pub fn entry_to_kind_payload(entry: &LogEntry) -> (String, String) {
+    use serde_json::json;
+    match entry {
+        LogEntry::UserText(t) => ("user".into(), json!({ "t": t }).to_string()),
+        LogEntry::AssistantText(t) => ("assistant".into(), json!({ "t": t }).to_string()),
+        LogEntry::Thinking(t) => ("thinking".into(), json!({ "t": t }).to_string()),
+        LogEntry::OrcInstruction(t) => ("orc_instruction".into(), json!({ "t": t }).to_string()),
+        LogEntry::ToolUse { name, input_summary } => (
+            "tool_use".into(),
+            json!({ "name": name, "input": input_summary }).to_string(),
+        ),
+        LogEntry::ToolResult { text, is_error } => (
+            "tool_result".into(),
+            json!({ "text": text, "is_error": is_error }).to_string(),
+        ),
+        LogEntry::System(t) => ("system".into(), json!({ "t": t }).to_string()),
+        LogEntry::Notify(t) => ("notify".into(), json!({ "t": t }).to_string()),
+        LogEntry::TurnEnd { cost_usd } => (
+            "turn_end".into(),
+            json!({ "cost_usd": cost_usd }).to_string(),
+        ),
+        LogEntry::Exploration { reads, greps, lists, globs } => (
+            "exploration".into(),
+            json!({ "reads": reads, "greps": greps, "lists": lists, "globs": globs }).to_string(),
+        ),
+    }
+}
+
+/// Decode a (kind, payload) pair back into a LogEntry. Unknown kinds
+/// fall back to a System entry preserving the raw payload.
+pub fn kind_payload_to_entry(kind: &str, payload: &str) -> LogEntry {
+    let v: serde_json::Value = serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| -> String { v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string() };
+    let b = |k: &str| -> bool { v.get(k).and_then(|x| x.as_bool()).unwrap_or(false) };
+    let u = |k: &str| -> u32 { v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u32 };
+    let f = |k: &str| -> Option<f64> { v.get(k).and_then(|x| x.as_f64()) };
+    match kind {
+        "user" => LogEntry::UserText(s("t")),
+        "assistant" => LogEntry::AssistantText(s("t")),
+        "thinking" => LogEntry::Thinking(s("t")),
+        "orc_instruction" => LogEntry::OrcInstruction(s("t")),
+        "tool_use" => LogEntry::ToolUse {
+            name: s("name"),
+            input_summary: s("input"),
+        },
+        "tool_result" => LogEntry::ToolResult {
+            text: s("text"),
+            is_error: b("is_error"),
+        },
+        "system" => LogEntry::System(s("t")),
+        "notify" => LogEntry::Notify(s("t")),
+        "turn_end" => LogEntry::TurnEnd { cost_usd: f("cost_usd") },
+        "exploration" => LogEntry::Exploration {
+            reads: u("reads"),
+            greps: u("greps"),
+            lists: u("lists"),
+            globs: u("globs"),
+        },
+        _ => LogEntry::System(payload.to_string()),
+    }
 }
 
 // Legacy chat-message API kept as a thin shim for existing callsites.
@@ -188,6 +255,27 @@ pub enum Modal {
         name: String,
     },
     ConfirmQuit,
+    /// Offered after the user submits a review approval. Enter merges
+    /// the worker's branch into `target` (the project's main branch);
+    /// Esc leaves the branch alone.
+    ConfirmMerge {
+        session_id: String,
+        name: String,
+        branch: String,
+        target: String,
+    },
+    /// Shown on startup when one or more workers were Running at the
+    /// previous orc exit. The user picks whether to restart them all
+    /// (their claude processes did not survive).
+    ResumeRunning {
+        names: Vec<String>,
+    },
+    /// Offered after a successful merge when the project has an
+    /// `origin` remote. Enter pushes; Esc skips.
+    ConfirmPush {
+        branch: String,
+        target: String,
+    },
     Help,
 }
 
@@ -217,6 +305,11 @@ pub struct App {
 
     pub should_quit: bool,
     pub tick: u64,
+    /// Session ids that reached a terminal state (Done / Failed) and
+    /// should be fully cleaned up (kill child, drop worktree, delete db
+    /// rows). Drained by the main loop after each frame so UI logic
+    /// stays sync-only.
+    pub pending_cleanup: Vec<String>,
     /// First half of a `gg` chord (vim-style jump-to-top). Set by `g`,
     /// consumed by next key. Cleared on any other key.
     pub pending_g: bool,
@@ -240,6 +333,7 @@ impl App {
             should_quit: false,
             tick: 0,
             pending_g: false,
+            pending_cleanup: Vec::new(),
         }
     }
 
@@ -413,14 +507,30 @@ impl App {
     }
 
     /// Append a structured log entry to a worker's event log.
+    /// Also persist via the StateHandle if available so the events box
+    /// survives an orc restart for Running / AwaitingReview workers.
     pub fn push_log(&mut self, session_id: &str, entry: LogEntry) {
         if let Some(&idx) = self.session_index.get(session_id) {
             let log = &mut self.sessions[idx].event_log;
-            log.push(entry);
+            log.push(entry.clone());
             if log.len() > 5000 {
                 let drop = log.len() - 5000;
                 log.drain(0..drop);
             }
+        }
+        if let Some(handle) = &self.state_handle {
+            let (kind, payload) = entry_to_kind_payload(&entry);
+            let h = handle.clone();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                let _ = h
+                    .send(crate::state::StateCommand::AppendEvent {
+                        session_id: sid,
+                        kind,
+                        payload,
+                    })
+                    .await;
+            });
         }
     }
 
@@ -537,13 +647,34 @@ impl App {
     pub fn elapsed_str(session: &Session) -> String {
         let elapsed = chrono::Utc::now()
             .signed_duration_since(session.created_at)
-            .num_seconds();
-        if elapsed < 60 {
-            format!("{elapsed}s")
-        } else {
-            format!("{}m", elapsed / 60)
-        }
+            .num_seconds()
+            .max(0) as u64;
+        format_elapsed(elapsed)
     }
+}
+
+/// Compact elapsed-time formatter:
+///   <60s          → "Ns"        e.g. "23s"
+///   <60min        → "Mm"        e.g. "1m", "47m"   (no seconds — once a
+///                                                    minute has passed,
+///                                                    seconds are noise)
+///   <24h          → "HhMm"      e.g. "3h05m"
+///   ≥24h          → "Dd"        e.g. "2d"
+pub fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return format!("{hours}h{rem_mins:02}m");
+    }
+    let days = hours / 24;
+    format!("{days}d")
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +685,35 @@ impl App {
 mod tests {
     use super::*;
     use crate::session::{BlockKind, SessionMode};
+
+    #[test]
+    fn elapsed_format_seconds() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59), "59s");
+    }
+
+    #[test]
+    fn elapsed_format_minutes_drops_seconds() {
+        // Once a minute has passed, seconds are noise — show only the
+        // minute count regardless of remainder.
+        assert_eq!(format_elapsed(60), "1m");
+        assert_eq!(format_elapsed(83), "1m");
+        assert_eq!(format_elapsed(599), "9m");
+        assert_eq!(format_elapsed(600), "10m");
+        assert_eq!(format_elapsed(3540), "59m");
+    }
+
+    #[test]
+    fn elapsed_format_hours() {
+        assert_eq!(format_elapsed(3600), "1h00m");
+        assert_eq!(format_elapsed(7325), "2h02m");
+    }
+
+    #[test]
+    fn elapsed_format_days() {
+        assert_eq!(format_elapsed(86_400), "1d");
+        assert_eq!(format_elapsed(2 * 86_400 + 3600), "2d");
+    }
 
     fn test_session(id: &str, name: &str) -> Session {
         Session {

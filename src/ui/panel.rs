@@ -31,6 +31,7 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
     // Orc card (always first).
     let focused = matches!(app.focused_tab, TabId::Orc);
     let orc_badge = if app.orc_view.alive { "◐" } else { "✗" };
+    let orc_color = if app.orc_view.alive { Color::Cyan } else { Color::Red };
     let orc_summary = app
         .session_summary("orc")
         .unwrap_or_else(|| "orchestrator".to_string());
@@ -39,10 +40,11 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
         &mut lines,
         focused,
         orc_badge,
-        Color::Cyan,
-        &name_with_model("orc", &app.orc_view.model),
+        orc_color,
+        "orc",
+        &app.orc_view.model,
         &orc_summary,
-        "alive",
+        if app.orc_view.alive { "" } else { "exited" },
         &elapsed_str_secs(app.started_at.elapsed().as_secs()),
         orc_ctx,
         inner_w,
@@ -53,8 +55,10 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
         let is_focused = matches!(app.focused_tab, TabId::Worker(i) if i == idx);
         let (badge, color) = App::state_badge(&sv.session.state);
         let elapsed = App::elapsed_str(&sv.session);
+        // Only show a state tag when the state isn't "running" — running
+        // is already encoded in the badge.
         let state_label = match &sv.session.state {
-            crate::session::SessionState::Running => "running",
+            crate::session::SessionState::Running => "",
             crate::session::SessionState::Blocked { .. } => "blocked",
             crate::session::SessionState::AwaitingReview { .. } => "review",
             crate::session::SessionState::Done { .. } => "done",
@@ -69,7 +73,8 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
             is_focused,
             badge,
             color,
-            &name_with_model(&sv.session.name, &sv.session.model),
+            &sv.session.name,
+            &sv.session.model,
             &summary,
             state_label,
             &elapsed,
@@ -84,6 +89,17 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(para, inner);
 }
 
+/// Render a 4-5 line agent card. Layout:
+///
+///   ▌ ◐ {name}                              [{state-tag-if-not-running}]
+///   ▌   {model} · {elapsed} [· {tokens} · {pct}%]
+///   ▌   {summary l1}
+///   ▌   {summary l2}     (only when summary wraps)
+///   [blank]
+///
+/// Name always lives on line 1 by itself (truncated with `…` only if it
+/// itself overflows the panel width). Model/elapsed/context always live
+/// on line 2 so they're never elided by a long name.
 #[allow(clippy::too_many_arguments)]
 fn push_card(
     lines: &mut Vec<Line<'static>>,
@@ -91,6 +107,7 @@ fn push_card(
     badge: &str,
     badge_color: Color,
     name: &str,
+    model: &str,
     summary: &str,
     state_label: &str,
     elapsed: &str,
@@ -103,16 +120,18 @@ fn push_card(
     } else {
         Style::default()
     };
-    let name_style = if focused {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    let name_style = Style::default().add_modifier(Modifier::BOLD);
 
-    // Line 1: bar + space + badge + space + name. bar(1)+space(1)+badge(1)+space(1) = 4 cols.
-    let name_avail = width.saturating_sub(4);
-    let name_trunc = truncate(name, name_avail);
-    lines.push(Line::from(vec![
+    let show_state = !state_label.is_empty();
+    let state_w = if show_state { state_label.chars().count() + 1 } else { 0 };
+    let prefix_w = 4; // bar(1) sp(1) badge(1) sp(1)
+
+    // ---- Line 1: ▌ badge name [pad] state-tag ----
+    let name_avail = width.saturating_sub(prefix_w).saturating_sub(state_w);
+    let name_trunc = truncate(name, name_avail.max(1));
+    let used = prefix_w + name_trunc.chars().count();
+    let pad = width.saturating_sub(used + state_w);
+    let mut row1: Vec<Span<'static>> = vec![
         Span::styled(bar.to_string(), bar_style),
         Span::raw(" "),
         Span::styled(
@@ -123,57 +142,66 @@ fn push_card(
         ),
         Span::raw(" "),
         Span::styled(name_trunc, name_style),
-    ]));
-
-    // Lines 2-3: summary truncated to two lines.
-    let avail = width.saturating_sub(4); // 2-char indent + bar + space
-    let (s1, s2) = wrap_two(summary, avail);
-    lines.push(Line::from(vec![
-        Span::styled(bar.to_string(), bar_style),
-        Span::raw("   "),
-        Span::styled(s1, Style::default().fg(Color::Gray)),
-    ]));
-    if !s2.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(bar.to_string(), bar_style),
-            Span::raw("   "),
-            Span::styled(s2, Style::default().fg(Color::Gray)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled(bar.to_string(), bar_style),
-            Span::raw("   "),
-        ]));
-    }
-
-    // Line 4: state · elapsed [· Nk · pct% ⚠]. Context segment only shown
-    // when occupancy crosses the warn threshold; ⚠ color escalates at the
-    // alarm threshold. claude auto-compacts at 50%, so the indicator
-    // climbs and then drops on its own.
-    let state_truncated = truncate(state_label, avail.saturating_sub(2));
-    let mut spans = vec![
-        Span::styled(bar.to_string(), bar_style),
-        Span::raw("   "),
-        Span::styled(state_truncated.clone(), Style::default().fg(badge_color)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
     ];
-    let used_so_far = state_truncated.chars().count() + 3;
-    if let Some(ctx) = ctx {
-        let ctx_str = format!(" · {} · {}%", ctx.tokens_label, ctx.pct);
-        let glyph = " ⚠";
-        let ctx_room = avail.saturating_sub(used_so_far + ctx_str.chars().count() + glyph.chars().count());
-        let elapsed_truncated = truncate(elapsed, ctx_room);
-        spans.push(Span::styled(elapsed_truncated, Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(ctx_str, Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(glyph.to_string(), Style::default().fg(ctx.glyph_color).add_modifier(Modifier::BOLD)));
-    } else {
-        let elapsed_room = avail.saturating_sub(used_so_far);
-        let elapsed_truncated = truncate(elapsed, elapsed_room);
-        spans.push(Span::styled(elapsed_truncated, Style::default().fg(Color::DarkGray)));
+    if show_state {
+        row1.push(Span::raw(" ".repeat(pad)));
+        row1.push(Span::styled(
+            state_label.to_string(),
+            Style::default().fg(badge_color).add_modifier(Modifier::BOLD),
+        ));
     }
-    lines.push(Line::from(spans));
+    lines.push(Line::from(row1));
 
-    // Blank separator
+    // ---- Line 2: ▌   model · elapsed [· tokens · pct%] ----
+    let mut row2: Vec<Span<'static>> = vec![
+        Span::styled(bar.to_string(), bar_style),
+        Span::raw("   "),
+    ];
+    if !model.is_empty() {
+        row2.push(Span::styled(
+            model.to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        row2.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+    }
+    row2.push(Span::styled(
+        elapsed.to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if let Some(ctx) = ctx {
+        row2.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        row2.push(Span::styled(
+            format!("{}", ctx.tokens_label),
+            Style::default().fg(Color::DarkGray),
+        ));
+        row2.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        row2.push(Span::styled(
+            format!("{}%", ctx.pct),
+            Style::default().fg(ctx.glyph_color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(row2));
+
+    // -------------------- Summary (up to 2 wrapped lines) --------------------
+    let summary_avail = width.saturating_sub(4);
+    let collapsed: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !collapsed.is_empty() && summary_avail > 0 {
+        let (s1, s2) = wrap_two(&collapsed, summary_avail);
+        lines.push(Line::from(vec![
+            Span::styled(bar.to_string(), bar_style),
+            Span::raw("   "),
+            Span::styled(s1, Style::default().fg(Color::Gray)),
+        ]));
+        if !s2.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(bar.to_string(), bar_style),
+                Span::raw("   "),
+                Span::styled(s2, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+
+    // Blank separator between cards.
     lines.push(Line::from(""));
 }
 
@@ -267,20 +295,31 @@ impl std::fmt::Display for TokensLabel {
     }
 }
 
+/// Context-occupancy display threshold. Below 20% we hide the indicator
+/// entirely — the agent has plenty of room and the column is just noise.
+/// At 20%+ we surface it (DarkGray), escalating to Yellow at the warn
+/// threshold and Red near auto-compaction.
+const CTX_SHOW_PCT: u32 = 20;
+
 fn context_pct(tokens: Option<u64>, model: &str) -> Option<ContextDisplay> {
     let t = tokens?;
+    if t == 0 {
+        return None;
+    }
     let cap = crate::worker::context_cap_for(model);
     if cap == 0 {
         return None;
     }
     let pct = ((t as u128 * 100) / cap as u128) as u32;
-    if pct < CTX_WARN_PCT {
+    if pct < CTX_SHOW_PCT {
         return None;
     }
     let glyph_color = if pct >= CTX_ALARM_PCT {
         Color::Red
-    } else {
+    } else if pct >= CTX_WARN_PCT {
         Color::Yellow
+    } else {
+        Color::DarkGray
     };
     Some(ContextDisplay {
         tokens_label: TokensLabel(t),
@@ -298,11 +337,7 @@ fn name_with_model(name: &str, model: &str) -> String {
 }
 
 fn elapsed_str_secs(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m", secs / 60)
-    }
+    crate::app::format_elapsed(secs)
 }
 
 #[cfg(test)]
@@ -404,13 +439,25 @@ mod tests {
             .unwrap();
         let s = buf_text(&terminal);
         assert!(s.contains("explorer"), "{}", s);
-        assert!(s.contains("running"), "{}", s);
+        // Running sessions encode state in the ◐ badge; the word "running"
+        // is redundant and intentionally not rendered.
+        assert!(s.contains("◐"), "{}", s);
     }
 
     #[test]
-    fn context_pct_hidden_below_warn() {
-        // 200k of 1M opus = 20%, below 30% warn threshold.
-        assert!(context_pct(Some(200_000), "opus").is_none());
+    fn context_pct_dim_at_show_threshold() {
+        // 20% is the show threshold — surface, DarkGray.
+        let d = context_pct(Some(200_000), "opus").expect("shown");
+        assert_eq!(d.pct, 20);
+        assert_eq!(d.glyph_color, Color::DarkGray);
+    }
+
+    #[test]
+    fn context_pct_hidden_below_show_threshold() {
+        // 19% (190k of 1M opus) — hidden.
+        assert!(context_pct(Some(190_000), "opus").is_none());
+        // And of course tiny values.
+        assert!(context_pct(Some(500), "opus").is_none());
     }
 
     #[test]

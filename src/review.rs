@@ -361,7 +361,7 @@ impl ReviewState {
             overall: None,
             view_mode: ViewMode::Diff,
             worktree_path,
-            whole_file_scroll: 0,
+            whole_file_scroll: usize::MAX,
         }
     }
 
@@ -370,12 +370,22 @@ impl ReviewState {
             ViewMode::Diff => ViewMode::WholeFile,
             ViewMode::WholeFile => ViewMode::Diff,
         };
-        // Reset paged-scroll on each entry; cursor anchors first frame.
-        self.whole_file_scroll = 0;
+        // Re-anchor on cursor each entry. usize::MAX is the "not yet
+        // anchored" sentinel the renderer recognises.
+        self.whole_file_scroll = usize::MAX;
     }
 
     /// Page-scroll the WholeFile view by `rows` (positive = down).
+    /// Operates on the absolute scroll position; the first J/K press
+    /// after entering the view promotes the cursor-anchored position
+    /// (rendered as `usize::MAX` sentinel) into a concrete row number.
     pub fn whole_file_page(&mut self, rows: isize) {
+        // On the first paging keystroke we don't have a concrete scroll
+        // value yet — the renderer was centering on the cursor. Promote
+        // to 0 first; the next render clamps to max_scroll anyway.
+        if self.whole_file_scroll == usize::MAX {
+            self.whole_file_scroll = 0;
+        }
         if rows >= 0 {
             self.whole_file_scroll =
                 self.whole_file_scroll.saturating_add(rows as usize);

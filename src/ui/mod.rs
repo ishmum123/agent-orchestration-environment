@@ -90,18 +90,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// Pin scroll. If a tab is sticky-to-bottom, set scroll to the tail.
 /// If not sticky but the user has scrolled down to the bottom, re-engage
 /// stick (so subsequent new content keeps following).
-fn autoscroll(app: &mut App, _content_area: Rect, inner_w: u16, inner_h: usize) {
+fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
     let tabs: Vec<TabId> = std::iter::once(TabId::Orc)
         .chain((0..app.sessions.len()).map(TabId::Worker))
         .collect();
 
     for tab in tabs {
-        let log_ref: &[crate::app::LogEntry] = match tab {
-            TabId::Orc => &app.orc_view.event_log,
-            TabId::Worker(i) => &app.sessions[i].event_log,
+        // Worker tabs render a task banner and a decisions strip that
+        // consume rows from content_area before the events block.  Match
+        // render_worker's Layout so max_scroll here equals the one computed
+        // inside render_event_log.
+        let (effective_inner_h, wrapped) = match tab {
+            TabId::Orc => {
+                let wrapped = worker::wrapped_line_count(&app.orc_view.event_log, inner_w);
+                (inner_h, wrapped)
+            }
+            TabId::Worker(i) => {
+                let sv = &app.sessions[i];
+                let task_is_empty = sv.session.task.trim().is_empty();
+                let task_h: usize = if task_is_empty || content_area.height < 6 { 0 } else { 1 };
+                let dec_count = sv.permissions.len().min(8);
+                let dec_h: usize = if dec_count > 0 { dec_count + 2 } else { 0 };
+                let effective = inner_h.saturating_sub(task_h + dec_h);
+                let wrapped = worker::wrapped_line_count(&sv.event_log, inner_w);
+                (effective, wrapped)
+            }
         };
-        let wrapped = worker::wrapped_line_count(log_ref, inner_w);
-        let max = wrapped.saturating_sub(inner_h);
+        let max = wrapped.saturating_sub(effective_inner_h);
         let stick = app.stick_to_bottom(tab);
         let cur = app.scroll_pos(tab);
 
@@ -115,8 +130,20 @@ fn autoscroll(app: &mut App, _content_area: Rect, inner_w: u16, inner_h: usize) 
     }
 }
 
-/// Render the orc tab as an event-log peer to worker tabs.
+/// Render the orc tab as an event-log peer to worker tabs. On a fresh
+/// session (only system bootstrap lines, no user/assistant content yet),
+/// show a welcome panel instead of two cryptic bracket lines.
 fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::app::LogEntry;
+    let has_real_content = app
+        .orc_view
+        .event_log
+        .iter()
+        .any(|e| !matches!(e, LogEntry::System(_)));
+    if !has_real_content {
+        render_orc_welcome(frame, area, app);
+        return;
+    }
     let scroll = app.scroll_pos(TabId::Orc);
     worker::render_event_log(
         frame,
@@ -128,9 +155,109 @@ fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Minimal one-line header showing the focused entity.
+/// Centred welcome panel inside the events frame. Shown on first paint
+/// when the orchestrator has not yet received any work.
+fn render_orc_welcome(frame: &mut Frame, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders};
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" events ", Style::default().fg(Color::DarkGray)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 4 || inner.width < 20 {
+        return;
+    }
+
+    let model = if app.orc_view.model.is_empty() {
+        "opus".to_string()
+    } else {
+        app.orc_view.model.clone()
+    };
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  ◐ orc",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  · {model}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  the orchestrator is ready. give it a task and it will plan,",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "  delegate to workers, and report back.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "c",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  chat with orc (give it a task)", Style::default()),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "?",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  show all keys", Style::default()),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  quit", Style::default()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  workers spawn into their own git worktrees. you read their tabs;",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  you intervene with c, x, R, r — never with raw shell access.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("project: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.project_dir.display().to_string(),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One-line header. Left: focused entity (badge + name + state hint).
+/// Right: project basename + worker tally (so multi-orc instances are
+/// distinguishable at a glance).
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let line = match app.focused_tab {
+    use crate::session::{BlockKind, SessionState};
+
+    let mut left: Vec<Span<'static>> = match app.focused_tab {
         TabId::Orc => {
             let badge = if app.orc_view.alive { "◐" } else { "✗" };
             let badge_color = if app.orc_view.alive {
@@ -138,7 +265,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Color::Red
             };
-            Line::from(vec![
+            vec![
                 Span::raw(" "),
                 Span::styled(
                     badge.to_string(),
@@ -148,12 +275,23 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::raw(" "),
                 Span::styled("orc", Style::default().add_modifier(Modifier::BOLD)),
-            ])
+            ]
         }
         TabId::Worker(idx) => {
             if let Some(sv) = app.sessions.get(idx) {
                 let (badge, color) = App::state_badge(&sv.session.state);
-                Line::from(vec![
+                let state_hint = match &sv.session.state {
+                    SessionState::Running => None,
+                    SessionState::Blocked { kind, .. } => Some(match kind {
+                        BlockKind::Permission => "blocked: permission",
+                        BlockKind::OrcDecision => "blocked: orc",
+                        BlockKind::UserInput => "blocked: question",
+                    }),
+                    SessionState::AwaitingReview { .. } => Some("awaiting review"),
+                    SessionState::Done { .. } => Some("done"),
+                    SessionState::Failed { .. } => Some("failed"),
+                };
+                let mut spans = vec![
                     Span::raw(" "),
                     Span::styled(
                         badge.to_string(),
@@ -164,13 +302,107 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                         sv.session.name.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                ])
+                ];
+                if let Some(hint) = state_hint {
+                    let hint_style = match &sv.session.state {
+                        SessionState::AwaitingReview { .. } => Style::default()
+                            .fg(Color::Black)
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD),
+                        SessionState::Failed { .. } => Style::default()
+                            .fg(Color::Black)
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD),
+                        _ => Style::default().fg(color),
+                    };
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(format!(" {hint} "), hint_style));
+                    if matches!(&sv.session.state, SessionState::AwaitingReview { .. }) {
+                        spans.push(Span::styled(
+                            "  press r",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    } else if matches!(&sv.session.state, SessionState::Failed { .. }) {
+                        spans.push(Span::styled(
+                            "  press R to restart",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
+                spans
             } else {
-                Line::from("")
+                vec![Span::raw("")]
             }
         }
     };
-    frame.render_widget(Paragraph::new(line), area);
+
+    // Right side: project basename · worker tally.
+    let project_name = app
+        .project_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut tally_parts: Vec<(String, Color)> = Vec::new();
+    let n = app.sessions.len();
+    if n > 0 {
+        tally_parts.push((format!("{n} worker{}", if n == 1 { "" } else { "s" }), Color::DarkGray));
+        let mut review = 0usize;
+        let mut blocked = 0usize;
+        let mut failed = 0usize;
+        for sv in &app.sessions {
+            match &sv.session.state {
+                SessionState::AwaitingReview { .. } => review += 1,
+                SessionState::Blocked { .. } => blocked += 1,
+                SessionState::Failed { .. } => failed += 1,
+                _ => {}
+            }
+        }
+        if review > 0 {
+            tally_parts.push((format!("◑ {review}"), Color::Magenta));
+        }
+        if blocked > 0 {
+            tally_parts.push((format!("! {blocked}"), Color::Yellow));
+        }
+        if failed > 0 {
+            tally_parts.push((format!("✗ {failed}"), Color::Red));
+        }
+    }
+
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if !project_name.is_empty() {
+        right.push(Span::styled(
+            project_name,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    }
+    for (i, (text, color)) in tally_parts.into_iter().enumerate() {
+        if i == 0 && !right.is_empty() {
+            right.push(Span::styled("  ", Style::default()));
+        } else if i > 0 {
+            right.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        // First entry is plain "N workers" — keep it dim. Subsequent
+        // attention-grabbing badges (review/blocked/failed) get bold so the
+        // eye finds them immediately when there are many tabs.
+        let style = if i == 0 {
+            Style::default().fg(color)
+        } else {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        right.push(Span::styled(text, style));
+    }
+    right.push(Span::raw(" "));
+
+    let total_w = area.width as usize;
+    let left_w: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans = std::mem::take(&mut left);
+    if total_w > left_w + right_w {
+        spans.push(Span::raw(" ".repeat(total_w - left_w - right_w)));
+        spans.extend(right);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Bottom action bar — context-sensitive keybinds.
@@ -194,57 +426,124 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // In review mode the global keymap is replaced by a review keymap;
+    // show only the review keys so the user doesn't see disabled hints.
+    if app.review.is_some() {
+        let review_parts: &[(&str, &str)] = &[
+            ("a", "approve & merge"),
+            ("c", "comment"),
+            ("s", "submit with comments"),
+            ("o", "open file"),
+            ("e", "editor"),
+            ("J/K", "next/prev hunk"),
+            ("[ ]", "prev/next file"),
+            ("j/k", "line up/down"),
+            ("q/esc", "close review"),
+        ];
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(review_parts.len() * 4 + 1);
+        spans.push(Span::raw(" "));
+        let key_style = Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD);
+        let lbl_style = Style::default().fg(Color::DarkGray);
+        let sep_style = Style::default().fg(Color::DarkGray);
+        for (i, (k, lbl)) in review_parts.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("   ", sep_style));
+            }
+            spans.push(Span::styled(k.to_string(), key_style));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(lbl.to_string(), lbl_style));
+        }
+        let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
+        frame.render_widget(bar, area);
+        return;
+    }
+
     use crate::session::SessionState;
 
-    let mut parts: Vec<&'static str> = Vec::new();
-    parts.push("t talk");
-    parts.push("1-9 tab");
+    // Build hints. `1-9 tab` only makes sense once at least one worker
+    // exists. Worker-state-specific keys come first so the most relevant
+    // action is closest to the eye.
+    let mut parts: Vec<(&'static str, &'static str)> = Vec::new();
+    parts.push(("c", "chat"));
 
     match app.focused_tab {
         TabId::Orc => {
-            parts.push("^C interrupt");
-            parts.push("G end");
+            // If a worker is awaiting review, surface `r review` on the
+            // orc tab so the user can act from there without first
+            // hunting for the right worker tab.
+            let any_review = app.sessions.iter().any(|sv| {
+                matches!(sv.session.state, SessionState::AwaitingReview { .. })
+            });
+            if any_review {
+                parts.push(("r", "review"));
+            }
+            parts.push(("^C", "interrupt"));
         }
         TabId::Worker(idx) => {
             if let Some(sv) = app.sessions.get(idx) {
                 match &sv.session.state {
                     SessionState::AwaitingReview { .. } => {
-                        parts.push("r review");
-                        parts.push("c control");
-                        parts.push("k kill");
-                        parts.push("G end");
+                        parts.push(("r", "review"));
+                        parts.push(("⏎", "control"));
+                        parts.push(("x", "kill"));
                     }
                     SessionState::Failed { .. } => {
-                        parts.push("R restart");
-                        parts.push("k kill");
-                        parts.push("G end");
+                        parts.push(("R", "restart"));
+                        parts.push(("x", "kill"));
                     }
                     SessionState::Done { .. } => {
-                        parts.push("k kill");
-                        parts.push("G end");
+                        parts.push(("x", "kill"));
                     }
                     SessionState::Running | SessionState::Blocked { .. } => {
-                        parts.push("c control");
-                        parts.push("k kill");
-                        parts.push("^C interrupt");
-                        parts.push("G end");
+                        parts.push(("⏎", "control"));
+                        parts.push(("^C", "interrupt"));
+                        parts.push(("x", "kill"));
                     }
                 }
             }
         }
     }
 
-    parts.push("q quit");
-    parts.push("? help");
+    if !app.sessions.is_empty() {
+        parts.push(("Tab", "next"));
+        if app.sessions.len() >= 1 {
+            parts.push(("1-9", "jump"));
+        }
+        // Show `n` only when at least one worker needs attention —
+        // otherwise the key would be a no-op and is just clutter.
+        let any_attention = app.sessions.iter().any(|sv| {
+            matches!(
+                sv.session.state,
+                SessionState::AwaitingReview { .. }
+                    | SessionState::Failed { .. }
+                    | SessionState::Blocked { .. }
+            )
+        });
+        if any_attention {
+            parts.push(("n", "next ⚡"));
+        }
+    }
+    parts.push(("G", "end"));
+    parts.push(("?", "help"));
+    parts.push(("q", "quit"));
 
-    let hints = parts.join("   ");
+    // Render with subtle styling: keys in a brighter dim, descriptions
+    // in a fainter dim so the eye groups (key, label) pairs.
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(parts.len() * 4 + 1);
+    spans.push(Span::raw(" "));
+    let key_style = Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD);
+    let lbl_style = Style::default().fg(Color::DarkGray);
+    let sep_style = Style::default().fg(Color::DarkGray);
+    for (i, (k, lbl)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", sep_style));
+        }
+        spans.push(Span::styled(k.to_string(), key_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(lbl.to_string(), lbl_style));
+    }
 
-    let bar = Paragraph::new(Line::from(vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(hints, Style::default().fg(Color::DarkGray)),
-    ]))
-    .style(Style::default().bg(Color::Black));
-
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     frame.render_widget(bar, area);
 }
 

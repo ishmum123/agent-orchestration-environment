@@ -1,2 +1,4 @@
 /target
 .claude/
+# per-project orc state (DB, hooks socket, MCP config, stderr/panic logs)
+.orc/

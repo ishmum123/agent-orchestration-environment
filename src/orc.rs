@@ -310,6 +310,18 @@ You have MCP tools to manage worker sessions:
 6. If a worker is stuck, instruct it or kill and respawn.
 7. Report results to the user.
 
+## Silent internal-status messages
+
+The harness will sometimes inject messages framed as
+`[internal status — do NOT reply or narrate to the user; the UI has already notified them]`.
+
+When you receive one of these:
+
+- **Ingest the fact internally.** Treat it as new context for future decisions.
+- **Do not write ANY assistant text in response.** Not a sentence, not an acknowledgement, not a recap. The user already sees the same fact in the UI; echoing it duplicates information on their screen.
+- **Only act** if the new status changes what you must do (e.g., spawn the next worker, or escalate via `ask_user`). If you do act, the action itself (the tool call) is the response — still no narrative chat.
+- It is correct and expected for your turn to end with zero assistant text after an internal-status message.
+
 ## Rules
 
 - Always plan before spawning. Call update_task_graph first.
@@ -332,10 +344,12 @@ Working directory: {project_dir}
 
 /// Generate MCP config file for the orc brain (HTTP transport).
 /// The MCP server must already be running on the given port.
-/// Returns the path to the generated config file.
-pub async fn write_mcp_config(port: u16) -> Result<PathBuf> {
+/// Returns the path to the generated config file. The caller passes
+/// the per-project `.orc/` directory so config lives with the project.
+pub async fn write_mcp_config(data_dir: &Path, port: u16) -> Result<PathBuf> {
     let config = crate::mcp::generate_mcp_config(port);
-    let config_path = std::env::temp_dir().join("orc-mcp-config.json");
+    tokio::fs::create_dir_all(data_dir).await.ok();
+    let config_path = data_dir.join("mcp-config.json");
     tokio::fs::write(&config_path, serde_json::to_string_pretty(&config)?).await?;
     Ok(config_path)
 }
@@ -419,7 +433,8 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_config_written_http() {
-        let path = write_mcp_config(9999).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_mcp_config(tmp.path(), 9999).await.unwrap();
         assert!(path.exists());
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();

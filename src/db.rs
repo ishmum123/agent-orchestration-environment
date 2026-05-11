@@ -145,6 +145,19 @@ impl Database {
                 ended_at TEXT
             );
 
+            -- Persistent worker event log, used to restore the events
+            -- box when orc is reopened on a project that still has
+            -- Running / AwaitingReview sessions.
+            CREATE TABLE IF NOT EXISTS session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_events_session_id
+                ON session_events(session_id, id);
+
             CREATE TABLE IF NOT EXISTS state_transitions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -263,6 +276,10 @@ impl Database {
             "DELETE FROM reviews WHERE session_id = ?1",
             params![id],
         )?;
+        self.conn.execute(
+            "DELETE FROM session_events WHERE session_id = ?1",
+            params![id],
+        )?;
         self.conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         Ok(())
@@ -282,6 +299,38 @@ impl Database {
             self.delete_session(id)?;
         }
         Ok(ids.len())
+    }
+
+    // --- session_events: persistent worker event log ---
+
+    /// Append a single event to a session's persistent log.
+    /// `kind` is a short tag (e.g. "user", "assistant", "tool_use",
+    /// "tool_result", "system", "notify", "orc_instruction"); payload is
+    /// the json-encoded body so we can round-trip rich entries.
+    pub fn append_event(&self, session_id: &str, kind: &str, payload: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO session_events (session_id, kind, payload, at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, kind, payload, now],
+        )?;
+        Ok(())
+    }
+
+    /// Return all events for a session in chronological order.
+    pub fn load_events(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, payload FROM session_events
+             WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Session> {

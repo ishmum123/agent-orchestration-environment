@@ -24,7 +24,7 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -79,19 +79,28 @@ fn check_dependencies() -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Resolve the project dir up-front so subcommands like doctor /
+    // clean can inspect the same per-project `.orc/` directory the
+    // main TUI uses.
+    let project_dir = std::fs::canonicalize(&cli.project)?;
+
     if let Some(SubCommand::Doctor) = &cli.command {
-        return run_doctor().await;
+        return run_doctor(&project_dir).await;
     }
     if let Some(SubCommand::Clean) = &cli.command {
-        return run_clean().await;
+        return run_clean(&project_dir).await;
     }
 
     check_dependencies()?;
 
-    let project_dir = std::fs::canonicalize(&cli.project)?;
     let project_str = project_dir.to_string_lossy().to_string();
 
-    let data_dir = dirs_data_dir().join("orc");
+    // Per-project data dir lives inside the project itself (`.orc/`).
+    // This avoids cross-project worker-name collisions and means the
+    // db/hooks-socket/stderr-log/mcp-config travel with the repo —
+    // open the project from another machine, the state's there.
+    // Recommend gitignoring it via `echo .orc/ >> .gitignore`.
+    let data_dir = project_dir.join(".orc");
     std::fs::create_dir_all(&data_dir)?;
 
     let db_path = data_dir.join("state.db");
@@ -100,7 +109,20 @@ async fn main() -> Result<()> {
     let (state_handle, state_manager) = StateManager::new(db, policy);
     tokio::spawn(state_manager.run());
 
-    let hook_sock = data_dir.join("hooks.sock");
+    // Unix-domain sockets have a hard path-length cap (SUN_LEN, ~104
+    // bytes on macOS / ~108 on Linux). When the project lives under a
+    // long tmpdir (CI, ephemeral test runs), `<project>/.orc/hooks.sock`
+    // can exceed that and bind fails. Keep the socket under the system
+    // temp dir, keyed by a short hash of the project path so concurrent
+    // orc instances on different projects don't collide.
+    let hook_sock = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        project_str.hash(&mut h);
+        let key = format!("{:016x}", h.finish());
+        std::env::temp_dir().join(format!("orc-{key}.sock"))
+    };
     let _ = std::fs::remove_file(&hook_sock);
     let (hook_tx, mut hook_rx) = mpsc::channel::<HookEvent>(256);
     let hook_server = HookServer::bind(&hook_sock, hook_tx).await?;
@@ -129,7 +151,7 @@ async fn main() -> Result<()> {
     ));
     mcp::serve_http(mcp_listener, mcp_server);
 
-    let mcp_config_path = orc::write_mcp_config(mcp_port).await?;
+    let mcp_config_path = orc::write_mcp_config(&data_dir, mcp_port).await?;
     let orc_config = OrcConfig {
         project_dir: project_dir.clone(),
         mcp_config_path,
@@ -137,42 +159,57 @@ async fn main() -> Result<()> {
     };
     let mut orc_process = orc::spawn_orc(&orc_config).await?;
 
-    let zombies = state::sweep_zombie_sessions(&state_handle).await;
-    if zombies > 0 {
-        eprintln!("[orc] swept {zombies} zombie session(s) from previous runs");
-    }
-
     let mut app = App::new(&project_str).with_state_handle(state_handle.clone());
     app.orc_view.model = orc_config.model.clone();
     app.push_chat(ChatRole::System, format!("orc v2 — MCP on port {mcp_port}"));
 
-    // Welcome prompt — open a NewTask modal targeted at orc on first frame.
-    app.modal = Some(Modal::NewTask {
-        target: TabId::Orc,
-        buffer: String::new(),
-    });
+    // Restore non-terminal sessions from the per-project DB so opening
+    // orc twice on the same project picks up where it left off.
+    let restored = restore_previous_sessions(&mut app, &state_handle).await;
+    if restored.running.is_empty() && restored.review.is_empty() {
+        // Fresh project — first-frame welcome modal.
+        app.modal = Some(Modal::NewTask {
+            target: TabId::Orc,
+            buffer: String::new(),
+        });
+    } else {
+        for name in &restored.review {
+            app.orc_view
+                .event_log
+                .push(app::LogEntry::Notify(format!(
+                    "{name} is ready for your review (press r)"
+                )));
+        }
+        if !restored.running.is_empty() {
+            // Prompt to resume Running sessions (their claude processes
+            // did not survive the previous orc exit).
+            app.modal = Some(Modal::ResumeRunning {
+                names: restored.running.clone(),
+            });
+        }
+    }
 
     // Install a panic hook that restores terminal state before printing
     // the panic info. Without this, a panic leaves alt-screen + raw mode
     // + mouse capture on and corrupts the user's shell.
+    let data_dir_panic = data_dir.clone();
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = io::stdout();
         let _ = out.execute(DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
         let _ = out.execute(LeaveAlternateScreen);
-        // Best-effort: persist a copy of the panic to a file so users have
-        // something to share even if the terminal scrollback is gone.
-        if let Some(home) = std::env::var_os("HOME") {
-            let p = std::path::PathBuf::from(home).join(".config/orc/last-panic.log");
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(
-                &p,
-                format!("{info}\n\nbacktrace:\n{}\n", std::backtrace::Backtrace::force_capture()),
-            );
+        // Best-effort: persist a copy of the panic to a file inside the
+        // project's .orc/ so the user has something to share even if the
+        // terminal scrollback is gone.
+        let panic_path = data_dir_panic.join("last-panic.log");
+        if let Some(parent) = panic_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        let _ = std::fs::write(
+            &panic_path,
+            format!("{info}\n\nbacktrace:\n{}\n", std::backtrace::Backtrace::force_capture()),
+        );
         default_panic(info);
     }));
 
@@ -262,7 +299,13 @@ async fn run_event_loop(
                 let action = handle_key(key, app, state_handle).await;
                 match action {
                     KeyAction::None => {}
-                    KeyAction::Quit => return Ok(()),
+                    KeyAction::Quit => {
+                        cleanup_finished_worktrees(
+                            app, worker_registry, state_handle, project_dir,
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     KeyAction::SendToOrc(msg) => {
                         app.push_chat(ChatRole::User, msg.clone());
                         cleanup_idle_done_sessions(
@@ -316,8 +359,27 @@ async fn run_event_loop(
             return Ok(());
         }
 
-        // Poll orc liveness to update the badge.
-        app.orc_view.alive = orc_process.is_alive();
+        // Drain terminal-state sessions queued by handle_state_change.
+        if !app.pending_cleanup.is_empty() {
+            let drained: Vec<String> = std::mem::take(&mut app.pending_cleanup);
+            for sid in drained {
+                full_terminate_session(app, worker_registry, state_handle, project_dir, &sid)
+                    .await;
+            }
+        }
+
+        // Poll orc liveness to update the badge. Log a single visible
+        // line on the alive→dead transition so the user notices when
+        // claude has actually exited (otherwise they'd just see the ✗
+        // badge with no explanation).
+        let alive_now = orc_process.is_alive();
+        if app.orc_view.alive && !alive_now {
+            app.push_chat(
+                ChatRole::System,
+                "orc brain exited unexpectedly — restart orc to continue".to_string(),
+            );
+        }
+        app.orc_view.alive = alive_now;
         // Mirror orc's latest-turn context occupancy into the view.
         let last_ctx = orc_process.usage().last_context_tokens;
         app.orc_view.last_context_tokens = if last_ctx > 0 { Some(last_ctx) } else { None };
@@ -442,10 +504,12 @@ async fn handle_worker_event(
             }
         }
         WorkerEvent::Exited { session_id, code } => {
-            app.push_log(
-                &session_id,
-                LogEntry::System(format!("worker exited code {code:?}")),
-            );
+            let msg = match code {
+                Some(0) => "worker finished cleanly".to_string(),
+                Some(c) => format!("worker exited with code {c}"),
+                None => "worker exited".to_string(),
+            };
+            app.push_log(&session_id, LogEntry::System(msg));
             let _ = worker_registry.kill(&session_id).await;
         }
     }
@@ -521,6 +585,116 @@ fn handle_paste(text: &str, app: &mut App) {
     app.modal = new;
 }
 
+/// Return true if the project has a remote named `origin`.
+async fn has_origin_remote(project_dir: &str) -> bool {
+    use tokio::process::Command;
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(project_dir)
+        .output()
+        .await;
+    matches!(out, Ok(o) if o.status.success())
+}
+
+/// `git push origin <target>`. Returns the trimmed stderr on failure.
+async fn push_to_origin(project_dir: &str, target: &str) -> anyhow::Result<()> {
+    use tokio::process::Command;
+    let out = Command::new("git")
+        .args(["push", "origin", target])
+        .current_dir(project_dir)
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Merge `branch` into `target` inside `project_dir` using a non-fast-forward
+/// merge so reviewers can always identify the worker contribution. Returns
+/// the trimmed stderr/stdout on failure so the user can see the reason.
+async fn merge_worker_branch(project_dir: &str, branch: &str, target: &str) -> anyhow::Result<()> {
+    use tokio::process::Command;
+    // Checkout target first. Required because `git merge` operates on the
+    // currently-checked-out branch.
+    let co = Command::new("git")
+        .args(["checkout", target])
+        .current_dir(project_dir)
+        .output()
+        .await?;
+    if !co.status.success() {
+        anyhow::bail!(
+            "git checkout {target} failed: {}",
+            String::from_utf8_lossy(&co.stderr).trim()
+        );
+    }
+    let merge = Command::new("git")
+        .args([
+            "merge",
+            "--no-ff",
+            "-m",
+            &format!("Merge worker branch '{branch}'"),
+            branch,
+        ])
+        .current_dir(project_dir)
+        .output()
+        .await?;
+    if !merge.status.success() {
+        anyhow::bail!(
+            "git merge failed: {}",
+            String::from_utf8_lossy(&merge.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Return the next worker tab that needs human attention, in priority
+/// order: awaiting review > failed > blocked. Starts searching after
+/// the currently focused tab and wraps around so repeated presses of
+/// `n` cycle through all pending workers.
+fn next_attention_tab(app: &App) -> Option<TabId> {
+    if app.sessions.is_empty() {
+        return None;
+    }
+    let priority = |s: &session::SessionState| -> u8 {
+        match s {
+            session::SessionState::AwaitingReview { .. } => 3,
+            session::SessionState::Failed { .. } => 2,
+            session::SessionState::Blocked { .. } => 1,
+            _ => 0,
+        }
+    };
+    let start = match app.focused_tab {
+        TabId::Orc => 0,
+        TabId::Worker(i) => (i + 1) % app.sessions.len(),
+    };
+    let n = app.sessions.len();
+    let mut best: Option<(u8, usize)> = None;
+    for k in 0..n {
+        let i = (start + k) % n;
+        let p = priority(&app.sessions[i].session.state);
+        if p > 0 {
+            // First hit at any priority wins (we already iterate in
+            // post-focus order). But prefer higher priority on the same
+            // scan position only when no higher-priority hit is found
+            // earlier in the wrap order.
+            match best {
+                None => best = Some((p, i)),
+                Some((bp, _)) if p > bp => best = Some((p, i)),
+                _ => {}
+            }
+            // Cheap early-out: if we hit the top priority, stop scanning.
+            if p == 3 {
+                break;
+            }
+        }
+    }
+    best.map(|(_, i)| TabId::Worker(i))
+}
+
 async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) -> KeyAction {
     // Per-tab Ctrl-C interrupts the focused conversation.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -559,25 +733,19 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         KeyCode::Char('?') => {
             app.modal = Some(Modal::Help);
         }
-        KeyCode::Char('t') => {
+        // `c` opens the chat (message orc / talk to the focused worker)
+        // on every tab. The old `t` binding stays as an alias for users
+        // who built muscle memory before the rebind.
+        KeyCode::Char('c') | KeyCode::Char('t') => {
             app.modal = Some(Modal::NewTask {
                 target: app.focused_tab,
                 buffer: String::new(),
             });
         }
-
-        KeyCode::Tab => app.next_tab(),
-        KeyCode::BackTab => app.prev_tab(),
-        KeyCode::Char(c @ '1'..='9') => {
-            let idx = (c as usize) - ('1' as usize);
-            if idx == 0 {
-                app.focus_tab(TabId::Orc);
-            } else if idx - 1 < app.sessions.len() {
-                app.focus_tab(TabId::Worker(idx - 1));
-            }
-        }
-
-        KeyCode::Char('c') => {
+        // On a worker tab, plain Enter (with no modal open) toggles
+        // control mode. Cheap one-key toggle so the user doesn't have
+        // to remember another letter.
+        KeyCode::Enter => {
             if let TabId::Worker(idx) = app.focused_tab {
                 if let Some(sv) = app.sessions.get(idx) {
                     let new_mode = match sv.session.mode {
@@ -594,6 +762,27 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
                 }
             }
         }
+
+        KeyCode::Tab => app.next_tab(),
+        KeyCode::BackTab => app.prev_tab(),
+        // `n` jumps to the next worker that needs attention (awaiting
+        // review > failed > blocked). Cycles. No-op if nothing pending.
+        KeyCode::Char('n') => {
+            if let Some(target) = next_attention_tab(app) {
+                app.focus_tab(target);
+            }
+        }
+        KeyCode::Char(c @ '1'..='9') => {
+            let idx = (c as usize) - ('1' as usize);
+            if idx == 0 {
+                app.focus_tab(TabId::Orc);
+            } else if idx - 1 < app.sessions.len() {
+                app.focus_tab(TabId::Worker(idx - 1));
+            }
+        }
+
+        // Kill the focused worker. Bound to `x` so it doesn't collide
+        // with `k` (scroll-up).
         KeyCode::Char('x') => {
             if let TabId::Worker(idx) = app.focused_tab {
                 if let Some(sv) = app.sessions.get(idx) {
@@ -616,20 +805,51 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
             }
         }
         KeyCode::Char('r') => {
-            if let TabId::Worker(idx) = app.focused_tab {
+            // Resolve which worker's review to open:
+            //   - on a worker tab in AwaitingReview → that worker
+            //   - on the orc tab → the first worker in AwaitingReview
+            //   - on a worker tab not in AwaitingReview → the first
+            //     other worker awaiting review (so `r` is never a
+            //     dead key when there's work to review somewhere)
+            let target_idx: Option<usize> = match app.focused_tab {
+                TabId::Worker(idx) => {
+                    let here = app.sessions.get(idx).map(|sv| {
+                        matches!(
+                            sv.session.state,
+                            session::SessionState::AwaitingReview { .. }
+                        )
+                    });
+                    if here == Some(true) {
+                        Some(idx)
+                    } else {
+                        app.sessions.iter().position(|sv| {
+                            matches!(
+                                sv.session.state,
+                                session::SessionState::AwaitingReview { .. }
+                            )
+                        })
+                    }
+                }
+                TabId::Orc => app.sessions.iter().position(|sv| {
+                    matches!(
+                        sv.session.state,
+                        session::SessionState::AwaitingReview { .. }
+                    )
+                }),
+            };
+            if let Some(idx) = target_idx {
+                app.focus_tab(TabId::Worker(idx));
                 if let Some(sv) = app.sessions.get(idx) {
-                    if let session::SessionState::AwaitingReview { .. } = sv.session.state {
-                        let worktree = sv.session.worktree_path.clone();
-                        let base = sv.session.base_commit.clone();
-                        let sid = sv.session.id.clone();
-                        match review::compute_diff(&worktree, &base).await {
-                            Ok(diff) => {
-                                app.review =
-                                    Some(review::ReviewState::with_worktree(sid, diff, worktree));
-                            }
-                            Err(e) => {
-                                app.push_chat(ChatRole::System, format!("diff error: {e}"));
-                            }
+                    let worktree = sv.session.worktree_path.clone();
+                    let base = sv.session.base_commit.clone();
+                    let sid = sv.session.id.clone();
+                    match review::compute_diff(&worktree, &base).await {
+                        Ok(diff) => {
+                            app.review =
+                                Some(review::ReviewState::with_worktree(sid, diff, worktree));
+                        }
+                        Err(e) => {
+                            app.push_chat(ChatRole::System, format!("diff error: {e}"));
                         }
                     }
                 }
@@ -876,6 +1096,127 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                 app.modal = Some(Modal::ConfirmQuit);
             }
         },
+        Some(Modal::ConfirmMerge { session_id, name, branch, target }) => match key.code {
+            KeyCode::Enter => {
+                let project_dir = app.project_dir.to_string_lossy().to_string();
+                let merged = match merge_worker_branch(&project_dir, &branch, &target).await {
+                    Ok(()) => {
+                        app.push_chat(
+                            ChatRole::System,
+                            format!("merged {name} ({branch}) into {target}"),
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        app.push_chat(
+                            ChatRole::System,
+                            format!("merge failed for {name}: {e}"),
+                        );
+                        false
+                    }
+                };
+                // Now that the merge is done (or failed), it's safe to
+                // tear down the worktree + branch + DB rows.
+                app.pending_cleanup.push(session_id);
+                // Offer to push if the merge succeeded and origin exists.
+                if merged && has_origin_remote(&project_dir).await {
+                    app.modal = Some(Modal::ConfirmPush {
+                        branch: branch.clone(),
+                        target: target.clone(),
+                    });
+                }
+            }
+            KeyCode::Esc => {
+                app.push_chat(
+                    ChatRole::System,
+                    format!("approved {name}; left branch {branch} unmerged"),
+                );
+                // User chose to keep the branch — still clean the DB
+                // row and child process, but skip remove_worktree.
+                // For now we leave both alone so the user can manually
+                // merge later from the worktree.
+                let _ = session_id;
+            }
+            _ => {
+                app.modal = Some(Modal::ConfirmMerge { session_id, name, branch, target });
+            }
+        },
+        Some(Modal::ConfirmPush { branch, target }) => match key.code {
+            KeyCode::Enter => {
+                let project_dir = app.project_dir.to_string_lossy().to_string();
+                match push_to_origin(&project_dir, &target).await {
+                    Ok(()) => app.push_chat(
+                        ChatRole::System,
+                        format!("pushed {target} to origin"),
+                    ),
+                    Err(e) => app.push_chat(
+                        ChatRole::System,
+                        format!("push failed: {e}"),
+                    ),
+                }
+                let _ = branch;
+            }
+            KeyCode::Esc => {
+                app.push_chat(
+                    ChatRole::System,
+                    format!("skipped pushing {target} to origin"),
+                );
+                let _ = branch;
+            }
+            _ => {
+                app.modal = Some(Modal::ConfirmPush { branch, target });
+            }
+        },
+        Some(Modal::ResumeRunning { names }) => match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                // Mark all the named sessions for restart. The main loop
+                // doesn't reach into worker spawn from here — instead we
+                // fail them in DB and surface a hint, and the user can
+                // hit R on each tab. Simpler than wiring a full async
+                // restart through this sync key handler. Future: do the
+                // restart inline here.
+                for sv in app.sessions.iter() {
+                    if names.contains(&sv.session.name) {
+                        let _ = state_handle
+                            .send(StateCommand::ApplyEvent {
+                                session_id: sv.session.id.clone(),
+                                event: session::SessionEvent::Errored {
+                                    reason: "orc restarted — press R to resume".to_string(),
+                                },
+                                reply: tokio::sync::oneshot::channel().0,
+                            })
+                            .await;
+                    }
+                }
+                app.push_chat(
+                    ChatRole::System,
+                    format!(
+                        "{} worker(s) were resumed — press R on each tab to restart its claude session",
+                        names.len()
+                    ),
+                );
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                // Same outcome — these workers' claude processes are
+                // dead anyway. Mark them Failed so they get the R hint.
+                for sv in app.sessions.iter() {
+                    if names.contains(&sv.session.name) {
+                        let _ = state_handle
+                            .send(StateCommand::ApplyEvent {
+                                session_id: sv.session.id.clone(),
+                                event: session::SessionEvent::Errored {
+                                    reason: "orc restarted; user skipped resume".to_string(),
+                                },
+                                reply: tokio::sync::oneshot::channel().0,
+                            })
+                            .await;
+                    }
+                }
+            }
+            _ => {
+                app.modal = Some(Modal::ResumeRunning { names });
+            }
+        },
         Some(Modal::Help) => {
             // Any key dismisses
         }
@@ -909,7 +1250,50 @@ async fn handle_review_key(
         KeyCode::Char('[') => review.move_file_up(),
 
         KeyCode::Char('a') => {
-            review.toggle_hunk_approval();
+            // Whole-review approve. Same path as `s` (submit) but
+            // explicitly conveys "I'm done here, ship it". The review
+            // is sent to the worker as approved and the merge modal
+            // opens immediately. Per-hunk approval was dropped — in
+            // a claude workflow the user either takes the change or
+            // sends comments, no in-between.
+            let session_id = review.session_id.clone();
+            let payload = review.to_payload();
+            let payload_json = serde_json::to_string_pretty(&payload).unwrap_or_default();
+            let (worker_name, branch) = app
+                .sessions
+                .iter()
+                .find(|s| s.session.id == session_id)
+                .map(|sv| (sv.session.name.clone(), sv.session.branch.clone()))
+                .unzip();
+            if let Some(name) = worker_name.as_ref() {
+                app.push_chat(
+                    ChatRole::System,
+                    format!("approved {name}"),
+                );
+            }
+            let _ = state_handle
+                .send(StateCommand::ApplyEvent {
+                    session_id: session_id.clone(),
+                    event: session::SessionEvent::ReviewSubmitted {
+                        approved: true,
+                        feedback: Some(payload_json),
+                    },
+                    reply: tokio::sync::oneshot::channel().0,
+                })
+                .await;
+            app.review = None;
+            if let (Some(name), Some(branch)) = (worker_name, branch) {
+                let project_dir = app.project_dir.to_string_lossy().to_string();
+                let target = worktree::main_branch(&project_dir)
+                    .await
+                    .unwrap_or_else(|_| "main".to_string());
+                app.modal = Some(Modal::ConfirmMerge {
+                    session_id,
+                    name,
+                    branch,
+                    target,
+                });
+            }
         }
 
         KeyCode::Char('o') => {
@@ -959,19 +1343,25 @@ async fn handle_review_key(
             let session_id = review.session_id.clone();
             let payload_json = serde_json::to_string_pretty(&payload).unwrap_or_default();
 
-            if let Some(sv) = app.sessions.iter().find(|s| s.session.id == session_id) {
-                let _name = sv.session.name.clone();
-                // Worker delivery via WorkerRegistry happens at call site; here
-                // we just push the review feedback as a system note + apply.
+            // Capture the bits we'll need for the post-submit merge
+            // prompt before we drop the review state.
+            let (worker_name, branch) = app
+                .sessions
+                .iter()
+                .find(|s| s.session.id == session_id)
+                .map(|sv| (sv.session.name.clone(), sv.session.branch.clone()))
+                .unzip();
+
+            if let Some(name) = worker_name.as_ref() {
                 app.push_chat(
                     ChatRole::System,
-                    format!("review submitted for {}", sv.session.name),
+                    format!("review submitted for {name}"),
                 );
             }
 
             let _ = state_handle
                 .send(StateCommand::ApplyEvent {
-                    session_id,
+                    session_id: session_id.clone(),
                     event: session::SessionEvent::ReviewSubmitted {
                         approved: true,
                         feedback: Some(payload_json),
@@ -981,6 +1371,22 @@ async fn handle_review_key(
                 .await;
 
             app.review = None;
+
+            // Offer to merge the worker's branch into the project's
+            // main branch. Detect target lazily — fall back to "main"
+            // if detection fails so the user still sees a sane default.
+            if let (Some(name), Some(branch)) = (worker_name, branch) {
+                let project_dir = app.project_dir.to_string_lossy().to_string();
+                let target = worktree::main_branch(&project_dir)
+                    .await
+                    .unwrap_or_else(|_| "main".to_string());
+                app.modal = Some(Modal::ConfirmMerge {
+                    session_id,
+                    name,
+                    branch,
+                    target,
+                });
+            }
         }
 
         KeyCode::Char('q') | KeyCode::Esc => {
@@ -1001,7 +1407,7 @@ fn handle_state_change(app: &mut App, change: StateChange) {
                 let id = session.id.clone();
                 let task = session.task.clone();
                 app.add_session(session);
-                app.push_chat(ChatRole::System, format!("session '{name}' spawned"));
+                app.push_chat(ChatRole::System, format!("spawned worker {name}"));
                 // Show the initial task in the worker's own log so the user
                 // can see what orc told this worker to do.
                 app.push_log(&id, LogEntry::OrcInstruction(task));
@@ -1009,7 +1415,7 @@ fn handle_state_change(app: &mut App, change: StateChange) {
         }
         StateChange::SessionStateChanged {
             session_id,
-            old: _,
+            old,
             new_state,
         } => {
             // AwaitingReview gets its own friendly line via
@@ -1019,15 +1425,14 @@ fn handle_state_change(app: &mut App, change: StateChange) {
             let name = app.session_index.get(&session_id).and_then(|&i| {
                 app.sessions.get(i).map(|s| s.session.name.clone())
             });
+            let _ = old;
             app.update_session_state(&session_id, new_state.clone());
+            // We used to eagerly queue Done/Failed sessions for
+            // teardown here, but that prevented the user from
+            // browsing a worker's events after it finished. Now
+            // cleanup only fires on explicit `x` kill, after the
+            // approve+merge modal closes, or at orc quit time.
             if !suppress {
-                let pretty = match &new_state {
-                    session::SessionState::Done { .. } => "done".to_string(),
-                    session::SessionState::Failed { .. } => "failed".to_string(),
-                    session::SessionState::Blocked { .. } => "blocked".to_string(),
-                    session::SessionState::Running => "running".to_string(),
-                    other => state::state_label(other).to_lowercase(),
-                };
                 let who = name.unwrap_or_else(|| {
                     if session_id.len() >= 8 {
                         session_id[..8].to_string()
@@ -1035,7 +1440,28 @@ fn handle_state_change(app: &mut App, change: StateChange) {
                         session_id.clone()
                     }
                 });
-                app.push_chat(ChatRole::System, format!("{who}: {pretty}"));
+                let sentence = match &new_state {
+                    session::SessionState::Done { .. } => format!("{who} finished"),
+                    session::SessionState::Failed { reason } if !reason.is_empty() => {
+                        format!("{who} failed — {reason}")
+                    }
+                    session::SessionState::Failed { .. } => format!("{who} failed"),
+                    session::SessionState::Blocked { kind, reason } => {
+                        let label = match kind {
+                            session::BlockKind::Permission => "needs permission",
+                            session::BlockKind::OrcDecision => "waiting for orc",
+                            session::BlockKind::UserInput => "asked you a question",
+                        };
+                        if reason.is_empty() {
+                            format!("{who} {label}")
+                        } else {
+                            format!("{who} {label} — {reason}")
+                        }
+                    }
+                    session::SessionState::Running => format!("{who} is running"),
+                    other => format!("{who} → {}", state::state_label(other).to_lowercase()),
+                };
+                app.push_chat(ChatRole::System, sentence);
             }
         }
         StateChange::SessionModeChanged { session_id, mode } => {
@@ -1103,11 +1529,13 @@ fn handle_state_change(app: &mut App, change: StateChange) {
         }
         StateChange::WorkerReviewSubmitted { name, summary, .. } => {
             let line = if summary.is_empty() {
-                format!("{name} ready for review")
+                format!("{name} is ready for your review (press r)")
             } else {
-                format!("{name} ready for review: {summary}")
+                format!("{name} is ready for your review — {summary} (press r)")
             };
-            app.push_chat(ChatRole::System, line);
+            // Notify (bright) instead of plain System (dim) so the
+            // call-to-action stands out.
+            app.orc_view.event_log.push(LogEntry::Notify(line));
         }
     }
 }
@@ -1221,6 +1649,128 @@ async fn cleanup_idle_done_sessions(
     }
 }
 
+/// Result of restoring sessions from a previous orc run.
+struct RestoredSessions {
+    /// Names of Running sessions whose claude child did not survive
+    /// the previous orc exit and need user confirmation to resume.
+    running: Vec<String>,
+    /// Names of AwaitingReview sessions ready for the user.
+    review: Vec<String>,
+}
+
+/// Pull non-terminal sessions from the per-project DB and restore them
+/// as worker tabs, including their persisted event log. Sessions in
+/// Done/Failed/Blocked are not restored (they're noise; user can run
+/// `orc clean` if they want to drop them).
+async fn restore_previous_sessions(
+    app: &mut App,
+    state_handle: &StateHandle,
+) -> RestoredSessions {
+    let mut restored = RestoredSessions {
+        running: Vec::new(),
+        review: Vec::new(),
+    };
+    let sessions = state_handle.list_sessions().await;
+    for s in sessions {
+        use session::SessionState;
+        let bucket = match &s.state {
+            SessionState::Running => Some(&mut restored.running),
+            SessionState::AwaitingReview { .. } => Some(&mut restored.review),
+            _ => None,
+        };
+        let Some(bucket) = bucket else { continue };
+        bucket.push(s.name.clone());
+        let id = s.id.clone();
+        let events = state_handle.load_events(&id).await;
+        app.add_session(s);
+        for (kind, payload) in events {
+            let entry = app::kind_payload_to_entry(&kind, &payload);
+            if let Some(&idx) = app.session_index.get(&id) {
+                app.sessions[idx].event_log.push(entry);
+            }
+        }
+    }
+    restored
+}
+
+/// Full teardown for a single session that has reached a terminal
+/// state (Done/Failed) or was explicitly killed. Cascades:
+///   1. kill the worker's claude child
+///   2. remove the git worktree
+///   3. delete the DB row (which cascades to events/transitions/etc)
+///   4. drop the in-memory SessionView from app.sessions
+async fn full_terminate_session(
+    app: &mut App,
+    workers: &WorkerRegistry,
+    state_handle: &StateHandle,
+    project_dir: &PathBuf,
+    session_id: &str,
+) {
+    let (name, worktree) = match app.sessions.iter().find(|sv| sv.session.id == session_id) {
+        Some(sv) => (sv.session.name.clone(), sv.session.worktree_path.clone()),
+        None => return,
+    };
+    let _ = workers.kill(session_id).await;
+    if !worktree.is_empty() {
+        let _ = crate::worktree::remove_worktree(
+            project_dir.to_str().unwrap_or("."),
+            std::path::Path::new(&worktree),
+            &name,
+        )
+        .await;
+    }
+    let _ = state_handle
+        .send(StateCommand::RemoveSession {
+            session_id: session_id.to_string(),
+        })
+        .await;
+    app.remove_session(session_id);
+}
+
+/// On normal quit, prune git worktrees for finished sessions
+/// (Done / Failed). Running and AwaitingReview workers are left
+/// alone — their work may not have been merged yet, and the user
+/// can rerun orc to revisit them.
+async fn cleanup_finished_worktrees(
+    app: &App,
+    workers: &WorkerRegistry,
+    state_handle: &StateHandle,
+    project_dir: &PathBuf,
+) {
+    let candidates: Vec<(String, String, String)> = app
+        .sessions
+        .iter()
+        .filter(|sv| {
+            matches!(
+                sv.session.state,
+                session::SessionState::Done { .. } | session::SessionState::Failed { .. }
+            )
+        })
+        .map(|sv| {
+            (
+                sv.session.id.clone(),
+                sv.session.name.clone(),
+                sv.session.worktree_path.clone(),
+            )
+        })
+        .collect();
+
+    for (id, name, worktree) in candidates {
+        let _ = workers.kill(&id).await;
+        if !worktree.is_empty() {
+            let _ = crate::worktree::remove_worktree(
+                project_dir.to_str().unwrap_or("."),
+                std::path::Path::new(&worktree),
+                &name,
+            )
+            .await;
+        }
+        let _ = state_handle
+            .send(StateCommand::RemoveSession { session_id: id })
+            .await;
+    }
+}
+
 /// Run an external editor on a file path. Surrender alt-screen, run blocking,
 /// then re-enter. Mirrors the previous tmux-attach dance.
 async fn run_editor(
@@ -1300,7 +1850,13 @@ async fn restart_worker(
     let tmux_name = format!("orc-{}", session.name);
     let _ = hooks::create_hook_script(hook_sock, &tmux_name).await;
 
-    let prompt = mcp::worker_system_prompt(&session.id, &session.name, &session.task);
+    let prompt = mcp::worker_system_prompt(
+        &session.id,
+        &session.name,
+        &session.task,
+        &session.worktree_path,
+        &session.branch,
+    );
     let worktree = std::path::PathBuf::from(&session.worktree_path);
 
     let handle = if let Some(claude_sid) = session.claude_session_id.clone() {
@@ -1336,8 +1892,8 @@ async fn restart_worker(
     Ok(())
 }
 
-async fn run_clean() -> Result<()> {
-    let data_dir = dirs_data_dir().join("orc");
+async fn run_clean(project_dir: &Path) -> Result<()> {
+    let data_dir = project_dir.join(".orc");
     let db_path = data_dir.join("state.db");
     if !db_path.exists() {
         println!("no state db at {} — nothing to clean", db_path.display());
@@ -1353,7 +1909,7 @@ async fn run_clean() -> Result<()> {
     Ok(())
 }
 
-async fn run_doctor() -> Result<()> {
+async fn run_doctor(project_dir: &Path) -> Result<()> {
     println!("orc doctor — checking environment\n");
     let mut all_ok = true;
 
@@ -1379,7 +1935,9 @@ async fn run_doctor() -> Result<()> {
         }
     }
 
-    let data_dir = dirs_data_dir().join("orc");
+    let data_dir = project_dir.join(".orc");
+    // Auto-create on doctor so first-run is friendly.
+    let _ = std::fs::create_dir_all(&data_dir);
     if data_dir.exists() {
         let test_file = data_dir.join(".doctor-probe");
         match std::fs::write(&test_file, "probe") {
@@ -1424,10 +1982,5 @@ async fn run_doctor() -> Result<()> {
     Ok(())
 }
 
-fn dirs_data_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config")
-    } else {
-        PathBuf::from(".")
-    }
-}
+// dirs_data_dir was used when the DB was global at ~/.config/orc/.
+// Now superseded by per-project `<project>/.orc/`. Function removed.

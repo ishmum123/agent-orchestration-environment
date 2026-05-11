@@ -416,6 +416,7 @@ struct TmuxSession {
     label: String,
     name: String,
     home: PathBuf,
+    project_dir: PathBuf,
 }
 
 impl TmuxSession {
@@ -447,6 +448,14 @@ impl TmuxSession {
             exit = exit_log.display(),
         );
 
+        // Kill any prior server on this socket before launching, so a
+        // panicked previous run doesn't block this one with "duplicate
+        // session: main". Best-effort; errors are normal here.
+        let _ = Command::new("tmux")
+            .args(["-L", label, "kill-server"])
+            .env("TMUX", "")
+            .output();
+
         let out = Command::new("tmux")
             .args([
                 "-L",
@@ -475,6 +484,7 @@ impl TmuxSession {
             label: label.to_string(),
             name: name.to_string(),
             home: home.to_path_buf(),
+            project_dir: project_dir.to_path_buf(),
         }
     }
 
@@ -541,7 +551,10 @@ impl TmuxSession {
     }
 
     fn db_path(&self) -> PathBuf {
-        self.home.join(".config/orc/state.db")
+        // orc now lives at <project>/.orc/state.db (per-project), not
+        // the old global ~/.config/orc/state.db.
+        let _ = &self.home;
+        self.project_dir.join(".orc/state.db")
     }
 
     fn query_sessions(&self) -> Vec<(String, String, String)> {
@@ -688,13 +701,14 @@ fn run_flow_for_project(
     // NOW focus the worker tab. If the broadcast hasn't yet added the
     // session to app.sessions, the `2` is a no-op and any subsequent `t`
     // would target orc instead of the worker. Retry until the action bar
-    // shows "c control" — that hint only appears on worker tabs (orc tab
-    // shows "^C interrupt" instead).
+    // shows the worker-tab "control" hint — only worker tabs have it.
+    // Hint format changed: was "c control", now "⏎ control" (Enter).
     let mut focused_worker = false;
     for _ in 0..15 {
         tmux.send_literal("2");
         std::thread::sleep(Duration::from_millis(400));
-        if tmux.capture().contains("c control") {
+        let cap = tmux.capture();
+        if cap.contains(" control") {
             focused_worker = true;
             break;
         }
@@ -874,33 +888,9 @@ fn run_flow_for_project(
     tmux.send_literal("e");
     std::thread::sleep(Duration::from_millis(900));
 
-    // Hunk approval toggle off-then-on path: footer shows "N approvals".
-    // Press `a` once → 1 approval; press again (rejection / toggle off) →
-    // 0 approvals. Then leave it un-approved when we close (this round
-    // doesn't approve; we'll approve in the second-review pass).
-    fn extract_approvals(cap: &str) -> Option<u32> {
-        cap.lines()
-            .find_map(|l| {
-                let l = l.trim();
-                let idx = l.find(" approvals")?;
-                let count_str = l[..idx].rsplit_once(' ').map(|(_, n)| n).unwrap_or("");
-                count_str.trim().parse::<u32>().ok()
-            })
-    }
-    tmux.send_literal("a");
-    std::thread::sleep(Duration::from_millis(200));
-    let approvals_after_a = extract_approvals(&tmux.capture()).unwrap_or(0);
-    assert!(
-        approvals_after_a >= 1,
-        "[{label}] expected ≥1 approval after `a`; got {approvals_after_a}"
-    );
-    tmux.send_literal("a");
-    std::thread::sleep(Duration::from_millis(200));
-    let approvals_after_toggle_off = extract_approvals(&tmux.capture()).unwrap_or(99);
-    assert_eq!(
-        approvals_after_toggle_off, 0,
-        "[{label}] expected 0 approvals after toggle-off; got {approvals_after_toggle_off}"
-    );
+    // Per-hunk approvals were removed in favour of `a` = whole-review
+    // approve+merge. We exercise the approve path on the second review
+    // pass below; here we just leave the review with comments and close.
 
     // Comment list grows: c → text → Enter, repeat. Footer "N comments"
     // should increment.
@@ -978,22 +968,24 @@ fn run_flow_for_project(
         "[{label}] worker did not reach second AwaitingReview"
     );
 
-    // Re-open review, approve hunk(s), submit -> auto-Done.
+    // Re-open review and approve+merge with `a`. This now triggers the
+    // post-approve merge prompt; press Esc to skip the merge and the
+    // session transitions to Done. (Then push prompt would follow if
+    // we'd accepted a merge with origin remote — we test that elsewhere.)
     tmux.send_literal("r");
     std::thread::sleep(Duration::from_millis(700));
     tmux.send_literal("a");
-    std::thread::sleep(Duration::from_millis(150));
-    tmux.send_literal("s");
+    std::thread::sleep(Duration::from_millis(500));
+    // Dismiss ConfirmMerge modal — don't try to push during the e2e.
+    tmux.send_key("Escape");
     std::thread::sleep(Duration::from_millis(400));
 
     tmux.wait_for_state("Done", Duration::from_secs(POLL_TIMEOUT_S))
         .unwrap_or_else(|| panic!("[{label}] worker never reached Done"));
 
     // ===== Control mode toggle on the worker tab =====
-    // [WATCH]/[CTRL] glyphs only appear in render_tabs which the prod
-    // layout doesn't actually render today (header shows just the focused
-    // tab name). So assert the toggle by reading the `mode` column of the
-    // sessions table directly.
+    // Control mode is toggled by pressing Enter on a worker tab.
+    // (Previously `c`, but `c` is now the chat key.)
     let read_mode = |name: &str| -> Option<String> {
         let out = Command::new("sqlite3")
             .args([
@@ -1010,19 +1002,19 @@ fn run_flow_for_project(
         Some("Watch"),
         "[{label}] expected mode=Watch pre-toggle"
     );
-    tmux.send_literal("c");
+    tmux.send_key("Enter");
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(
         read_mode(&worker_name).as_deref(),
         Some("Control"),
-        "[{label}] expected mode=Control after first c"
+        "[{label}] expected mode=Control after first Enter"
     );
-    tmux.send_literal("c");
+    tmux.send_key("Enter");
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(
         read_mode(&worker_name).as_deref(),
         Some("Watch"),
-        "[{label}] expected mode=Watch after second c"
+        "[{label}] expected mode=Watch after second Enter"
     );
 
     // ===== FLOW 9 (local follow-up — not PR-comment iteration) =====
@@ -1036,62 +1028,76 @@ fn run_flow_for_project(
     std::thread::sleep(Duration::from_millis(800));
 
     // ===== Scroll keys =====
-    // The events panel header reads "[N–M / T lines · E entries]". If
-    // total lines T exceed the visible window, scroll keys move N–M.
+    // The events panel header is one of:
+    //   ` events `                  — content fits, no scroll
+    //   ` events  · end `           — scrollable, but pinned at bottom
+    //   ` events  · N% ↑M  `        — scrolled up M rows from the bottom
     // Use the worker tab (lots of tool output) and only assert when there's
     // actually content to scroll past.
     tmux.send_literal("2");
     std::thread::sleep(Duration::from_millis(400));
-    fn parse_window(cap: &str) -> Option<(u32, u32, u32)> {
-        // Match `[N–M / T lines` (note: en-dash).
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Scroll {
+        Fits,
+        AtEnd,
+        Up(u32), // rows above bottom
+    }
+    fn parse_scroll(cap: &str) -> Option<Scroll> {
         for l in cap.lines() {
-            if !l.contains("events") || !l.contains("lines") {
+            if !l.contains("events") {
                 continue;
             }
-            let bracket_idx = l.find('[')?;
-            let body = &l[bracket_idx + 1..];
-            let slash_idx = body.find(" / ")?;
-            let range = &body[..slash_idx];
-            let after_slash = &body[slash_idx + 3..];
-            let lines_idx = after_slash.find(" lines")?;
-            let total: u32 = after_slash[..lines_idx].trim().parse().ok()?;
-            let dash_idx = range.find('–').or_else(|| range.find('-'))?;
-            let start: u32 = range[..dash_idx].trim().parse().ok()?;
-            // Skip the dash bytes (en-dash is 3 bytes in UTF-8).
-            let after_dash = &range[dash_idx + range[dash_idx..].chars().next()?.len_utf8()..];
-            let end: u32 = after_dash.trim().parse().ok()?;
-            return Some((start, end, total));
+            if l.contains(" end ") {
+                return Some(Scroll::AtEnd);
+            }
+            if let Some(arrow_idx) = l.find('↑') {
+                let after = &l[arrow_idx + '↑'.len_utf8()..];
+                let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = num.parse::<u32>() {
+                    return Some(Scroll::Up(n));
+                }
+            }
+            // Bare ` events ` with no scroll suffix → content fits.
+            return Some(Scroll::Fits);
         }
         None
     }
-    let (s0, e0, t0) = parse_window(&tmux.capture()).unwrap_or((0, 0, 0));
-    eprintln!("[{label}] scroll initial window: {s0}-{e0}/{t0}");
 
-    // Only assert if there's something to scroll.
-    let visible_rows = e0.saturating_sub(s0).saturating_add(1);
-    if t0 > visible_rows {
+    let s0 = parse_scroll(&tmux.capture()).unwrap_or(Scroll::Fits);
+    eprintln!("[{label}] scroll initial: {s0:?}");
+
+    let scrollable = matches!(s0, Scroll::AtEnd | Scroll::Up(_));
+    if scrollable {
         tmux.send_key("PageUp");
         std::thread::sleep(Duration::from_millis(200));
         tmux.send_key("PageUp");
         std::thread::sleep(Duration::from_millis(200));
-        let (s1, e1, _) = parse_window(&tmux.capture()).unwrap_or((s0, e0, t0));
+        let s1 = parse_scroll(&tmux.capture()).unwrap_or(s0);
         assert!(
-            (s1, e1) != (s0, e0),
-            "[{label}] PageUp didn't move scroll window. before:{s0}-{e0} after:{s1}-{e1}"
+            matches!(s1, Scroll::Up(n) if n > 0) && s1 != s0,
+            "[{label}] PageUp didn't move scroll window. before:{s0:?} after:{s1:?}"
         );
+        let max_up = if let Scroll::Up(n) = s1 { n } else { 0 };
         tmux.send_literal("g");
         std::thread::sleep(Duration::from_millis(80));
         tmux.send_literal("g");
         std::thread::sleep(Duration::from_millis(200));
-        let (s2, _, _) = parse_window(&tmux.capture()).unwrap_or((s1, e1, t0));
-        assert_eq!(s2, 1, "[{label}] gg chord should jump to top (start=1); got start={s2}");
+        let s2 = parse_scroll(&tmux.capture()).unwrap_or(s1);
+        assert!(
+            matches!(s2, Scroll::Up(n) if n >= max_up),
+            "[{label}] gg should jump to top; got {s2:?} (after PageUp had {s1:?})"
+        );
         tmux.send_literal("G");
         std::thread::sleep(Duration::from_millis(200));
-        let (_, e3, _) = parse_window(&tmux.capture()).unwrap_or((1, e0, t0));
-        assert_eq!(e3, t0, "[{label}] G should jump to bottom (end={t0}); got end={e3}");
+        let s3 = parse_scroll(&tmux.capture()).unwrap_or(s2);
+        assert!(
+            matches!(s3, Scroll::AtEnd | Scroll::Fits),
+            "[{label}] G should jump to bottom; got {s3:?}"
+        );
     } else {
         eprintln!(
-            "[{label}] worker tab content fits ({t0} lines, {visible_rows} visible) — \
+            "[{label}] worker tab content fits ({s0:?}) — \
              scroll keys exercised but no scroll possible to assert"
         );
         // Still exercise the keys; they're no-ops when content fits.

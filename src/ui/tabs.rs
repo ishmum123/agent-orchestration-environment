@@ -21,14 +21,7 @@ pub fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
     // Orc tab — always first
     let orc_focused = focused == TabId::Orc;
-    let orc_elapsed = {
-        let secs = app.started_at.elapsed().as_secs();
-        if secs < 60 {
-            format!("{secs}s")
-        } else {
-            format!("{}m", secs / 60)
-        }
-    };
+    let orc_elapsed = crate::app::format_elapsed(app.started_at.elapsed().as_secs());
 
     let orc_badge = if app.orc_view.alive { "◐" } else { "✗" };
     let orc_label = format!(" {orc_badge} ORC {orc_elapsed} ");

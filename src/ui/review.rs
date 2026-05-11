@@ -127,12 +127,19 @@ fn render_file_tree(frame: &mut Frame, area: Rect, review: &ReviewState) {
             Style::default().fg(Color::DarkGray),
         ),
     ]));
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {} comments  {} approvals", comment_count, approval_count),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
+    // Hunk-level approvals are no longer wired to a key — `a` now
+    // approves the whole review and triggers merge. Only show the
+    // comment count.
+    let _ = approval_count;
+    let comment_style = if comment_count > 0 {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!(" {comment_count} comments"),
+        comment_style,
+    )]));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
@@ -225,22 +232,24 @@ fn render_whole_file_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
         ]));
     }
 
-    // Scroll: J/K page through whole_file_scroll; otherwise center cursor
-    // on first entry. Clamp to a real max so the bottom of the file is
-    // reachable (Paragraph wrap counted at the same width).
+    // Scroll: a sentinel value of `usize::MAX` means "not yet anchored
+    // — center on the cursor". Any other value (including 0) is treated
+    // as an explicit scroll position, so K can bring the user above the
+    // initial cursor-centered position. J/K mutate this value via
+    // `whole_file_page`.
     let visible = inner.height as usize;
     let para_for_count = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let wrapped_total = para_for_count.line_count(inner.width) as usize;
     let max_scroll = wrapped_total.saturating_sub(visible);
-    let scroll_offset = if review.whole_file_scroll > 0 {
-        review.whole_file_scroll.min(max_scroll)
-    } else {
+    let scroll_offset = if review.whole_file_scroll == usize::MAX {
         let cursor_idx = cursor_lineno.map(|n| n.saturating_sub(1)).unwrap_or(0);
         if cursor_idx >= visible {
             cursor_idx.saturating_sub(visible / 2).min(max_scroll)
         } else {
             0
         }
+    } else {
+        review.whole_file_scroll.min(max_scroll)
     };
 
     // Force-clear inner cells first — Paragraph with Wrap+scroll can leave
@@ -304,17 +313,12 @@ fn render_diff_view(frame: &mut Frame, area: Rect, review: &ReviewState) {
 
     let mut cursor_buffer_row: Option<usize> = None;
     for hunk in &file.hunks {
-        let is_approved = review.hunk_approvals.contains(&hunk.id);
-
         // Hunk header line — does not advance the cursor index. cursor
         // counts diff lines only, so `cursor.line_idx == file_line_count - 1`
-        // points at the last actual diff row.
-        let header_marker = if is_approved { " \u{2713} " } else { "   " };
+        // points at the last actual diff row. Hunk-level approval was
+        // removed (a = whole-review approve), so no per-hunk marker.
         lines.push(Line::from(vec![
-            Span::styled(
-                header_marker,
-                Style::default().fg(Color::Green),
-            ),
+            Span::raw("   "),
             Span::styled(
                 &hunk.header,
                 Style::default()
@@ -601,7 +605,9 @@ mod tests {
             line: 16,
             body: "should we make base_unit_id required when conversion_factor != 1.0?".to_string(),
         });
-        review.hunk_approvals.insert("h2".to_string());
+        // Approval key format is `{file_idx}:{hunk_id}` — match
+        // hunk_key() so the UI's is_hunk_approved() finds it.
+        review.hunk_approvals.insert("0:h2".to_string());
         review
     }
 
@@ -793,7 +799,8 @@ mod tests {
 
         assert!(content.contains("2 files"), "should show file count");
         assert!(content.contains("1 comments"), "should show comment count");
-        assert!(content.contains("1 approvals"), "should show approval count");
+        // Per-hunk approval tracking removed (a = whole-review approve);
+        // no "N approvals" stat is rendered anymore.
     }
 
     #[test]

@@ -35,6 +35,11 @@ pub fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
         }
         Modal::ConfirmKill { session_id: _, name } => render_confirm_kill(frame, area, name),
         Modal::ConfirmQuit => render_confirm_quit(frame, area),
+        Modal::ConfirmMerge { name, branch, target, .. } => {
+            render_confirm_merge(frame, area, name, branch, target)
+        }
+        Modal::ResumeRunning { names } => render_resume_running(frame, area, names),
+        Modal::ConfirmPush { branch, target } => render_confirm_push(frame, area, branch, target),
         Modal::Help => render_help(frame, area),
     }
 }
@@ -116,11 +121,31 @@ fn split_body_hint(inner: Rect) -> (Rect, Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_input_box(frame: &mut Frame, area: Rect, buffer: &str) {
+    render_input_box_with_placeholder(frame, area, buffer, "")
+}
+
+fn render_input_box_with_placeholder(
+    frame: &mut Frame,
+    area: Rect,
+    buffer: &str,
+    placeholder: &str,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if buffer.is_empty() && !placeholder.is_empty() {
+        // Placeholder line + cursor on column 0.
+        let line = Line::from(vec![
+            Span::styled("_", Style::default().fg(Color::White)),
+            Span::styled(format!(" {placeholder}"), DIM.add_modifier(Modifier::ITALIC)),
+        ]);
+        let para = Paragraph::new(line).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+        return;
+    }
 
     let text = format!("{buffer}_");
     let paragraph = Paragraph::new(text)
@@ -137,8 +162,6 @@ fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
     let rect = centered_rect(60, 40, area);
     frame.render_widget(Clear, rect);
 
-    let show_welcome = matches!(target, TabId::Orc) && buffer.is_empty();
-
     let title = match target {
         TabId::Orc => "speak to orc".to_string(),
         TabId::Worker(idx) => format!("speak to worker #{}", idx + 1),
@@ -149,39 +172,12 @@ fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
 
     let (body, hint_area) = split_body_hint(inner);
 
-    // Welcome header takes 2 lines (wrapped blurb) when present.
-    let welcome_height: u16 = if show_welcome { 3 } else { 0 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(welcome_height),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(3),
-        ])
-        .split(body);
-
-    if show_welcome {
-        let welcome = Paragraph::new(
-            "hey I am orc — give me a task or a list of tasks and I'll help you complete them",
-        )
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .wrap(Wrap { trim: false });
-        frame.render_widget(welcome, chunks[0]);
-    }
-
-    let label_text = match target {
-        TabId::Orc => "describe the task for orc to plan:",
-        TabId::Worker(_) => "send a message to this worker:",
+    let placeholder = match target {
+        TabId::Orc => "describe a task — orc will plan and delegate",
+        TabId::Worker(_) => "send a message to this worker",
     };
-    let label = Paragraph::new(label_text).style(Style::default().fg(Color::White));
-    frame.render_widget(label, chunks[1]);
 
-    render_input_box(frame, chunks[3], buffer);
+    render_input_box_with_placeholder(frame, body, buffer, placeholder);
 
     let hints = hint_line(&[
         ("enter", "send"),
@@ -325,6 +321,122 @@ fn render_confirm_quit(frame: &mut Frame, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Confirm merge (after approving a review)
+// ---------------------------------------------------------------------------
+
+fn render_confirm_merge(frame: &mut Frame, area: Rect, name: &str, branch: &str, target: &str) {
+    let rect = centered_fixed(60, 9, area);
+    frame.render_widget(Clear, rect);
+
+    let block = modal_block("merge approved work");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let (body, hint_area) = split_body_hint(inner);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("merge worker "),
+            Span::styled(name.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" into "),
+            Span::styled(target.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("branch: ", DIM),
+            Span::styled(branch.to_string(), Style::default().fg(Color::Gray)),
+        ]),
+    ];
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, body);
+
+    let hints = hint_line(&[("enter", "merge"), ("esc", "skip")]);
+    frame.render_widget(Paragraph::new(hints), hint_area);
+}
+
+// ---------------------------------------------------------------------------
+// Confirm push (after a successful merge, when origin remote exists)
+// ---------------------------------------------------------------------------
+
+fn render_confirm_push(frame: &mut Frame, area: Rect, branch: &str, target: &str) {
+    let rect = centered_fixed(60, 9, area);
+    frame.render_widget(Clear, rect);
+
+    let block = modal_block("push to remote?");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let (body, hint_area) = split_body_hint(inner);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("merged "),
+            Span::styled(branch.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" into "),
+            Span::styled(target.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("."),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("push "),
+            Span::styled(target.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" to "),
+            Span::styled("origin", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw("?"),
+        ]),
+    ];
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, body);
+
+    let hints = hint_line(&[("enter", "push"), ("esc", "skip")]);
+    frame.render_widget(Paragraph::new(hints), hint_area);
+}
+
+// ---------------------------------------------------------------------------
+// Resume-Running (offered on startup when prior workers were active)
+// ---------------------------------------------------------------------------
+
+fn render_resume_running(frame: &mut Frame, area: Rect, names: &[String]) {
+    let height = (6 + names.len()).min(20) as u16;
+    let rect = centered_fixed(60, height, area);
+    frame.render_widget(Clear, rect);
+
+    let block = modal_block("resume previous workers?");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let (body, hint_area) = split_body_hint(inner);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![Span::raw(
+            "the following workers were running last time orc was open:",
+        )]),
+        Line::from(""),
+    ];
+    for n in names {
+        lines.push(Line::from(vec![
+            Span::raw("  · "),
+            Span::styled(
+                n.clone(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "resume them? (their claude processes did not survive)",
+        DIM,
+    )));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, body);
+
+    let hints = hint_line(&[("y / enter", "resume all"), ("n / esc", "leave as-is")]);
+    frame.render_widget(Paragraph::new(hints), hint_area);
+}
+
+// ---------------------------------------------------------------------------
 // Help overlay
 // ---------------------------------------------------------------------------
 
@@ -336,38 +448,66 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let bindings: &[(&str, &str)] = &[
-        ("tab / shift+tab", "cycle tabs"),
-        ("1-9", "jump to tab"),
-        ("t", "talk (new task / message)"),
-        ("c", "control mode toggle (worker)"),
-        ("k", "kill focused worker"),
-        ("R", "restart failed worker"),
-        ("r", "open review (awaiting review)"),
-        ("q", "quit"),
-        ("?", "toggle help"),
-        ("j / ↓", "scroll down"),
-        ("↑ / pgup", "scroll up"),
-        ("gg / home", "jump to top"),
-        ("G / end", "jump to bottom (auto-follow)"),
-        ("enter", "send chat input"),
-        ("esc", "close modal / deselect"),
+    // Sectioned for scannability. Each section starts with a dim header.
+    let sections: &[(&str, &[(&str, &str)])] = &[
+        (
+            "navigate",
+            &[
+                ("tab / shift+tab", "cycle tabs"),
+                ("1-9", "jump to tab"),
+                ("n", "jump to next attention (review/failed/blocked)"),
+                ("j / ↓", "scroll down"),
+                ("↑ / pgup", "scroll up"),
+                ("gg / home", "jump to top"),
+                ("G / end", "jump to bottom (auto-follow)"),
+            ],
+        ),
+        (
+            "act on focused tab",
+            &[
+                ("c", "chat (new task on orc / message a worker)"),
+                ("⏎", "control mode toggle (worker tab)"),
+                ("r", "open review (awaiting review)"),
+                ("x", "kill focused worker"),
+                ("R", "restart failed worker"),
+                ("^C", "interrupt"),
+            ],
+        ),
+        (
+            "modal / global",
+            &[
+                ("enter", "send chat input"),
+                ("esc", "close modal / deselect"),
+                ("?", "toggle help"),
+                ("q", "quit"),
+            ],
+        ),
     ];
 
-    let lines: Vec<Line> = bindings
-        .iter()
-        .map(|(key, desc)| {
-            Line::from(vec![
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, (heading, items)) in sections.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            heading.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (key, desc) in *items {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
                 Span::styled(
-                    format!("{:<20}", key),
+                    format!("{:<18}", key),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(*desc),
-            ])
-        })
-        .collect();
+                Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
 
     let para = Paragraph::new(lines)
         .style(Style::default().fg(Color::White))
@@ -444,7 +584,7 @@ mod tests {
         };
         let output = render_to_string(&modal);
         assert!(output.contains("speak to orc"));
-        assert!(output.contains("describe the task"));
+        // With non-empty buffer the placeholder is hidden; buffer text shows.
         assert!(output.contains("add OAuth"));
         assert!(output.contains("enter"));
         assert!(output.contains("send"));

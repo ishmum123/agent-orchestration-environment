@@ -27,23 +27,58 @@ pub fn render_worker(
         0
     };
 
+    // Pinned task banner: one line, dim, never scrolls. Lets the user
+    // see "what is this worker doing" even after the original
+    // OrcInstruction has scrolled past the visible window.
+    let task = session_view.session.task.trim();
+    let task_height: u16 = if task.is_empty() || area.height < 6 { 0 } else { 1 };
+
     let chunks = Layout::vertical([
+        Constraint::Length(task_height),
         Constraint::Min(4),
         Constraint::Length(decisions_height),
     ])
     .split(area);
 
+    if task_height > 0 {
+        render_task_banner(frame, chunks[0], task);
+    }
     render_event_log(
         frame,
-        chunks[0],
+        chunks[1],
         &session_view.event_log,
         scroll,
         session_view.is_thinking,
         tick,
     );
     if decisions_height > 0 {
-        render_decisions(frame, chunks[1], session_view);
+        render_decisions(frame, chunks[2], session_view);
     }
+}
+
+/// Render a one-line dim banner showing the worker's assigned task.
+/// Truncates with ellipsis if it overflows the available width.
+fn render_task_banner(frame: &mut Frame, area: Rect, task: &str) {
+    if area.width < 8 {
+        return;
+    }
+    let inner_w = area.width as usize;
+    let prefix = " task: ";
+    let avail = inner_w.saturating_sub(prefix.chars().count() + 1);
+    let collapsed: String = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let shown: String = if collapsed.chars().count() > avail {
+        let take = avail.saturating_sub(1);
+        let mut s: String = collapsed.chars().take(take).collect();
+        s.push('…');
+        s
+    } else {
+        collapsed
+    };
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+        Span::styled(shown, Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 #[allow(dead_code)]
@@ -182,7 +217,28 @@ fn sanitize(s: &str) -> String {
 /// and worker tabs — same model for both.
 pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(log.len());
+    // Insert a blank visual gap before "primary" entries (user, orc,
+    // assistant). Without spacing, consecutive turns run flush and
+    // the eye can't find paragraph boundaries.
+    let push_gap = |out: &mut Vec<Line<'static>>| {
+        if !out.is_empty()
+            && !out
+                .last()
+                .map(|l| l.spans.is_empty())
+                .unwrap_or(true)
+        {
+            out.push(Line::from(""));
+        }
+    };
     for entry in log {
+        // Add a leading gap before turn-like entries so distinct
+        // utterances are visually separated.
+        match entry {
+            LogEntry::UserText(_)
+            | LogEntry::OrcInstruction(_)
+            | LogEntry::AssistantText(_) => push_gap(&mut out),
+            _ => {}
+        }
         match entry {
             LogEntry::UserText(t) => {
                 let t = sanitize(t);
@@ -282,24 +338,42 @@ pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
                 }
             }
             LogEntry::System(s) => {
+                // Render as a dim prose line with a leading `· ` so the
+                // event reads like a natural sentence — no bracketed
+                // wrap that makes it look like a log marker.
                 let s = sanitize(s);
                 for (i, ln) in s.split('\n').enumerate() {
-                    let body = if i == 0 {
-                        format!("[{ln}")
-                    } else {
-                        format!(" {ln}")
-                    };
+                    let prefix = if i == 0 { "· " } else { "  " };
                     out.push(Line::from(Span::styled(
-                        body,
+                        format!("{prefix}{ln}"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                if let Some(last) = out.last_mut() {
-                    // Append closing bracket to last line.
-                    last.spans.push(Span::styled(
-                        "]".to_string(),
-                        Style::default().fg(Color::DarkGray),
+            }
+            LogEntry::Notify(s) => {
+                // Bright call-to-action prose. Leading filled bullet +
+                // brighter colour so the eye finds it among dim system
+                // lines. No brackets — reads as a sentence.
+                let s = sanitize(s);
+                for (i, ln) in s.split('\n').enumerate() {
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    if i == 0 {
+                        spans.push(Span::styled(
+                            "● ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::raw("  "));
+                    }
+                    spans.push(Span::styled(
+                        ln.to_string(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ));
+                    out.push(Line::from(spans));
                 }
             }
             LogEntry::TurnEnd { cost_usd: _ } => {
@@ -597,9 +671,13 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 block_just_ended = false;
             }
             Event::Code(c) => {
+                // Inline code: use a calm Cyan over the previous bright
+                // LightYellow. With many code tokens per paragraph the
+                // yellow created a noisy "rainbow" effect; cyan reads as
+                // monospace technical terms without fighting body text.
                 current.push(Span::styled(
                     c.into_string(),
-                    style(&style_stack).fg(Color::LightYellow),
+                    style(&style_stack).fg(Color::Cyan),
                 ));
             }
             Event::SoftBreak => {
@@ -728,21 +806,28 @@ pub fn wrap_lines_to_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'st
     out
 }
 
-/// Build " events  [N–M / TOTAL] " title.
+/// Build the events frame title. When all rows fit on screen, just
+/// ` events `. When scrolled, show a compact position indicator
+/// ` events  ▲ N% ` so the eye doesn't have to parse "N–M / X / Y".
 fn format_events_title(
     scroll: usize,
     visible: usize,
     wrapped_total: usize,
-    entries_total: usize,
+    _entries_total: usize,
 ) -> String {
-    if wrapped_total == 0 {
+    if wrapped_total == 0 || wrapped_total <= visible {
         return " events ".to_string();
     }
-    let start = scroll + 1;
-    let end = (scroll + visible.max(1)).min(wrapped_total);
-    format!(
-        " events  [{start}–{end} / {wrapped_total} lines · {entries_total} entries] "
-    )
+    let max_scroll = wrapped_total.saturating_sub(visible);
+    if scroll >= max_scroll {
+        return " events  · end ".to_string();
+    }
+    let pct = if max_scroll == 0 {
+        0
+    } else {
+        (scroll * 100) / max_scroll
+    };
+    format!(" events  · {pct}% ↑{}  ", max_scroll - scroll)
 }
 
 /// Build the spinner line shown at the tail while an agent is in a

@@ -257,3 +257,159 @@ async fn e2e_worker_lifecycle_with_fake_claude() {
         session_after.state
     );
 }
+
+// ---------------------------------------------------------------------------
+// Persistence boundary: spawn → AwaitingReview → drop state manager →
+// reopen the same DB file → assert the session and its event log are
+// still there. Mirrors what happens when the user quits and reopens orc
+// on the same project.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn restore_awaiting_review_after_reopen() {
+    let fake_bin = env!("CARGO_BIN_EXE_fake_claude");
+    unsafe { std::env::set_var("ORC_CLAUDE_BIN", fake_bin) };
+
+    let project_dir = setup_git_repo();
+    let data_dir = project_dir.join(".orc");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("state.db");
+
+    let worker_name = format!("survivor-{}", unique_suffix());
+    let session_id;
+
+    // ── round 1: create session, drive to AwaitingReview, append events ──
+    {
+        let db = Database::open(&db_path).unwrap();
+        let policy = PolicyEngine::default_policy();
+        let (state_handle, manager) = StateManager::new(db, policy);
+        let mgr_task = tokio::spawn(manager.run());
+
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerEvent>();
+        let (listener, mcp_port) = orc::mcp::bind_http_listener().await.unwrap();
+        let (orc_inject_tx, _orc_inject_rx) = mpsc::channel::<String>(8);
+        let server = Arc::new(McpServer::new(
+            state_handle.clone(),
+            project_dir.clone(),
+            data_dir.join("hooks.sock"),
+            mcp_port,
+            WorkerRegistry::new(),
+            worker_tx,
+            orc_inject_tx,
+        ));
+        orc::mcp::serve_http(listener, server.clone());
+
+        // Spawn
+        let spawn_resp = server
+            .handle_request(&JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(Value::Number(1.into())),
+                method: "tools/call".into(),
+                params: serde_json::json!({
+                    "name": "spawn_session",
+                    "arguments": {
+                        "name": &worker_name,
+                        "task": "persisted across restart",
+                        "model": "sonnet"
+                    }
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(spawn_resp.error.is_none());
+        let data = extract_json(&spawn_resp.result.unwrap());
+        session_id = data["session_id"].as_str().unwrap().to_string();
+
+        // Drain a couple of WorkerEvents (fake_claude noise) so the
+        // background runner doesn't block the channel.
+        let _ = tokio::time::timeout(Duration::from_secs(3), worker_rx.recv()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), worker_rx.recv()).await;
+
+        // submit_for_review now refuses empty diffs — drop a file in
+        // the worker's worktree so the diff is non-empty.
+        let session = state_handle.get_session(&session_id).await.unwrap();
+        std::fs::write(
+            std::path::Path::new(&session.worktree_path).join("WORK.md"),
+            "did the work",
+        )
+        .unwrap();
+
+        // Submit for review.
+        let resp = server
+            .handle_request(&JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(Value::Number(2.into())),
+                method: "tools/call".into(),
+                params: serde_json::json!({
+                    "name": "submit_for_review",
+                    "arguments": {
+                        "session_id": &session_id,
+                        "summary": "shipped it"
+                    }
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(resp.error.is_none(), "submit_for_review failed: {:?}", resp.error);
+
+        // Persist a few events through the state manager so the
+        // session_events table is populated like in the live UI path.
+        for (kind, payload) in &[
+            ("system", r#"{"t":"spawned"}"#),
+            ("assistant", r#"{"t":"looking at the repo"}"#),
+            ("tool_use", r#"{"name":"Read","input":"README.md"}"#),
+        ] {
+            state_handle
+                .send(orc::state::StateCommand::AppendEvent {
+                    session_id: session_id.clone(),
+                    kind: (*kind).into(),
+                    payload: (*payload).into(),
+                })
+                .await
+                .ok();
+        }
+
+        // Confirm AwaitingReview now.
+        let s = state_handle.get_session(&session_id).await.unwrap();
+        assert!(
+            matches!(s.state, SessionState::AwaitingReview { .. }),
+            "expected AwaitingReview, got {:?}",
+            s.state
+        );
+
+        // Drop the state manager. Wait briefly so any pending DB writes
+        // flush before we re-open the file.
+        drop(state_handle);
+        drop(server);
+        mgr_task.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ── round 2: reopen the SAME db, list sessions, load events ─────────
+    {
+        let db = Database::open(&db_path).unwrap();
+        let policy = PolicyEngine::default_policy();
+        let (state_handle, manager) = StateManager::new(db, policy);
+        tokio::spawn(manager.run());
+
+        let sessions = state_handle.list_sessions().await;
+        let found = sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("session must be restored from disk");
+        assert!(
+            matches!(found.state, SessionState::AwaitingReview { .. }),
+            "expected restored session in AwaitingReview, got {:?}",
+            found.state
+        );
+        assert_eq!(found.name, worker_name);
+
+        let events = state_handle.load_events(&session_id).await;
+        assert!(
+            events.len() >= 3,
+            "expected at least 3 persisted events, got {events:?}"
+        );
+        let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(kinds.contains(&"assistant"), "kinds = {kinds:?}");
+        assert!(kinds.contains(&"tool_use"), "kinds = {kinds:?}");
+    }
+}

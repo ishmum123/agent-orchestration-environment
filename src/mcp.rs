@@ -418,7 +418,8 @@ impl McpServer {
         )
         .await;
 
-        let worker_prompt = worker_system_prompt(&session.id, name, task);
+        let worker_prompt =
+            worker_system_prompt(&session.id, name, task, &worktree_str, &branch);
         match crate::worker::spawn_worker(
             session.id.clone(),
             worktree_path.clone(),
@@ -618,6 +619,18 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'summary'"))?;
 
+        // Look up the worker name + worktree so we can inspect what
+        // actually changed on disk before letting it mark itself done.
+        let session = self
+            .state
+            .get_session(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {}", session_id))?;
+        let name = session.name.clone();
+
+        let no_changes =
+            Self::worktree_has_no_changes_impl(&session.worktree_path, &session.base_commit).await;
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.state
             .send(StateCommand::ApplyEvent {
@@ -631,10 +644,45 @@ impl McpServer {
         rx.await
             .map_err(|_| anyhow::anyhow!("state manager dropped reply"))??;
 
+        let no_changes_tag = if no_changes {
+            " (no file changes detected on the worktree — verify this was intentional)"
+        } else {
+            ""
+        };
+        self.inject_orc_event(&format!(
+            "[internal status — do NOT reply or narrate to the user; \
+             the UI has already notified them]\n\
+             Worker {name} marked itself done: {summary}{no_changes_tag}\n\
+             Track it internally. Only respond if you need to spawn the \
+             next task. If you do speak about this worker later, use its \
+             name ({name})."
+        ))
+        .await;
+
         Ok(serde_json::to_string(&serde_json::json!({
             "ok": true,
-            "session_id": session_id
+            "session_id": session_id,
+            "no_changes": no_changes,
         }))?)
+    }
+
+    /// Fire-and-forget inject of a synthetic user message into the orc
+    /// brain's stream. No-op when the inject channel is absent (test
+    /// fixtures, MCP server running outside the orc process).
+    async fn inject_orc_event(&self, msg: &str) {
+        if let Some(tx) = &self.orc_inject {
+            let _ = tx.send(msg.to_string()).await;
+        }
+    }
+
+    /// Returns true if this worker's worktree has no changes vs its
+    /// base commit. Used to warn when mark_done is called with nothing
+    /// written.
+    async fn worktree_has_no_changes_impl(worktree_path: &str, base_commit: &str) -> bool {
+        match crate::review::compute_diff(worktree_path, base_commit).await {
+            Ok(d) => d.files.is_empty(),
+            Err(_) => false,
+        }
     }
 
     async fn tool_submit_for_review(&self, args: &Value) -> Result<String> {
@@ -653,23 +701,26 @@ impl McpServer {
             .await
             .ok_or_else(|| anyhow::anyhow!("unknown session: {}", session_id))?;
 
-        // Compute diff hash from the worktree against base commit.
-        let diff_hash = match crate::review::compute_diff(
+        // Reject empty-diff submissions outright. There is no point
+        // reviewing nothing, and historically workers have called
+        // submit_for_review without saving any files — the diff was
+        // literally empty. Force them to actually do the work first.
+        let diff = match crate::review::compute_diff(
             &session.worktree_path,
             &session.base_commit,
         )
         .await
         {
-            Ok(diff) => crate::review::diff_hash(&diff),
-            Err(_) => {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                summary.hash(&mut h);
-                session_id.hash(&mut h);
-                format!("{:016x}", h.finish())
-            }
+            Ok(d) => d,
+            Err(e) => anyhow::bail!("could not compute diff: {e}"),
         };
+        if diff.files.is_empty() {
+            anyhow::bail!(
+                "refusing to submit for review: no file changes on this worker's worktree. \
+                 Make the edits, write the files, and commit before calling submit_for_review."
+            );
+        }
+        let diff_hash = crate::review::diff_hash(&diff);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.state
@@ -692,6 +743,28 @@ impl McpServer {
             name: session.name.clone(),
             summary: summary.to_string(),
         });
+
+        // Wake the orc brain so it sees the submission immediately
+        // (without this it would only learn when the user next types).
+        let name = &session.name;
+        let summary_part = if summary.is_empty() {
+            String::new()
+        } else {
+            format!(": {summary}")
+        };
+        // Silent inject: the UI already shows the user a notification
+        // (LogEntry::Notify in handle_state_change). The brain should
+        // ingest this as state, not narrate it back — otherwise the
+        // user sees the same fact twice.
+        self.inject_orc_event(&format!(
+            "[internal status — do NOT reply or narrate to the user; \
+             the UI has already notified them]\n\
+             Worker {name} submitted its work for review{summary_part}.\n\
+             Track it internally. Do not write anything in response \
+             unless you need to spawn the next dependent task. \
+             If you do speak about this worker later, use its name ({name})."
+        ))
+        .await;
 
         Ok(serde_json::to_string(&serde_json::json!({
             "ok": true,
@@ -718,6 +791,27 @@ impl McpServer {
                 summary: summary.to_string(),
             })
             .await?;
+
+        // When a worker reports progress, surface it to the orc brain so
+        // it can stay aware without having to poll list_sessions. Framed
+        // as informational — orc decides whether to act. Skips when orc
+        // itself is the reporter (we don't echo orc's own summary back
+        // at it).
+        if key != "orc" {
+            let name = self
+                .state
+                .get_session(&key)
+                .await
+                .map(|s| s.name)
+                .unwrap_or_else(|| key.clone());
+            self.inject_orc_event(&format!(
+                "[internal status — do NOT reply or narrate to the user; \
+                 the UI already shows this in the agents panel]\n\
+                 Worker {name} reports progress: {summary}\n\
+                 Track it. Only respond if you need to redirect {name}."
+            ))
+            .await;
+        }
 
         Ok(serde_json::to_string(&serde_json::json!({
             "ok": true,
@@ -845,8 +939,15 @@ pub async fn start_http_server(server: std::sync::Arc<McpServer>) -> Result<u16>
 /// Generate MCP config JSON for Claude Code's --mcp-config flag (HTTP transport).
 /// The MCP server runs in-process on localhost, Claude Code connects to it.
 /// System prompt appended to a worker's claude session.
-/// Tells the worker its identity and how to use MCP tools to communicate back.
-pub fn worker_system_prompt(session_id: &str, name: &str, task: &str) -> String {
+/// Tells the worker its identity, where it lives, and how to use MCP
+/// tools to communicate back.
+pub fn worker_system_prompt(
+    session_id: &str,
+    name: &str,
+    task: &str,
+    worktree_path: &str,
+    branch: &str,
+) -> String {
     format!(
         r#"You are an orc worker session.
 
@@ -854,18 +955,44 @@ pub fn worker_system_prompt(session_id: &str, name: &str, task: &str) -> String 
 - session_id: {session_id}
 - name: {name}
 
+## Your sandbox (READ THIS CAREFULLY)
+
+You are running inside a **git worktree** that is isolated from the user's main project. Your current working directory is already set to it:
+
+    {worktree_path}
+
+This worktree is checked out on branch `{branch}`. **Every file you create or edit MUST live inside this worktree.**
+
+Hard rules about file location:
+
+- Use **relative paths** for Write/Edit/Read whenever possible. `src/foo.rs` lands in the worktree. `./README.md` lands in the worktree. That is what you want.
+- If you ever write an **absolute path**, it MUST start with `{worktree_path}`. Never write to paths outside this prefix.
+- Do **not** `cd` out of the worktree. Do **not** edit files in the user's main project directory — even if you can see those paths via Read. Read-only inspection of the parent repo (via absolute paths) is fine; writes are not.
+- The user reviews your work by diffing this worktree against its base commit. Files written outside the worktree are invisible to them — they will see "no changes" and reject your submission.
+
 ## Task
 {task}
 
 ## How to communicate back
 You have access to these MCP tools (server: orc):
-- submit_for_review(session_id, summary): Call when your work is ready for human review. Pass your session_id ({session_id}). The user will inspect the diff and approve or reject.
-- mark_done(session_id, summary): Call only if no review is needed (rare).
+- submit_for_review(session_id, summary): Call when your work is ready for human review. Pass your session_id ({session_id}). The user will inspect the diff and approve or reject. **Rejected automatically if your worktree has no changes vs base.**
+- mark_done(session_id, summary): Call only if no review is needed (rare). Will warn if no file changes detected.
 - ask_user(question, context?, session_id?): Ask the human a question. BLOCKS until they respond. Pass your session_id ({session_id}) so orc can race to answer first if it has context.
 - current_summary(summary, session_id?): Record a one-sentence summary of what you are currently working on. Pass your session_id ({session_id}). Call this periodically after meaningful progress, not after every line — the user reads this in the agents panel.
 
 ## Rules
-- Do the task in your current worktree. All your file edits live on a dedicated branch.
+
+**You MUST write your work to disk.** Talking about edits is not editing. Reasoning about what a file should contain is not creating that file. If your task involves producing code, documentation, or any file at all:
+
+1. Use the `Write` or `Edit` tool. Every. Time.
+2. Verify with `Read` after writing — confirm the bytes are on disk.
+3. Run `git status` to confirm the worktree shows your changes (you should see them under "Untracked files" or "Changes not staged for commit"). If git status is empty, you have not done the work yet.
+4. Only then call `submit_for_review` or `mark_done`.
+
+`submit_for_review` will be **rejected** by the harness if your worktree has no changes vs the base commit. There is no exception. "I described what to do" or "I planned it out" is not a valid completion state.
+
+Other rules:
+
 - When done, ALWAYS call submit_for_review first. Don't ask the user to confirm; let them review the diff.
 - Keep your responses concise.
 - Periodically call `current_summary` to keep the user oriented. After meaningful progress, not after every line.
@@ -873,6 +1000,8 @@ You have access to these MCP tools (server: orc):
         session_id = session_id,
         name = name,
         task = task,
+        worktree_path = worktree_path,
+        branch = branch,
     )
 }
 
@@ -909,19 +1038,23 @@ mod tests {
     use super::*;
 
     async fn test_server() -> McpServer {
+        test_server_with_inject().await.0
+    }
+
+    /// Variant that returns the orc_inject receiver so a test can
+    /// assert what synthetic messages would have been pushed to the
+    /// orc brain.
+    async fn test_server_with_inject() -> (McpServer, mpsc::Receiver<String>) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::Database::open(dir.path().join("test.db")).unwrap();
         let policy = crate::policy::PolicyEngine::default_policy();
         let (handle, manager) = crate::state::StateManager::new(db, policy);
         tokio::spawn(manager.run());
 
-        // Put git repo inside a "repo" subdir so worktrees go into the tempdir
-        // (not /tmp/.orc-worktrees which collides across tests)
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
         let hook_socket_path = dir.path().join("hooks.sock");
 
-        // Initialize a git repo so worktree creation works in tests
         let _ = std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(&project_dir)
@@ -931,11 +1064,54 @@ mod tests {
             .current_dir(&project_dir)
             .output();
 
-        // Leak tempdir so it outlives the test
         std::mem::forget(dir);
         let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
-        let (inj_tx, _inj_rx) = mpsc::channel(8);
-        McpServer::new(handle, project_dir, hook_socket_path, 0, WorkerRegistry::new(), worker_tx, inj_tx)
+        let (inj_tx, inj_rx) = mpsc::channel(8);
+        let server = McpServer::new(
+            handle,
+            project_dir,
+            hook_socket_path,
+            0,
+            WorkerRegistry::new(),
+            worker_tx,
+            inj_tx,
+        );
+        (server, inj_rx)
+    }
+
+    /// Spawn a session via the MCP tool and return its session_id.
+    async fn spawn_session(server: &McpServer, name: &str) -> String {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(Value::Number(1.into())),
+            method: "tools/call".into(),
+            params: serde_json::json!({
+                "name": "spawn_session",
+                "arguments": { "name": name, "task": "test" }
+            }),
+        };
+        let resp = server.handle_request(&req).await.unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        parsed["session_id"].as_str().unwrap().to_string()
+    }
+
+    async fn call_tool(server: &McpServer, name: &str, args: Value) -> Value {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(Value::Number(99.into())),
+            method: "tools/call".into(),
+            params: serde_json::json!({ "name": name, "arguments": args }),
+        };
+        let resp = server.handle_request(&req).await.unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        serde_json::from_str(&text).unwrap()
     }
 
     #[tokio::test]
@@ -1261,5 +1437,180 @@ mod tests {
             assert!(!tool.description.is_empty());
             assert_eq!(tool.input_schema["type"], "object");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Worker → orc-brain injection: every tool that signals worker
+    // progress must wake the orchestrator so it doesn't go silent when
+    // a worker reports done / submits / publishes a summary.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mark_done_injects_into_orc() {
+        let (server, mut inj) = test_server_with_inject().await;
+        let sid = spawn_session(&server, "finisher").await;
+
+        // Drain any spawn-time injects (currently none, but be robust).
+        while inj.try_recv().is_ok() {}
+
+        let resp = call_tool(
+            &server,
+            "mark_done",
+            serde_json::json!({ "session_id": sid, "summary": "all green" }),
+        )
+        .await;
+        assert_eq!(resp["ok"], true);
+
+        let msg = inj
+            .recv()
+            .await
+            .expect("expected an inject when worker marks done");
+        assert!(
+            msg.contains("Worker finisher marked itself done"),
+            "inject text: {msg}"
+        );
+        assert!(msg.contains("all green"), "summary missing: {msg}");
+    }
+
+    /// submit_for_review now refuses empty-diff workers. Drop a file
+    /// into the worker's worktree so the diff isn't empty.
+    async fn touch_worktree_file(server: &McpServer, session_id: &str) {
+        let session = server
+            .state
+            .get_session(session_id)
+            .await
+            .expect("session exists");
+        let path = std::path::Path::new(&session.worktree_path).join("scratch.txt");
+        std::fs::write(path, "edit").unwrap();
+    }
+
+    #[tokio::test]
+    async fn submit_for_review_injects_into_orc() {
+        let (server, mut inj) = test_server_with_inject().await;
+        let sid = spawn_session(&server, "reviewer").await;
+        touch_worktree_file(&server, &sid).await;
+        while inj.try_recv().is_ok() {}
+
+        let resp = call_tool(
+            &server,
+            "submit_for_review",
+            serde_json::json!({ "session_id": sid, "summary": "added the OAuth flow" }),
+        )
+        .await;
+        assert_eq!(resp["ok"], true);
+
+        let msg = inj
+            .recv()
+            .await
+            .expect("expected an inject when worker submits for review");
+        assert!(
+            msg.contains("Worker reviewer submitted its work for review"),
+            "inject text: {msg}"
+        );
+        assert!(msg.contains("added the OAuth flow"), "summary missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn submit_for_review_inject_omits_summary_when_empty() {
+        let (server, mut inj) = test_server_with_inject().await;
+        let sid = spawn_session(&server, "quiet").await;
+        touch_worktree_file(&server, &sid).await;
+        while inj.try_recv().is_ok() {}
+
+        call_tool(
+            &server,
+            "submit_for_review",
+            serde_json::json!({ "session_id": sid }),
+        )
+        .await;
+
+        let msg = inj.recv().await.expect("inject expected");
+        assert!(
+            msg.contains("Worker quiet submitted its work for review"),
+            "inject text: {msg}"
+        );
+        // No trailing ": something" segment when summary was missing.
+        assert!(
+            !msg.contains("for review:"),
+            "should not have colon when summary empty: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_for_review_rejects_empty_diff() {
+        // Workers that haven't written anything should not be able to
+        // claim review-ready. The user reported seeing workers report
+        // done without saving files — this guard catches the submit-
+        // for-review case at the MCP boundary.
+        let (server, _inj) = test_server_with_inject().await;
+        let sid = spawn_session(&server, "lazy").await;
+
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(Value::Number(42.into())),
+            method: "tools/call".into(),
+            params: serde_json::json!({
+                "name": "submit_for_review",
+                "arguments": { "session_id": sid, "summary": "claims done" }
+            }),
+        };
+        let resp = server.handle_request(&req).await.unwrap();
+        let result = resp.result.expect("tool errors go in content");
+        assert_eq!(result["isError"], true, "expected error response");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("no file changes"),
+            "expected empty-diff error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_summary_from_worker_injects_into_orc() {
+        let (server, mut inj) = test_server_with_inject().await;
+        let sid = spawn_session(&server, "scout").await;
+        while inj.try_recv().is_ok() {}
+
+        call_tool(
+            &server,
+            "current_summary",
+            serde_json::json!({ "session_id": sid, "summary": "scanning files" }),
+        )
+        .await;
+
+        let msg = inj.recv().await.expect("inject expected for worker summary");
+        assert!(
+            msg.contains("Worker scout reports progress"),
+            "inject text: {msg}"
+        );
+        assert!(msg.contains("scanning files"), "summary missing: {msg}");
+        // Internal-status framing tells the brain to ingest silently.
+        assert!(msg.contains("internal status"), "framing missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn current_summary_from_orc_does_not_inject() {
+        // Orc itself sets a summary — we must not echo it back into orc's
+        // own message stream (that would create a loop).
+        let (server, mut inj) = test_server_with_inject().await;
+        while inj.try_recv().is_ok() {}
+
+        call_tool(
+            &server,
+            "current_summary",
+            serde_json::json!({ "session_id": "orc", "summary": "planning" }),
+        )
+        .await;
+
+        // Default session_id is "orc" when omitted — same path.
+        call_tool(
+            &server,
+            "current_summary",
+            serde_json::json!({ "summary": "still planning" }),
+        )
+        .await;
+
+        // Should be empty. Use a short timeout to avoid hanging.
+        let got = tokio::time::timeout(std::time::Duration::from_millis(50), inj.recv()).await;
+        assert!(got.is_err(), "did not expect any inject for orc's own summary, got: {got:?}");
     }
 }
