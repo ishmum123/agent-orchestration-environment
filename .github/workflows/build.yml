@@ -7,7 +7,20 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            artifact: orc
+            asset: orc-linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+            artifact: orc
+            asset: orc-macos-arm64
 
     steps:
       - name: Checkout repository
@@ -16,16 +29,24 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install tmux (required by integration tests)
+      - name: Install tmux (Linux, required by integration tests)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tmux
 
+      - name: Install tmux (macOS, required by integration tests)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - name: Configure git identity
+        shell: bash
         run: |
           git config --global user.email "ci@example.com"
           git config --global user.name "CI"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Run tests
         run: cargo test --release
@@ -36,5 +57,5 @@ jobs:
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: orc-linux
-          path: target/release/orc
+          name: ${{ matrix.asset }}
+          path: target/release/${{ matrix.artifact }}

@@ -27,6 +27,13 @@ Proof of concept more than a product. MIT licensed.
     cd orc
     cargo install --path . --force
 
+Or grab a prebuilt binary from the latest green `main` CI run (via [nightly.link](https://nightly.link/), no GitHub login needed):
+
+- Linux x86_64: [orc-linux-x86_64.zip](https://nightly.link/ishmum123/agent-orchestration-environment/workflows/build/main/orc-linux-x86_64.zip)
+- macOS arm64: [orc-macos-arm64.zip](https://nightly.link/ishmum123/agent-orchestration-environment/workflows/build/main/orc-macos-arm64.zip)
+
+Unzip, then `chmod +x orc`.
+
 Requires:
 
 - Rust (stable)
