@@ -332,6 +332,9 @@ async fn run_event_loop(
                     KeyAction::Editor { command, target, line } => {
                         run_editor(terminal, &command, &target, line).await?;
                     }
+                    KeyAction::ScratchClaude => {
+                        run_scratch_claude(terminal, project_dir).await?;
+                    }
                     KeyAction::RestartWorker { session_id } => {
                         if let Err(e) = restart_worker(
                             app,
@@ -527,6 +530,7 @@ enum KeyAction {
     InterruptOrc,
     InterruptWorker(String),
     Editor { command: String, target: String, line: Option<usize> },
+    ScratchClaude,
     RestartWorker { session_id: String },
 }
 
@@ -765,12 +769,19 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
 
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
-        // `n` jumps to the next worker that needs attention (awaiting
+        // `!` jumps to the next worker that needs attention (awaiting
         // review > failed > blocked). Cycles. No-op if nothing pending.
-        KeyCode::Char('n') => {
+        // `n` is reserved for the scratch claude handoff.
+        KeyCode::Char('!') => {
             if let Some(target) = next_attention_tab(app) {
                 app.focus_tab(target);
             }
+        }
+        // `n` surrenders the terminal to a plain `claude` session
+        // rooted at the project. orc never sees the transcript; the
+        // session keeps no state in orc. Mirrors the `e` editor flow.
+        KeyCode::Char('n') => {
+            return KeyAction::ScratchClaude;
         }
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
@@ -1814,6 +1825,33 @@ async fn run_editor(
 
     if let Err(e) = status {
         eprintln!("[orc] editor error: {e}");
+    }
+
+    Ok(())
+}
+
+/// Surrender the terminal to a plain `claude` session rooted at the
+/// project. Mirrors `run_editor`: leave alt-screen, run the child to
+/// completion with inherited stdio, then restore the TUI. orc keeps
+/// no record of the session — the trust root stays sealed because
+/// nothing crosses the boundary.
+async fn run_scratch_claude(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    project_dir: &std::path::Path,
+) -> Result<()> {
+    terminal::disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    let status = std::process::Command::new(worker::claude_bin())
+        .current_dir(project_dir)
+        .status();
+
+    io::stdout().execute(EnterAlternateScreen)?;
+    terminal::enable_raw_mode()?;
+    terminal.clear()?;
+
+    if let Err(e) = status {
+        eprintln!("[orc] claude error: {e}");
     }
 
     Ok(())

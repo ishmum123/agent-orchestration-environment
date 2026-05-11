@@ -520,9 +520,10 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
             )
         });
         if any_attention {
-            parts.push(("n", "next ⚡"));
+            parts.push(("!", "next ⚡"));
         }
     }
+    parts.push(("n", "claude"));
     parts.push(("G", "end"));
     parts.push(("?", "help"));
     parts.push(("q", "quit"));

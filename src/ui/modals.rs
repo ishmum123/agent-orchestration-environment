@@ -455,7 +455,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             &[
                 ("tab / shift+tab", "cycle tabs"),
                 ("1-9", "jump to tab"),
-                ("n", "jump to next attention (review/failed/blocked)"),
+                ("!", "jump to next attention (review/failed/blocked)"),
                 ("j / ↓", "scroll down"),
                 ("↑ / pgup", "scroll up"),
                 ("gg / home", "jump to top"),
@@ -471,6 +471,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("x", "kill focused worker"),
                 ("R", "restart failed worker"),
                 ("^C", "interrupt"),
+                ("n", "fullscreen claude (scratch session, project cwd)"),
             ],
         ),
         (

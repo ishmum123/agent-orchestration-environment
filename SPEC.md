@@ -102,6 +102,16 @@ The keystroke ladder `r → o → e` reinforces frequency and disruption: each s
 
 ---
 
+## Scratch claude (`n`)
+
+`n` (global, any tab, no modal open) surrenders the terminal to a plain `claude` child running in the project root and resumes orc when claude exits. Mirrors the `e` editor handoff: leave alt-screen, run blocking with inherited stdio, re-enter. One scratch session at a time.
+
+Orc never sees the transcript. Nothing crosses the boundary by construction — the trust root stays sealed because there's no IPC, no log capture, no orc state touched. Workers in flight keep running in the background but are invisible while inside; that's an accepted trade-off for the scratch-session ergonomic.
+
+The binary is resolved via the same `ORC_CLAUDE_BIN`-then-`claude` lookup workers use, so harness runs with the `fake_claude` shim work the same way.
+
+---
+
 ## What's preserved
 
 - **Worktrees**. Each worker gets `git worktree add` to a dedicated branch. This is workspace isolation, unrelated to how the Claude process is run. Worktrees stay.
@@ -112,7 +122,7 @@ The keystroke ladder `r → o → e` reinforces frequency and disruption: each s
 ## What's removed
 
 - **tmux for workers**. Workers are stream-json children of orc; no terminal involved.
-- **Attach-into-claude**. There is no path that surrenders the screen to a raw Claude TUI. Editor handoff is the only outside-orc surrender, and it goes to a tool *you* picked.
+- **Attach-into-claude for workers**. No path surrenders the screen to a worker's Claude TUI; workers are stream-json children, observed only through orc. The scratch `n` handoff is *not* this — it spawns a fresh, unrelated claude session and never sees orc's worker state.
 - **The PTY tail / pane snapshot**. Workers' logs are structured events, not terminal redraws.
 
 ---
