@@ -206,7 +206,7 @@ fn render_hints(frame: &mut Frame, area: Rect, _thinking: bool) {
         Span::styled("Ctrl+b", key),
         Span::styled(" → opus  ", dim),
         Span::styled("Ctrl+n", key),
-        Span::styled(" → orc", dim),
+        Span::styled(" attach", dim),
     ]);
     frame.render_widget(Paragraph::new(hints), area);
 }

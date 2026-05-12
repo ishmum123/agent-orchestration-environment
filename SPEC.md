@@ -118,7 +118,7 @@ The binary is resolved via the same `ORC_CLAUDE_BIN`-then-`claude` lookup worker
 
 The backchannel is a stream-json claude child spawned in the project root cwd, on **sonnet** by default. No worktree, no MCP server attachment, no policy gating, no system prompt — it's a sealed-off sidekick for "ask a question, read some code, brainstorm" use that shouldn't pollute orc's context.
 
-**Trust-root isolation.** The backchannel transcript never enters `orc_view.event_log`, never reaches the orchestrator, never appears in the agents panel or task graph. Workers spawned by orc don't see it either. The only escape hatch is `Ctrl-N` below, which is user-initiated.
+**Trust-root isolation.** The backchannel transcript never enters `orc_view.event_log`, never reaches the orchestrator, never appears in the agents panel or task graph. Workers spawned by orc don't see it either. The only escape hatch is `Ctrl-N` below, which is user-initiated — and it carries only a short distilled brief, not the chat itself.
 
 The help screen lives on `h`. `?` is reserved for the overlay.
 
@@ -128,7 +128,16 @@ Keys, while overlay is open:
 - `?` — also closes overlay when the input buffer is empty (so `?` toggles).
 - `Ctrl-X` — kill the backchannel child and drop its state. Next `?` spawns a fresh sonnet channel.
 - `Ctrl-B` — promote to opus. If the conversation is empty, just respawn on opus directly. If non-empty, the channel is asked for a 1–3 sentence summary; on completion the sonnet child is killed and a fresh opus child is spawned with the summary as its first user message (carried forward as a System line in the new transcript).
-- `Ctrl-N` — promote to orc. Asks the channel for a summary; on completion the summary is sent into orc's input stream as a user message prefixed `[from scratch claude]`. The channel is killed. **This is the only path that lets orc's trust root see backchannel content, and it's user-initiated.**
+- `Ctrl-N` — **attach as worker.** Asks the channel for a `{slug, task}` summary; on completion the scratch child is killed, the overlay closes, and a fresh regular worker is spawned with the task as its brief. The new worker is structurally indistinguishable from one spawned via `c` chat → `spawn_session`: own worktree, MCP wiring, worker system prompt, tab in the panel. Focus jumps to the new tab. The scratch chat history is **not** transferred — only the summary crosses the boundary. The trade-off (accepted): faithfulness to the prior chat is lost; true worker-equivalence is gained.
+
+Summary prompt: the channel is told to reply with strict JSON on a single line — `{"slug":"<kebab-case ≤20 chars>","task":"<1-3 sentence brief>"}`. The first balanced `{…}` is extracted (so a code-fenced or prose-wrapped reply still parses), the slug is sanitized to `[a-z0-9-]` and truncated, and the task is taken verbatim. **Fallback** (any parse failure or empty fields): slug becomes `scratch-<HHMMSS>` and the entire raw reply becomes the task. This keeps the flow robust to a non-cooperating model (e.g. the echo-mode `fake_claude` shim used in harness tests).
+
+Edge cases:
+
+- **Ctrl+N during an in-flight turn.** The summary request is queued onto the channel's stdin — claude processes user messages serially, so it runs naturally after the current turn completes. No abort, no race.
+- **Ctrl+N with an empty conversation.** No-op except for an inline system line in the overlay (`nothing to attach — say something first.`). The channel is not killed; the user keeps the overlay.
+- **Spawn failure** (e.g. worktree creation fails because of a dirty repo). The overlay stays open and a system line records the error. The channel is not killed — the user's chat is preserved so they can retry or copy it out.
+- **Name collision.** If the model picks a slug already in use by an existing session, orc appends `-2`, `-3`, … until a free name is found, so `git worktree add` doesn't fail.
 
 The binary is resolved via the same `ORC_CLAUDE_BIN`-then-`claude` lookup workers use, so harness runs with the `fake_claude` shim work the same way.
 

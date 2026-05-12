@@ -152,6 +152,7 @@ async fn main() -> Result<()> {
         worker_tx.clone(),
         orc_inject_tx.clone(),
     ));
+    let mcp_server_for_ctrl_n = mcp_server.clone();
     mcp::serve_http(mcp_listener, mcp_server);
 
     let mcp_config_path = orc::write_mcp_config(&data_dir, mcp_port).await?;
@@ -261,6 +262,7 @@ async fn main() -> Result<()> {
         &hook_sock,
         mcp_port,
         worker_tx.clone(),
+        mcp_server_for_ctrl_n,
     )
     .await;
 
@@ -291,6 +293,7 @@ async fn run_event_loop(
     hook_sock: &PathBuf,
     mcp_port: u16,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+    mcp_server: Arc<McpServer>,
 ) -> Result<()> {
     // Backchannel event receiver. None until the user opens the overlay
     // for the first time. The Backchannel struct itself lives in `app`.
@@ -427,23 +430,28 @@ async fn run_event_loop(
                             }
                         }
                     }
-                    KeyAction::PromoteBackchannelToOrc => {
+                    KeyAction::AttachBackchannelAsWorker => {
+                        // Empty conversation: nothing for a worker to do.
+                        // Surface a notice in the overlay rather than
+                        // silently dropping the channel — the user might
+                        // have hit Ctrl+N by mistake.
                         let history_empty = app
                             .backchannel
                             .as_ref()
                             .map(|b| b.history.is_empty())
                             .unwrap_or(true);
                         if history_empty {
-                            // Nothing to hand over — just drop.
-                            if let Some(bc) = app.backchannel.take() {
-                                bc.kill().await;
+                            if let Some(bc) = app.backchannel.as_mut() {
+                                bc.history.push(backchannel::BackchannelEntry::System(
+                                    "nothing to attach — say something first.".to_string(),
+                                ));
                             }
-                            bc_rx = None;
                         } else if let Some(bc) = app.backchannel.as_mut() {
-                            if let Err(e) = bc
-                                .request_summary(backchannel::PendingPromotion::ToOrc)
-                                .await
-                            {
+                            // If a turn is already in flight, the summary
+                            // request will queue behind it — claude
+                            // processes stdin messages serially. This is
+                            // the cleanest "wait for in-flight" handling.
+                            if let Err(e) = bc.request_attach_summary().await {
                                 bc.history.push(backchannel::BackchannelEntry::System(
                                     format!("summary request failed: {e}"),
                                 ));
@@ -570,18 +578,37 @@ async fn run_event_loop(
                                     }
                                 }
                             }
-                            backchannel::PendingPromotion::ToOrc => {
-                                let promoted = summary.trim().to_string();
-                                if let Some(bc) = app.backchannel.take() {
-                                    bc.kill().await;
-                                }
-                                bc_rx = None;
-                                if !promoted.is_empty() {
-                                    let msg = format!(
-                                        "[from scratch claude] {promoted}"
-                                    );
-                                    app.push_chat(ChatRole::User, msg.clone());
-                                    let _ = orc_process.send(&msg).await;
+                            backchannel::PendingPromotion::AttachAsWorker => {
+                                let spec = backchannel::parse_summary(&summary);
+                                let name = unique_session_name(state_handle, &spec.slug).await;
+                                match mcp_server.spawn_session(&name, &spec.task, "sonnet").await {
+                                    Ok(session) => {
+                                        if let Some(bc) = app.backchannel.take() {
+                                            bc.kill().await;
+                                        }
+                                        bc_rx = None;
+                                        // The session is created here but its
+                                        // tab is appended in handle_state_change
+                                        // when the SessionCreated broadcast
+                                        // lands. Stage the focus jump so it
+                                        // fires once the tab actually exists.
+                                        app.pending_focus_session_id = Some(session.id.clone());
+                                    }
+                                    Err(e) => {
+                                        // Keep the overlay alive so the user
+                                        // doesn't lose the chat. The channel
+                                        // is still usable; pending was cleared
+                                        // when TurnEnd fired.
+                                        if let Some(bc) = app.backchannel.as_mut() {
+                                            bc.history.push(
+                                                backchannel::BackchannelEntry::System(
+                                                    format!(
+                                                        "attach failed (worker spawn): {e}"
+                                                    ),
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -721,9 +748,35 @@ enum KeyAction {
     /// If the conversation is empty, respawn directly; otherwise ask
     /// for a summary first and complete the swap when it arrives.
     PromoteBackchannelModel(String),
-    /// Ctrl-N: hand the channel's summary to orc as a user message,
-    /// then drop the channel.
-    PromoteBackchannelToOrc,
+    /// Ctrl-N: ask the channel for a slug+task summary, then spawn a
+    /// fresh regular worker with that task, kill the channel, and
+    /// close the overlay. The new worker is structurally identical to
+    /// a `c` / `spawn_session`-spawned worker.
+    AttachBackchannelAsWorker,
+}
+
+/// Pick a session name that doesn't collide with an existing one.
+/// Worktrees live at `<repo>/../.orc-worktrees/<name>`, so a clash on
+/// `name` would make `git worktree add` fail. Append `-2`, `-3`, … until
+/// we find a free slot.
+async fn unique_session_name(state_handle: &StateHandle, base: &str) -> String {
+    let existing: std::collections::HashSet<String> = state_handle
+        .list_sessions()
+        .await
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    if !existing.contains(base) {
+        return base.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Render the user's prompt for display purposes (event log / worker chat)
@@ -1539,7 +1592,7 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
         match key.code {
             KeyCode::Char('x') => return KeyAction::KillBackchannel,
             KeyCode::Char('b') => return KeyAction::PromoteBackchannelModel("opus".to_string()),
-            KeyCode::Char('n') => return KeyAction::PromoteBackchannelToOrc,
+            KeyCode::Char('n') => return KeyAction::AttachBackchannelAsWorker,
             KeyCode::Char('v') => {
                 if let Some(bc) = app.backchannel.as_mut() {
                     match input_attachments::try_from_clipboard() {
@@ -1798,6 +1851,13 @@ fn handle_state_change(app: &mut App, change: StateChange) {
                 // Show the initial task in the worker's own log so the user
                 // can see what orc told this worker to do.
                 app.push_log(&id, LogEntry::OrcInstruction(task));
+                // Honor a staged focus jump (set by Ctrl+N attach).
+                if app.pending_focus_session_id.as_deref() == Some(id.as_str()) {
+                    app.pending_focus_session_id = None;
+                    if let Some(&idx) = app.session_index.get(&id) {
+                        app.focus_tab(app::TabId::Worker(idx));
+                    }
+                }
             }
         }
         StateChange::SessionStateChanged {
