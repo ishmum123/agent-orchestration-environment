@@ -2,6 +2,7 @@ mod app;
 mod backchannel;
 mod db;
 mod hooks;
+mod input_attachments;
 mod mcp;
 mod orc;
 mod policy;
@@ -173,6 +174,7 @@ async fn main() -> Result<()> {
         app.modal = Some(Modal::NewTask {
             target: TabId::Orc,
             buffer: String::new(),
+            attachments: input_attachments::AttachmentSet::new(),
         });
     } else {
         for name in &restored.review {
@@ -314,8 +316,9 @@ async fn run_event_loop(
                         .await;
                         return Ok(());
                     }
-                    KeyAction::SendToOrc(msg) => {
-                        app.push_chat(ChatRole::User, msg.clone());
+                    KeyAction::SendToOrc(msg, attachments) => {
+                        let display = format_user_with_attachments(&msg, &attachments);
+                        app.push_chat(ChatRole::User, display);
                         cleanup_idle_done_sessions(
                             app,
                             state_handle,
@@ -324,10 +327,12 @@ async fn run_event_loop(
                             &msg,
                         )
                         .await;
-                        let _ = orc_process.send(&msg).await;
+                        let _ = orc_process.send_with(&msg, &attachments).await;
                     }
-                    KeyAction::SendToWorker { session_id, body } => {
-                        let _ = worker_registry.send(&session_id, &body).await;
+                    KeyAction::SendToWorker { session_id, body, attachments } => {
+                        let _ = worker_registry
+                            .send_with(&session_id, &body, &attachments)
+                            .await;
                     }
                     KeyAction::InterruptOrc => {
                         let _ = orc_process.interrupt().await;
@@ -697,8 +702,12 @@ async fn handle_worker_event(
 enum KeyAction {
     None,
     Quit,
-    SendToOrc(String),
-    SendToWorker { session_id: String, body: String },
+    SendToOrc(String, Vec<input_attachments::Attachment>),
+    SendToWorker {
+        session_id: String,
+        body: String,
+        attachments: Vec<input_attachments::Attachment>,
+    },
     InterruptOrc,
     InterruptWorker(String),
     Editor { command: String, target: String, line: Option<usize> },
@@ -717,6 +726,22 @@ enum KeyAction {
     PromoteBackchannelToOrc,
 }
 
+/// Render the user's prompt for display purposes (event log / worker chat)
+/// with a trailing `[+N image(s)]` suffix when images are attached.
+fn format_user_with_attachments(
+    text: &str,
+    attachments: &[input_attachments::Attachment],
+) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    format!(
+        "{text} [+{n} image{plural}]",
+        n = attachments.len(),
+        plural = if attachments.len() == 1 { "" } else { "s" }
+    )
+}
+
 /// Clear the spinner flag for a worker once it produces visible output.
 fn clear_thinking(app: &mut App, session_id: &str) {
     if let Some(&idx) = app.session_index.get(session_id) {
@@ -726,21 +751,41 @@ fn clear_thinking(app: &mut App, session_id: &str) {
 
 /// Append a pasted block to the active modal's text buffer. If no input
 /// modal is open, the paste is dropped (orc has no persistent input box).
+///
+/// Image paths inside the paste payload are extracted and added as
+/// `Attachment` chips on the focused input box. Remaining text — or the
+/// whole payload when no image path is found — falls through to the
+/// buffer.
 fn handle_paste(text: &str, app: &mut App) {
+    let images = input_attachments::try_from_paste(text);
+    let has_image_attachments = !images.is_empty();
+    let attachments: Vec<input_attachments::Attachment> =
+        images.into_iter().filter_map(|r| r.ok()).collect();
+
     // Pastes land in the backchannel input box when the overlay is open.
     if app.modal.is_none() {
         if let Some(bc) = app.backchannel.as_mut() {
             if bc.open {
-                bc.input.push_str(text);
+                for a in attachments {
+                    bc.attachments.push(a);
+                }
+                if !has_image_attachments {
+                    bc.input.push_str(text);
+                }
                 return;
             }
         }
     }
     let modal = app.modal.take();
     let new = match modal {
-        Some(Modal::NewTask { target, mut buffer }) => {
-            buffer.push_str(text);
-            Some(Modal::NewTask { target, buffer })
+        Some(Modal::NewTask { target, mut buffer, attachments: mut set }) => {
+            for a in attachments {
+                set.push(a);
+            }
+            if !has_image_attachments {
+                buffer.push_str(text);
+            }
+            Some(Modal::NewTask { target, buffer, attachments: set })
         }
         Some(Modal::AskUser {
             session_id,
@@ -749,9 +794,15 @@ fn handle_paste(text: &str, app: &mut App) {
             context,
             mut buffer,
             hidden,
+            attachments: mut set,
         }) => {
             if !hidden {
-                buffer.push_str(text);
+                for a in attachments {
+                    set.push(a);
+                }
+                if !has_image_attachments {
+                    buffer.push_str(text);
+                }
             }
             Some(Modal::AskUser {
                 session_id,
@@ -760,6 +811,7 @@ fn handle_paste(text: &str, app: &mut App) {
                 context,
                 buffer,
                 hidden,
+                attachments: set,
             })
         }
         Some(Modal::Comment {
@@ -949,6 +1001,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
             app.modal = Some(Modal::NewTask {
                 target: app.focused_tab,
                 buffer: String::new(),
+                attachments: input_attachments::AttachmentSet::new(),
             });
         }
         // On a worker tab, plain Enter (with no modal open) toggles
@@ -1116,21 +1169,46 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
 async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) -> KeyAction {
     let modal = app.modal.take();
     match modal {
-        Some(Modal::NewTask { target, mut buffer }) => match key.code {
+        Some(Modal::NewTask { target, mut buffer, mut attachments }) => {
+            // Ctrl+V: try the OS clipboard for an image (or image path
+            // in text). Falls back to inserting clipboard text into the
+            // buffer when nothing image-like is found.
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v'))
+            {
+                match input_attachments::try_from_clipboard() {
+                    Some(Ok(a)) => attachments.push(a),
+                    Some(Err(_)) => { /* surfaced silently — keep modal open */ }
+                    None => {
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            if let Ok(text) = cb.get_text() {
+                                buffer.push_str(&text);
+                            }
+                        }
+                    }
+                }
+                app.modal = Some(Modal::NewTask { target, buffer, attachments });
+                return KeyAction::None;
+            }
+            match key.code {
             KeyCode::Esc => {}
             KeyCode::Enter
-                if !buffer.is_empty() && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                if (!buffer.is_empty() || !attachments.is_empty())
+                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
+                let imgs = attachments.take_all();
                 match target {
-                    TabId::Orc => return KeyAction::SendToOrc(buffer),
+                    TabId::Orc => return KeyAction::SendToOrc(buffer, imgs),
                     TabId::Worker(idx) => {
                         if let Some(sv) = app.sessions.get(idx) {
                             let id = sv.session.id.clone();
                             let body = buffer.clone();
-                            app.push_log(&id, LogEntry::UserText(body.clone()));
+                            let display = format_user_with_attachments(&body, &imgs);
+                            app.push_log(&id, LogEntry::UserText(display));
                             return KeyAction::SendToWorker {
                                 session_id: id,
                                 body,
+                                attachments: imgs,
                             };
                         }
                     }
@@ -1138,20 +1216,27 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 buffer.push('\n');
-                app.modal = Some(Modal::NewTask { target, buffer });
+                app.modal = Some(Modal::NewTask { target, buffer, attachments });
             }
             KeyCode::Char(c) => {
                 buffer.push(c);
-                app.modal = Some(Modal::NewTask { target, buffer });
+                app.modal = Some(Modal::NewTask { target, buffer, attachments });
             }
             KeyCode::Backspace => {
-                buffer.pop();
-                app.modal = Some(Modal::NewTask { target, buffer });
+                // Backspace on empty input deletes the rightmost chip;
+                // otherwise edits the buffer normally.
+                if buffer.is_empty() && !attachments.is_empty() {
+                    attachments.pop();
+                } else {
+                    buffer.pop();
+                }
+                app.modal = Some(Modal::NewTask { target, buffer, attachments });
             }
             _ => {
-                app.modal = Some(Modal::NewTask { target, buffer });
+                app.modal = Some(Modal::NewTask { target, buffer, attachments });
             }
-        },
+            }
+        }
         Some(Modal::AskUser {
             session_id,
             question_id,
@@ -1159,6 +1244,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
             context,
             mut buffer,
             hidden,
+            attachments,
         }) => {
             // Tab toggles modal visibility so the user can peek the chat.
             if matches!(key.code, KeyCode::Tab) {
@@ -1169,6 +1255,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                     context,
                     buffer,
                     hidden: !hidden,
+                    attachments,
                 });
                 return KeyAction::None;
             }
@@ -1182,6 +1269,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                     context: context.clone(),
                     buffer: buffer.clone(),
                     hidden: true,
+                    attachments: attachments.clone(),
                 };
                 match key.code {
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -1224,6 +1312,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                         context,
                         buffer,
                         hidden,
+                        attachments,
                     });
                 }
                 KeyCode::Backspace => {
@@ -1235,6 +1324,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                         context,
                         buffer,
                         hidden,
+                        attachments,
                     });
                 }
                 _ => {
@@ -1245,6 +1335,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
                         context,
                         buffer,
                         hidden,
+                        attachments,
                     });
                 }
             }
@@ -1449,6 +1540,22 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyCode::Char('x') => return KeyAction::KillBackchannel,
             KeyCode::Char('b') => return KeyAction::PromoteBackchannelModel("opus".to_string()),
             KeyCode::Char('n') => return KeyAction::PromoteBackchannelToOrc,
+            KeyCode::Char('v') => {
+                if let Some(bc) = app.backchannel.as_mut() {
+                    match input_attachments::try_from_clipboard() {
+                        Some(Ok(a)) => bc.attachments.push(a),
+                        Some(Err(_)) => {}
+                        None => {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if let Ok(text) = cb.get_text() {
+                                    bc.input.push_str(&text);
+                                }
+                            }
+                        }
+                    }
+                }
+                return KeyAction::None;
+            }
             _ => {}
         }
     }
@@ -1475,13 +1582,18 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
             bc.input.push('\n');
         }
         KeyCode::Enter => {
-            if !bc.input.trim().is_empty() {
+            if !bc.input.trim().is_empty() || !bc.attachments.is_empty() {
                 let msg = std::mem::take(&mut bc.input);
                 return KeyAction::SendBackchannel(msg);
             }
         }
         KeyCode::Backspace => {
-            bc.input.pop();
+            // Backspace on empty input deletes the rightmost chip.
+            if bc.input.is_empty() && !bc.attachments.is_empty() {
+                bc.attachments.pop();
+            } else {
+                bc.input.pop();
+            }
         }
         KeyCode::Char(c) => {
             bc.input.push(c);
@@ -1758,6 +1870,7 @@ fn handle_state_change(app: &mut App, change: StateChange) {
                 context,
                 buffer: String::new(),
                 hidden: false,
+                attachments: input_attachments::AttachmentSet::new(),
             });
         }
         StateChange::QuestionResolved {

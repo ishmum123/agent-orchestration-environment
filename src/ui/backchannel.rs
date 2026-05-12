@@ -36,19 +36,56 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, bc: &Backchannel, tick: u64
     }
 
     // Reserve 5 rows for the input box (border + 3 content rows + hint
-    // line), 1 for the hint above it. Transcript fills the rest.
+    // line), 1 for the hint above it. Transcript fills the rest. When
+    // attachments are staged, a 1-row chip strip is inserted above the
+    // input box.
+    let chip_rows: u16 = if bc.attachments.is_empty() { 0 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),       // transcript
-            Constraint::Length(5),    // input box
-            Constraint::Length(1),    // hint bar
+            Constraint::Min(3),               // transcript
+            Constraint::Length(chip_rows),    // chip strip (0 or 1)
+            Constraint::Length(5),            // input box
+            Constraint::Length(1),            // hint bar
         ])
         .split(inner);
 
     render_transcript(frame, chunks[0], bc, tick);
-    render_input(frame, chunks[1], &bc.input);
-    render_hints(frame, chunks[2], bc.thinking);
+    if chip_rows > 0 {
+        render_chips(frame, chunks[1], bc);
+    }
+    render_input(frame, chunks[2], &bc.input);
+    render_hints(frame, chunks[3], bc.thinking);
+}
+
+fn render_chips(frame: &mut Frame, area: Rect, bc: &Backchannel) {
+    const MAX: usize = 6;
+    let total = bc.attachments.len();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut shown = 0usize;
+    for a in bc.attachments.iter().take(MAX) {
+        let name = truncate(&a.display_name, 24);
+        spans.push(Span::styled(
+            format!(" [{name} ✕] "),
+            Style::default().fg(Color::Cyan),
+        ));
+        shown += 1;
+    }
+    if total > shown {
+        spans.push(Span::styled(
+            format!(" +{} more ", total - shown),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, bc: &Backchannel, tick: u64) {

@@ -69,10 +69,17 @@ pub struct WorkerHandle {
 impl WorkerHandle {
     /// Send a user message to the worker (multi-turn instruction).
     pub async fn send(&self, message: &str) -> Result<()> {
-        let msg = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": message }
-        });
+        self.send_with(message, &[]).await
+    }
+
+    /// Send variant with image content blocks attached. Empty
+    /// `attachments` keeps the wire shape identical to `send`.
+    pub async fn send_with(
+        &self,
+        message: &str,
+        attachments: &[crate::input_attachments::Attachment],
+    ) -> Result<()> {
+        let msg = crate::input_attachments::build_user_message(message, attachments);
         let line = serde_json::to_string(&msg)?;
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(line.as_bytes()).await?;

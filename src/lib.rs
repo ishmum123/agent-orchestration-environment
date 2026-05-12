@@ -4,6 +4,7 @@ pub mod app;
 pub mod backchannel;
 pub mod db;
 pub mod hooks;
+pub mod input_attachments;
 pub mod mcp;
 pub mod policy;
 pub mod review;

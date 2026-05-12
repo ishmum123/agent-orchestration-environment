@@ -4,6 +4,7 @@
 // L4: Drive orc binary in tmux — verify pane content shows expected UI elements.
 
 use orc::app::{App, ChatRole, Modal, TabId};
+use orc::input_attachments::AttachmentSet;
 use orc::review::{
     DiffCursor, DiffFile, DiffLine, Hunk, LineKind, ParsedDiff, ReviewState,
 };
@@ -126,6 +127,7 @@ fn l3_new_task_modal() {
     app.modal = Some(Modal::NewTask {
         target: TabId::Orc,
         buffer: "add OAuth".to_string(),
+        attachments: AttachmentSet::new(),
     });
     let output = render_to_string(&mut app, 120, 40);
     assert!(output.contains("new task") || output.contains("task"),
@@ -142,6 +144,7 @@ fn l3_ask_user_modal() {
         context: Some("for the PR".to_string()),
         buffer: String::new(),
         hidden: false,
+        attachments: AttachmentSet::new(),
     });
     let output = render_to_string(&mut app, 120, 40);
     assert!(

@@ -23,9 +23,18 @@ impl WorkerRegistry {
     }
 
     pub async fn send(&self, session_id: &str, msg: &str) -> Result<()> {
+        self.send_with(session_id, msg, &[]).await
+    }
+
+    pub async fn send_with(
+        &self,
+        session_id: &str,
+        msg: &str,
+        attachments: &[crate::input_attachments::Attachment],
+    ) -> Result<()> {
         let map = self.inner.lock().await;
         if let Some(h) = map.get(session_id) {
-            h.send(msg).await?;
+            h.send_with(msg, attachments).await?;
         }
         Ok(())
     }

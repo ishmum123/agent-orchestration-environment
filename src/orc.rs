@@ -139,13 +139,17 @@ pub struct OrcProcess {
 impl OrcProcess {
     /// Send a user message to the orc brain.
     pub async fn send(&mut self, message: &str) -> Result<()> {
-        let msg = serde_json::json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": message
-            }
-        });
+        self.send_with(message, &[]).await
+    }
+
+    /// Send variant that attaches image content blocks. Empty
+    /// `attachments` produces the original text-content shape.
+    pub async fn send_with(
+        &mut self,
+        message: &str,
+        attachments: &[crate::input_attachments::Attachment],
+    ) -> Result<()> {
+        let msg = crate::input_attachments::build_user_message(message, attachments);
         let line = serde_json::to_string(&msg)?;
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;

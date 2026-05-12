@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::input_attachments::{Attachment, AttachmentSet};
 use crate::worker::claude_bin;
 
 /// One entry in the backchannel transcript.
@@ -77,6 +78,9 @@ pub struct Backchannel {
     pub pending_model: Option<String>,
     /// Accumulator for the summary turn's text blocks.
     pub pending_buffer: String,
+    /// Pending image attachments staged via Ctrl+V or bracketed paste.
+    /// Drained into the next outgoing user message.
+    pub attachments: AttachmentSet,
 
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -169,6 +173,7 @@ impl Backchannel {
             pending: None,
             pending_model: None,
             pending_buffer: String::new(),
+            attachments: AttachmentSet::new(),
             child: child_arc,
             stdin: stdin_arc,
         };
@@ -190,10 +195,14 @@ impl Backchannel {
     /// Write a user message to stdin without recording it in history.
     /// Used by the promotion summary prompts and seed messages.
     async fn send_raw(&self, message: &str) -> Result<()> {
-        let msg = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": message }
-        });
+        self.send_raw_with(message, &[]).await
+    }
+
+    /// Like `send_raw` but with image attachments stitched into the
+    /// stream-json content-block array. Empty `attachments` keeps the
+    /// plain text-content shape.
+    async fn send_raw_with(&self, message: &str, attachments: &[Attachment]) -> Result<()> {
+        let msg = crate::input_attachments::build_user_message(message, attachments);
         let line = serde_json::to_string(&msg)?;
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(line.as_bytes()).await?;
@@ -216,9 +225,21 @@ impl Backchannel {
     }
 
     /// Send a user message into the child + record it in history.
+    /// Drains the pending `attachments` into the same message.
     pub async fn send(&mut self, message: &str) -> Result<()> {
-        self.send_raw(message).await?;
-        self.history.push(BackchannelEntry::User(message.to_string()));
+        let imgs = self.attachments.take_all();
+        self.send_raw_with(message, &imgs).await?;
+        let suffix = if imgs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " [+{} image{}]",
+                imgs.len(),
+                if imgs.len() == 1 { "" } else { "s" }
+            )
+        };
+        self.history
+            .push(BackchannelEntry::User(format!("{message}{suffix}")));
         self.thinking = true;
         self.stick_to_bottom = true;
         Ok(())
@@ -334,6 +355,7 @@ mod tests {
             pending: None,
             pending_model: None,
             pending_buffer: String::new(),
+            attachments: AttachmentSet::new(),
             child: Arc::new(Mutex::new(tchild)),
             stdin: Arc::new(Mutex::new(stdin)),
         }

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::input_attachments::AttachmentSet;
 use crate::review::ReviewState;
 use crate::session::{Session, SessionMode, SessionState};
 use crate::state::StateHandle;
@@ -233,6 +234,7 @@ pub enum Modal {
     NewTask {
         target: TabId,
         buffer: String,
+        attachments: AttachmentSet,
     },
     AskUser {
         session_id: String,
@@ -243,6 +245,7 @@ pub enum Modal {
         /// When true, modal is hidden so the user can scroll the chat
         /// behind it. `Tab` toggles. State (buffer, question) is preserved.
         hidden: bool,
+        attachments: AttachmentSet,
     },
     Comment {
         session_id: String,

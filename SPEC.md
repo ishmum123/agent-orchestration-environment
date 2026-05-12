@@ -132,6 +132,33 @@ Keys, while overlay is open:
 
 The binary is resolved via the same `ORC_CLAUDE_BIN`-then-`claude` lookup workers use, so harness runs with the `fake_claude` shim work the same way.
 
+## Image attachments
+
+Every input box that talks to a claude child — scratch overlay, worker chat (`c`/`t` on a worker tab), orc chat (`c`/`t` on the orc tab) — accepts image attachments. Three input pathways feed the same pipeline:
+
+1. **Ctrl+V** — reads the OS clipboard via `arboard`. If the clipboard holds image bytes they are re-encoded as PNG. If it holds text that is an absolute path to an image file (`.png .jpg .jpeg .gif .webp`), the file is read. Otherwise the clipboard text is inserted into the buffer (normal paste).
+2. **Bracketed paste** — handles Cmd+V of paths and large text. `EnableBracketedPaste` is set at startup, `DisableBracketedPaste` on exit. crossterm delivers the payload as `Event::Paste`. `file://` prefixes are stripped, surrounding quotes removed, and the payload is split into tokens. Every token that resolves to a recognised image file becomes an attachment; the rest is treated as text and inserted into the buffer when no image tokens were found.
+3. **Drag-drop** — macOS terminals deliver drag-drop as bracketed paste content, so this falls through #2 with no extra handler.
+
+Staged attachments render as chips above the input box (e.g. `[screenshot.png ✕]  [diagram.jpg ✕]`). Backspace on an empty input deletes the rightmost chip. Up to ~6 chips render inline; overflow becomes `+N more`.
+
+On send, the staged attachments are drained into the next outgoing stream-json `user` message. With zero attachments the wire shape stays text-only:
+
+```json
+{"type":"user","message":{"role":"user","content":"…user text…"}}
+```
+
+With one or more attachments the `content` field becomes an array of content blocks — a text block followed by image blocks:
+
+```json
+{"type":"user","message":{"role":"user","content":[
+  {"type":"text","text":"…user text…"},
+  {"type":"image","source":{"type":"base64","media_type":"image/png","data":"…"}}
+]}}
+```
+
+Applies uniformly to the scratch backchannel, worker `send`, and orc `send`.
+
 ## What's preserved
 
 - **Worktrees**. Each worker gets `git worktree add` to a dedicated branch. This is workspace isolation, unrelated to how the Claude process is run. Worktrees stay.

@@ -9,6 +9,41 @@ use ratatui::{
 };
 
 use crate::app::{Modal, TabId};
+use crate::input_attachments::AttachmentSet;
+
+// Max chips rendered inline; overflow becomes "+N more".
+const CHIP_VISIBLE_MAX: usize = 6;
+
+fn attachment_chip_line(set: &AttachmentSet) -> Line<'static> {
+    if set.is_empty() {
+        return Line::from("");
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let total = set.len();
+    let mut shown = 0usize;
+    for a in set.iter().take(CHIP_VISIBLE_MAX) {
+        spans.push(Span::styled(
+            format!(" [{} ✕] ", truncate_name(&a.display_name, 24)),
+            Style::default().fg(Color::Cyan),
+        ));
+        shown += 1;
+    }
+    if total > shown {
+        spans.push(Span::styled(
+            format!(" +{} more ", total - shown),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn truncate_name(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -16,7 +51,9 @@ use crate::app::{Modal, TabId};
 
 pub fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
     match modal {
-        Modal::NewTask { target, buffer } => render_new_task(frame, area, *target, buffer),
+        Modal::NewTask { target, buffer, attachments } => {
+            render_new_task(frame, area, *target, buffer, attachments)
+        }
         Modal::AskUser {
             session_id,
             question_id: _,
@@ -24,11 +61,12 @@ pub fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             context: _,
             buffer,
             hidden,
+            attachments,
         } => {
             if *hidden {
                 return;
             }
-            render_ask_user(frame, area, session_id, question, None, buffer);
+            render_ask_user(frame, area, session_id, question, None, buffer, attachments);
         }
         Modal::Comment { file, line, buffer, .. } => {
             render_comment(frame, area, file, *line, buffer)
@@ -158,7 +196,13 @@ fn render_input_box_with_placeholder(
 // New task modal
 // ---------------------------------------------------------------------------
 
-fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
+fn render_new_task(
+    frame: &mut Frame,
+    area: Rect,
+    target: TabId,
+    buffer: &str,
+    attachments: &AttachmentSet,
+) {
     let rect = centered_rect(60, 40, area);
     frame.render_widget(Clear, rect);
 
@@ -177,14 +221,36 @@ fn render_new_task(frame: &mut Frame, area: Rect, target: TabId, buffer: &str) {
         TabId::Worker(_) => "send a message to this worker",
     };
 
-    render_input_box_with_placeholder(frame, body, buffer, placeholder);
+    render_input_with_chips(frame, body, buffer, placeholder, attachments);
 
     let hints = hint_line(&[
         ("enter", "send"),
-        ("shift+enter", "newline"),
+        ("shift+enter", "nl"),
+        ("ctrl+v", "img"),
         ("esc", "cancel"),
     ]);
     frame.render_widget(Paragraph::new(hints), hint_area);
+}
+
+/// Split `area` into an optional chip row (1 line, shown only when
+/// attachments are non-empty) plus the input box below.
+fn render_input_with_chips(
+    frame: &mut Frame,
+    area: Rect,
+    buffer: &str,
+    placeholder: &str,
+    attachments: &AttachmentSet,
+) {
+    if attachments.is_empty() {
+        render_input_box_with_placeholder(frame, area, buffer, placeholder);
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+    frame.render_widget(Paragraph::new(attachment_chip_line(attachments)), chunks[0]);
+    render_input_box_with_placeholder(frame, chunks[1], buffer, placeholder);
 }
 
 fn render_comment(frame: &mut Frame, area: Rect, file: &str, line: usize, buffer: &str) {
@@ -224,6 +290,7 @@ fn render_ask_user(
     question: &str,
     context: Option<&str>,
     buffer: &str,
+    attachments: &AttachmentSet,
 ) {
     let rect = centered_rect(70, 40, area);
     frame.render_widget(Clear, rect);
@@ -267,7 +334,7 @@ fn render_ask_user(
     .wrap(Wrap { trim: false });
     frame.render_widget(q, chunks[2]);
 
-    render_input_box(frame, chunks[4], buffer);
+    render_input_with_chips(frame, chunks[4], buffer, "", attachments);
 
     let hints = hint_line(&[("enter", "submit"), ("esc", "defer")]);
     frame.render_widget(Paragraph::new(hints), hint_area);
@@ -583,6 +650,7 @@ mod tests {
         let modal = Modal::NewTask {
             target: TabId::Orc,
             buffer: "add OAuth".into(),
+            attachments: AttachmentSet::new(),
         };
         let output = render_to_string(&modal);
         assert!(output.contains("speak to orc"));
@@ -602,6 +670,7 @@ mod tests {
             context: Some("npm audit shows no vulns".into()),
             buffer: String::new(),
             hidden: false,
+            attachments: AttachmentSet::new(),
         };
         let output = render_to_string(&modal);
         assert!(output.contains("orc needs your input"));
@@ -619,6 +688,7 @@ mod tests {
             context: None,
             buffer: "yes".into(),
             hidden: false,
+            attachments: AttachmentSet::new(),
         };
         let output = render_to_string(&modal);
         assert!(output.contains("proceed?"));
@@ -660,7 +730,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let small = Rect::new(0, 0, 10, 5);
         for modal in &[
-            Modal::NewTask { target: TabId::Orc, buffer: "x".into() },
+            Modal::NewTask { target: TabId::Orc, buffer: "x".into(), attachments: AttachmentSet::new() },
             Modal::ConfirmQuit,
             Modal::Help,
         ] {

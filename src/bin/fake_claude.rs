@@ -50,6 +50,39 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
     None
 }
 
+/// Extract user text + image count from a stream-json `user` message
+/// body. Supports both the legacy text-only `content: "..."` shape and
+/// the content-block array shape introduced for image attachments.
+fn extract_user_text_and_images(v: &Value) -> (String, usize) {
+    let content = match v.pointer("/message/content") {
+        Some(c) => c,
+        None => return ("<no content>".to_string(), 0),
+    };
+    if let Some(s) = content.as_str() {
+        return (s.to_string(), 0);
+    }
+    if let Some(arr) = content.as_array() {
+        let mut text = String::new();
+        let mut images = 0usize;
+        for block in arr {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                }
+                Some("image") => images += 1,
+                _ => {}
+            }
+        }
+        return (text, images);
+    }
+    ("<unknown shape>".to_string(), 0)
+}
+
 /// Pull `session_id: <uuid>` out of the worker system prompt. Real claude
 /// gets the same string and uses it to call MCP tools; we mirror that.
 fn extract_session_id(prompt: &str) -> Option<String> {
@@ -471,16 +504,21 @@ fn main() {
                 continue;
             }
             turn += 1;
-            let user_text = serde_json::from_str::<Value>(&line)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/message/content")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "<unparseable>".to_string());
+            let parsed = serde_json::from_str::<Value>(&line).ok();
+            let (user_text, image_count) = match parsed {
+                Some(v) => extract_user_text_and_images(&v),
+                None => ("<unparseable>".to_string(), 0),
+            };
             let snippet: String = user_text.chars().take(80).collect();
-            emit_assistant_text(&mut stdout, &format!("[fake-claude turn {turn}] received: {snippet}"));
+            let suffix = if image_count > 0 {
+                format!("; [{image_count} images attached]")
+            } else {
+                String::new()
+            };
+            emit_assistant_text(
+                &mut stdout,
+                &format!("[fake-claude turn {turn}] received: {snippet}{suffix}"),
+            );
             emit_result(&mut stdout);
             stdout.flush().ok();
         }
