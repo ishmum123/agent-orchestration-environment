@@ -1,0 +1,527 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-12T12:14:29Z",
+  "entries": {
+    "file:.github/workflows/build.yml": {
+      "level": "file",
+      "path": ".github/workflows/build.yml",
+      "name": "build.yml",
+      "summary": "GitHub Actions CI workflow that builds and tests orc on Ubuntu (linux-x86_64) and macOS (macos-arm64). Runs `cargo test --release` then `cargo build --release` on each push to `main`, installs tmux as a test dependency, configures git identity, and uploads the resulting binary as a named artifact.",
+      "content_hash": "f0410c7bc0459257",
+      "lines": 61,
+      "children": []
+    },
+    "file:.gitignore": {
+      "level": "file",
+      "path": ".gitignore",
+      "name": ".gitignore",
+      "summary": "Ignores Rust's `target/` build output, the per-project `.claude/` directory, and the `.orc/` per-project data directory (SQLite DB, hooks socket, MCP config, stderr/panic logs).",
+      "content_hash": "d1c53646130f3ebc",
+      "lines": 4,
+      "children": []
+    },
+    "file:Cargo.toml": {
+      "level": "file",
+      "path": "Cargo.toml",
+      "name": "Cargo.toml",
+      "summary": "Package manifest for orc v0.2.0. Key runtime dependencies include `ratatui 0.29`, `crossterm 0.28`, `tokio` (full), `axum 0.8`, `rusqlite 0.31` with bundled SQLite, `serde_json`, `arboard` (image-data feature for clipboard), and `base64`. Dev dependencies add `tempfile`, `insta`, and `reqwest` for integration tests.",
+      "content_hash": "fd3b6087261bd840",
+      "lines": 33,
+      "children": []
+    },
+    "file:CLAUDE.md": {
+      "level": "file",
+      "path": "CLAUDE.md",
+      "name": "CLAUDE.md",
+      "summary": "Project-level instructions for the orc solo home project. Covers build/run commands, the mandatory live-verification protocol using tmux + `fake_claude` shim (`ORC_CLAUDE_BIN`), harness primitives (`tmux send-keys`, `capture-pane`), useful DB/process inspection snippets, and cleanup procedures for botched runs. States explicitly: no backward compatibility constraints — rename/delete/restructure freely.",
+      "content_hash": "e9f776227bfe1e6d",
+      "lines": 122,
+      "children": []
+    },
+    "file:LICENSE": {
+      "level": "file",
+      "path": "LICENSE",
+      "name": "LICENSE",
+      "summary": "MIT License for orc, copyright 2026 Ishmum Jawad Khan. Standard permissive terms: use, copy, modify, merge, publish, distribute, sublicense, sell with no warranty.",
+      "content_hash": "8185bf3a746e2bf9",
+      "lines": 21,
+      "children": []
+    },
+    "file:README.md": {
+      "level": "file",
+      "path": "README.md",
+      "name": "README.md",
+      "summary": "User-facing README for the Agent Orchestration Environment. Explains the motivation (Claude Code parallel sessions bottleneck), installation (cargo install or prebuilt CI artifact), key bindings table, tab strip badges, and the high-level architecture: workers as stream-json children, SQLite state, git worktrees, orc as a Claude session with MCP tools, and hooks + policy engine.",
+      "content_hash": "f626a9e2382da252",
+      "lines": 93,
+      "children": []
+    },
+    "file:SPEC.md": {
+      "level": "file",
+      "path": "SPEC.md",
+      "name": "SPEC.md",
+      "summary": "Authoritative architecture and UX specification for orc. Defines the tab model (orc + workers), event log contents, speaking/question/interrupt/review flows, the scratch claude (`n`) and scratch overlay (`?`) features with `Ctrl-B`/`Ctrl-N` promotion flows, and the image attachment pipeline (Ctrl+V, bracketed paste, drag-drop → base64 content blocks). Also lists what is explicitly out of scope.",
+      "content_hash": "2493594b5daeb0a5",
+      "lines": 204,
+      "children": []
+    },
+    "file:TODO.md": {
+      "level": "file",
+      "path": "TODO.md",
+      "name": "TODO.md",
+      "summary": "Tracked future work items: architecture rewrite around canonical data models, auto-resume on Claude usage-limit reset, more compact UI event log, restyle worker/orc tabs to match scratch overlay aesthetic, panel-scoped mouse selection, editor-like input box, Ctrl+V image paste (now shipped), and a list of planned slash commands (`/plan`, `/concise`, `@file`, `#worker`, etc.).",
+      "content_hash": "a14d001fbfc5ca4d",
+      "lines": 26,
+      "children": []
+    },
+    "file:docs/auto-resume-design.md": {
+      "level": "file",
+      "path": "docs/auto-resume-design.md",
+      "name": "auto-resume-design.md",
+      "summary": "Design document for automatic recovery from Claude plan usage-limit caps. Documents the detection signal (stream-json assistant text matching `^Claude AI usage limit reached\\|(\\d+)`), a global `QuotaState` enum (`Healthy` | `Waiting { resume_at, retry_count, vendor_resume_at, at_ceiling }`), 5min→5h exponential backoff, and a new `Quota` session state variant. Implementation is pending until sibling `worker.rs` work lands.",
+      "content_hash": "73c41f7c58785941",
+      "lines": 230,
+      "children": []
+    },
+    "file:docs/superpowers/plans/2026-05-09-spec-implementation.md": {
+      "level": "file",
+      "path": "docs/superpowers/plans/2026-05-09-spec-implementation.md",
+      "name": "2026-05-09-spec-implementation.md",
+      "summary": "Step-by-step implementation plan for bringing the codebase in line with SPEC.md. Covers seven sequenced phases: de-tmux workers to stream-json children, unify orc tab as an event-log peer, pop-up input + per-tab interrupt, worker→orc question forwarding, three-mode review (diff/whole-file/editor), resume-on-restart via `--resume`, and live verification. Lists exact files to modify, add, and delete.",
+      "content_hash": "69e53da56cafb115",
+      "lines": 838,
+      "children": []
+    },
+    "file:docs/superpowers/plans/2026-05-09-ux-polish-handover.md": {
+      "level": "file",
+      "path": "docs/superpowers/plans/2026-05-09-ux-polish-handover.md",
+      "name": "2026-05-09-ux-polish-handover.md",
+      "summary": "Post-rewrite UX polish task list for the `v2-rewrite` branch. Issues include: agents panel text clipping/bleed, event log overflowing into the right panel, removing cost from turn-end divider, deduplicating `[orc model:]` system lines, suppressing empty `(thinking)` entries, and tool-input JSON noise reduction with tool-aware formatters (`Bash`, `WebFetch`, etc.).",
+      "content_hash": "05464f4165586683",
+      "lines": 200,
+      "children": []
+    },
+    "file:docs/ui-ascii.md": {
+      "level": "file",
+      "path": "docs/ui-ascii.md",
+      "name": "ui-ascii.md",
+      "summary": "ASCII snapshots of the orc TUI captured live at 140x50. Shows the base view (header + events box + agents panel + action bar), the centered speak modal with multiline buffer, the help overlay, the review split-pane (file tree + diff), and the scratch overlay (transcript + input box). Serves as a visual layout reference.",
+      "content_hash": "2ee5f5adcc579920",
+      "lines": 149,
+      "children": []
+    },
+    "file:src/app.rs": {
+      "level": "file",
+      "path": "src/app.rs",
+      "name": "app.rs",
+      "summary": "Defines `App` (top-level TUI state container), `TabId` (Orc | Worker(usize)), `LogEntry` (enum for all event-log variants: UserText, AssistantText, Thinking, OrcInstruction, ToolUse, ToolResult, System, Notify, TurnEnd, Exploration), and `SessionView`. Also exports `entry_to_kind_payload` / `kind_payload_to_entry` for DB round-tripping of log entries. Distinguishes UI-local ephemeral state (scroll, modal, focused tab) from authoritative state projected from `StateManager`.",
+      "content_hash": "9f765dd55f258790",
+      "lines": 838,
+      "children": []
+    },
+    "file:src/backchannel.rs": {
+      "level": "file",
+      "path": "src/backchannel.rs",
+      "name": "backchannel.rs",
+      "summary": "Implements the sealed-off scratch claude overlay (`?` key). Defines `BackchannelEntry`, `BackchannelEvent`, `PendingPromotion` (Model | AttachAsWorker), `SummarySpec`, and `parse_summary` (extracts `{slug, task}` JSON from the model's reply with a fallback to timestamp slug + raw text). The `Backchannel` struct owns a stream-json claude child (sonnet by default) with no MCP, no policy, and no orc state coupling.",
+      "content_hash": "6e4d548fee54a6fc",
+      "lines": 604,
+      "children": []
+    },
+    "file:src/bin/fake_claude.rs": {
+      "level": "file",
+      "path": "src/bin/fake_claude.rs",
+      "name": "fake_claude.rs",
+      "summary": "Deterministic stream-json shim that replaces the real `claude` CLI during harness runs (`ORC_CLAUDE_BIN`). Operates in two modes: echo mode (each stdin line produces an assistant turn echoing the input) and scripted mode (`ORC_FAKE_SCRIPT` JSON file, driving `write_file`, `run_cmd`, `mcp_call`, `text` actions per turn). Implements SIGINT handling to mirror claude's cancel-current-turn behaviour, extracts `session_id` from worker system prompts, and supports image content block parsing via `extract_user_text_and_images`.",
+      "content_hash": "64607f5180dc4457",
+      "lines": 686,
+      "children": []
+    },
+    "file:src/db.rs": {
+      "level": "file",
+      "path": "src/db.rs",
+      "name": "db.rs",
+      "summary": "SQLite persistence layer via `rusqlite` + `refinery` migrations. Defines `Database` with row types `StateTransition`, `PermissionDecision`, `TaskGraph`, `TaskNode`, and `Review`. Handles session CRUD, state serialization (`state_to_name`, `state_from_db`), event log append/load (`append_event`, `load_events`), permission audit trail, task graph upsert, and review persistence. Session mode serialized as `Watch`/`Control` strings.",
+      "content_hash": "61b46d8eee077312",
+      "lines": 884,
+      "children": []
+    },
+    "file:src/hooks.rs": {
+      "level": "file",
+      "path": "src/hooks.rs",
+      "name": "hooks.rs",
+      "summary": "Unix socket hook receiver for Claude Code agent lifecycle events. Defines `HookEvent` + `HookKind` (PreToolUse, PostToolUse, Stop, Notification) with serde tag-based dispatch. `HookServer::bind` creates a Unix socket, `HookServer::run` accepts NDJSON connections and forwards parsed `HookEvent`s over an mpsc channel. Also exports `generate_hooks_config` and `create_hook_script` to wire workers' Claude Code hooks to orc's socket.",
+      "content_hash": "083e2b5ef6019bed",
+      "lines": 524,
+      "children": []
+    },
+    "file:src/input_attachments.rs": {
+      "level": "file",
+      "path": "src/input_attachments.rs",
+      "name": "input_attachments.rs",
+      "summary": "Image attachment pipeline for all input boxes that talk to a claude child. Defines `Attachment` (base64 PNG/JPEG/GIF/WEBP with MIME) and `AttachmentSet` (Vec wrapper with push/pop/take_all). Exports `build_user_message` (emits text-only or content-block-array stream-json shape), `from_image_path`, `try_from_clipboard` (via `arboard`), and `try_from_paste` (handles Cmd+V bracketed paste and drag-drop, strips `file://`, splits on whitespace).",
+      "content_hash": "f4280f5cb2baeb1d",
+      "lines": 519,
+      "children": []
+    },
+    "file:src/lib.rs": {
+      "level": "file",
+      "path": "src/lib.rs",
+      "name": "lib.rs",
+      "summary": "Library crate root that re-exports all modules for integration tests and external use: `app`, `backchannel`, `db`, `hooks`, `input_attachments`, `mcp`, `policy`, `review`, `session`, `state`, `tmux`, `ui`, `worker`, `worker_registry`, `worktree`.",
+      "content_hash": "9ee6fed40462f1e4",
+      "lines": 17,
+      "children": []
+    },
+    "file:src/main.rs": {
+      "level": "file",
+      "path": "src/main.rs",
+      "name": "main.rs",
+      "summary": "Binary entry point and main event loop. Parses CLI args (`Cli` with `--project`, `--model`, `doctor`/`clean` subcommands), initializes `Database`, `StateManager`, `HookServer`, `McpServer`, `OrcProcess`, and the crossterm terminal. Drives the tokio select loop: routes `OrcEvent` and `WorkerEvent` to `App` log entries, handles all keyboard input (tab switching, modal open/close, scroll, `n`/`t`/`r`/`x`/`R`/`q`/`?`, Ctrl+V image paste, bracketed paste), and manages scratch overlay + scratch claude (`n`) handoff.",
+      "content_hash": "43da500d14cd7356",
+      "lines": 2476,
+      "children": []
+    },
+    "file:src/mcp.rs": {
+      "level": "file",
+      "path": "src/mcp.rs",
+      "name": "mcp.rs",
+      "summary": "JSON-RPC 2.0 MCP server exposing 10 orchestrator tools to Claude agents via HTTP: `spawn_session`, `instruct_session`, `kill_session`, `ask_user`, `list_sessions`, `mark_done`, `submit_for_review`, `answer_worker`, `current_summary`, `update_task_graph`. Defines `JsonRpcRequest`/`JsonRpcResponse`/`ToolDef`, constants `ORC_MCP_TOOL_NAMES` and `HARNESS_META_TOOLS`, and `should_hide_tool` to filter agent→orc tool calls from the user-facing event log.",
+      "content_hash": "ef3263127fe22e0d",
+      "lines": 1632,
+      "children": []
+    },
+    "file:src/orc.rs": {
+      "level": "file",
+      "path": "src/orc.rs",
+      "name": "orc.rs",
+      "summary": "Orchestrator brain: spawns and manages the planning Claude agent. Defines `OrcEvent` (Text, ToolUse, Result, System, Thinking), `parse_orc_events` (converts raw stream-json Values to `OrcEvent` vec), `OrcUsage` (cumulative tokens/cost/turns/context-window), and `OrcProcess` (the stream-json claude child with stdin/stdout pipes). `OrcConfig` holds project path, model, MCP config path, and hook socket.",
+      "content_hash": "502fc077276f62d7",
+      "lines": 588,
+      "children": []
+    },
+    "file:src/policy.rs": {
+      "level": "file",
+      "path": "src/policy.rs",
+      "name": "policy.rs",
+      "summary": "Policy engine for gating agent tool use. Defines `PolicyDecision` (Allow | Deny | HardDeny | Escalate), `PermissionRequest`, and `PolicyConfig`/`PolicyRules` (TOML-deserializable). `PolicyEngine::evaluate` checks hard-deny rules first (e.g. `rm -rf /`, modifying secrets), then deny/allow/escalate rules in order, defaulting to Escalate. `default_policy` allows reads and worktree writes, escalates network/package/outside-worktree, hard-denies secret modification.",
+      "content_hash": "a5894b3b8d4cc4c9",
+      "lines": 485,
+      "children": []
+    },
+    "file:src/review.rs": {
+      "level": "file",
+      "path": "src/review.rs",
+      "name": "review.rs",
+      "summary": "Diff parsing, review state, and submission payload types. Defines `ParsedDiff`/`DiffFile`/`Hunk`/`DiffLine`/`LineKind` for structured diff representation. `ReviewState` tracks session_id, parsed diff, `DiffCursor`, `DraftComment` list, `HashSet<hunk_id>` approvals, `ViewMode` (Diff | WholeFile), and `whole_file_scroll`. `ReviewPayload` is the serializable submission sent to the worker on `s`ubmit. `compute_diff` runs `git diff` against the worker's base commit.",
+      "content_hash": "a33c446c2210c614",
+      "lines": 1109,
+      "children": []
+    },
+    "file:src/session.rs": {
+      "level": "file",
+      "path": "src/session.rs",
+      "name": "session.rs",
+      "summary": "Session lifecycle state machine. Defines `SessionState` (Running | Blocked { kind, reason } | AwaitingReview | Done | Failed), `BlockKind` (Permission | OrcDecision | UserInput), `SessionMode` (Watch | Control), the `Session` struct (id, name, task, worktree_path, branch, base_commit, claude_session_id, etc.), `SessionEvent` (all transition triggers), and the `transition` function encoding the full state machine.",
+      "content_hash": "105ea101205bc484",
+      "lines": 490,
+      "children": []
+    },
+    "file:src/state.rs": {
+      "level": "file",
+      "path": "src/state.rs",
+      "name": "state.rs",
+      "summary": "Centralized single-writer state manager using a command channel (`StateCommand` enum) and a broadcast channel for `StateChange` events. `StateManager` owns `Database` and `PolicyEngine`, handles session CRUD, state-machine transitions via `ApplyEvent`, permission decisions, task graph updates, user question routing (`AskUser`/`AnswerUser`/`AnswerUserById`), event log append/load, and hook event dispatch. `StateHandle` is the cloneable client handle used across the rest of the app.",
+      "content_hash": "68049fc19a52ff54",
+      "lines": 1134,
+      "children": []
+    },
+    "file:src/tmux.rs": {
+      "level": "file",
+      "path": "src/tmux.rs",
+      "name": "tmux.rs",
+      "summary": "Tmux session lifecycle helpers used exclusively by the test harness (not by orc's worker architecture). Exports `create_session`, `kill_session`, `has_session`, `send_text`, `send_keys`, `start_pipe_pane`, `read_pipe_log`, and a `tmux_session_name` helper. Workers are stream-json children, not tmux panes; this module is test infrastructure only.",
+      "content_hash": "63f3e5554733fc4e",
+      "lines": 606,
+      "children": []
+    },
+    "file:src/ui/backchannel.rs": {
+      "level": "file",
+      "path": "src/ui/backchannel.rs",
+      "name": "backchannel.rs",
+      "summary": "Renders the scratch claude overlay as a 75%×80% centered panel. Layout: scrollable transcript (you/claude labeled blocks, dim system lines) + optional attachment chip strip + 5-row multiline input box + hint bar. `render_overlay` dispatches to `render_transcript`, `render_chips`, `render_input`, and `render_hints`. Thinking spinner uses a rotating `◐◓◑◒` glyph driven by the `tick` counter.",
+      "content_hash": "7c2cd5223b944f01",
+      "lines": 232,
+      "children": []
+    },
+    "file:src/ui/mod.rs": {
+      "level": "file",
+      "path": "src/ui/mod.rs",
+      "name": "mod.rs",
+      "summary": "Top-level UI render dispatcher. `render` lays out the full frame: 1-line header, main area split into content (left) + agents panel (right, `PANEL_WIDTH=32`), and 1-line action bar. Dispatches to `render_orc_tab` or `worker::render_worker` based on `app.focused_tab`, overlays `review::render_review` when a review is active, calls `panel::render_panel` always, and renders `modals::render_modal` and `backchannel::render_overlay` on top. Also implements `autoscroll` to keep sticky-to-bottom tabs pinned.",
+      "content_hash": "2809a83d8911dbfa",
+      "lines": 623,
+      "children": []
+    },
+    "file:src/ui/modals.rs": {
+      "level": "file",
+      "path": "src/ui/modals.rs",
+      "name": "modals.rs",
+      "summary": "Renders all modal overlays via `render_modal` dispatching on `Modal` variant: `NewTask` (centered input box with attachment chips), `AskUser` (question + answer buffer), `Comment` (file/line annotation input), `ConfirmKill`, `ConfirmQuit`, `ConfirmMerge`, `ResumeRunning`, `ConfirmPush`, and `Help`. Shared helpers `centered_rect`/`centered_fixed` handle geometry. Attachment chips render inline above the input box with `[name ✕]` format, truncated with `…` at 24 chars, overflow as `+N more`.",
+      "content_hash": "7edd7cb3201328c1",
+      "lines": 744,
+      "children": []
+    },
+    "file:src/ui/panel.rs": {
+      "level": "file",
+      "path": "src/ui/panel.rs",
+      "name": "panel.rs",
+      "summary": "Renders the persistent right-side agents panel (`PANEL_WIDTH=32`). Always visible on every tab. Draws one card per agent (orc + each worker): line 1 = focus gutter (`▌`) + badge + name + state tag; line 2 = model + elapsed + context-window percentage; lines 3-4 = summary (wrapped to 2 lines). `context_pct` computes the percentage of the model's context window used. Focused card is highlighted with a cyan `▌` gutter.",
+      "content_hash": "38cc9468eb0a82d7",
+      "lines": 504,
+      "children": []
+    },
+    "file:src/ui/review.rs": {
+      "level": "file",
+      "path": "src/ui/review.rs",
+      "name": "review.rs",
+      "summary": "Renders the diff review interface via `render_review`. Two-pane layout: `render_file_tree` (25%, shows `●`/`◌` comment markers, `+N -N` stat, focused-file highlight, summary footer) and `render_diff_view` or `render_whole_file_view` (75%), plus a 1-line `render_review_action_bar`. Diff view colors adds green, removes red, context default. Whole-file view shows the full current file from the worktree with line numbers and comment marker annotations.",
+      "content_hash": "f72bb72b10bc6866",
+      "lines": 818,
+      "children": []
+    },
+    "file:src/ui/tabs.rs": {
+      "level": "file",
+      "path": "src/ui/tabs.rs",
+      "name": "tabs.rs",
+      "summary": "Renders the horizontal tab strip via `render_tabs`. Orc tab is pinned left with a `◐`/`✗` badge; worker tabs follow with state badges (`◐ ? ! ⏸ ◑ ✓ ✗`) and elapsed times. Focused tab is highlighted with inverted colors; focused worker tab also shows `[WATCH]` or `[CTRL]` mode tag. Contains unit tests using `ratatui::TestBackend` that assert badge characters and mode tags render correctly.",
+      "content_hash": "49080f2951cc2ed9",
+      "lines": 273,
+      "children": []
+    },
+    "file:src/ui/worker.rs": {
+      "level": "file",
+      "path": "src/ui/worker.rs",
+      "name": "worker.rs",
+      "summary": "Renders the worker tab event log via `render_worker`. Layout: optional pinned task banner (1 line, dim italic) + `render_event_log` (scrollable, wraps long lines, renders all `LogEntry` variants with color-coded styles, thinking spinner) + optional permissions/decisions strip. `wrapped_line_count` is exported for autoscroll calculation in `ui::mod`. `collapse_last_turn` post-processes consecutive exploratory tool calls into an `Exploration` rollup entry.",
+      "content_hash": "e6bf89b6b40160b1",
+      "lines": 1111,
+      "children": []
+    },
+    "file:src/worker_registry.rs": {
+      "level": "file",
+      "path": "src/worker_registry.rs",
+      "name": "worker_registry.rs",
+      "summary": "In-memory registry mapping `session_id` to `WorkerHandle` (stream-json claude children). `WorkerRegistry` wraps `Arc<Mutex<HashMap<String, WorkerHandle>>>` and exposes `insert`, `send`, `send_with` (with image attachments), `interrupt`, `kill`, `kill_all`, `contains`, and `ids`. Replaces tmux as the worker process management layer.",
+      "content_hash": "b73ac5beea6084a9",
+      "lines": 72,
+      "children": []
+    },
+    "file:src/worker.rs": {
+      "level": "file",
+      "path": "src/worker.rs",
+      "name": "worker.rs",
+      "summary": "Worker process abstraction. Defines `WorkerEvent` (Text, ToolUse, ToolResult, Thinking, Result, ClaudeSessionId, Exited, OrcInstruction, Usage) and `WorkerHandle` (owns the stream-json claude child via `Arc<Mutex<Child>>` + `Arc<Mutex<ChildStdin>>`). `WorkerHandle::send_with` builds content-block-array messages via `input_attachments::build_user_message`; `interrupt` sends SIGINT; `claude_bin()` resolves via `ORC_CLAUDE_BIN` env var with `claude` fallback.",
+      "content_hash": "7c597b25d60f126b",
+      "lines": 511,
+      "children": []
+    },
+    "file:src/worktree.rs": {
+      "level": "file",
+      "path": "src/worktree.rs",
+      "name": "worktree.rs",
+      "summary": "Git worktree lifecycle helpers. `create_worktree` runs `git worktree add -b orc/{name}` placing the worktree under `{repo_root_parent}/.orc-worktrees/{name}`. `remove_worktree` runs `git worktree remove --force` + `git branch -D`. `repo_root` / `main_branch` resolve the project's root and detect `main`/`master`. `detect_conflicts` finds files modified in multiple worktrees (potential merge conflicts). Includes unit tests for the `FileConflict` struct and conflict detection edge cases.",
+      "content_hash": "777bba000125c31b",
+      "lines": 249,
+      "children": []
+    },
+    "file:tests/e2e_pipeline.rs": {
+      "level": "file",
+      "path": "tests/e2e_pipeline.rs",
+      "name": "e2e_pipeline.rs",
+      "summary": "End-to-end Rust integration tests for the full worker process lifecycle using `fake_claude`. Covers `spawn_session` → `WorkerEvent` channel → `instruct_session` (multi-turn) → `mark_done` → Done state, exercising `McpServer::handle_request` directly and asserting JSON-RPC responses. Uses `tempfile` for git repo and DB setup; `ORC_CLAUDE_BIN` is set to the `fake_claude` binary via `env!(\"CARGO_BIN_EXE_fake_claude\")`.",
+      "content_hash": "b5c255dbdbcdab1e",
+      "lines": 415,
+      "children": []
+    },
+    "file:tests/flow_e2e_scratch.rs": {
+      "level": "file",
+      "path": "tests/flow_e2e_scratch.rs",
+      "name": "flow_e2e_scratch.rs",
+      "summary": "End-to-end TUI test for the scratch overlay Ctrl+N attach-as-worker flow. Launches orc in tmux with `fake_claude` (echo mode), opens the `?` overlay, sends a message, presses Ctrl+N, and asserts that a new worker session appears in the SQLite DB with a `scratch-<HHMMSS>` slug (the deterministic fallback path when the model doesn't return JSON). Verifies the fallback path handles non-JSON echo responses robustly.",
+      "content_hash": "f9eb76c365ddcae6",
+      "lines": 344,
+      "children": []
+    },
+    "file:tests/flow_e2e.rs": {
+      "level": "file",
+      "path": "tests/flow_e2e.rs",
+      "name": "flow_e2e.rs",
+      "summary": "Comprehensive end-to-end FLOW test driving the orc binary through the complete user journey (greenfield + brownfield projects) via tmux + scripted `fake_claude`. Covers: launch, task entry, clarify (orc + worker modal), explore tool calls, failure→fix verify cycle, review navigation (j/k/J/K/o/e/c/q), rework loop, approve→Done, git push to bare remote, follow-up to orc, `mark_done` MCP path, kill worker (`x`+`y`), scroll keys, control-mode toggle, and clean quit with `orc doctor` assertion.",
+      "content_hash": "62f6e33fed6e6363",
+      "lines": 1307,
+      "children": []
+    },
+    "file:tests/integration.sh": {
+      "level": "file",
+      "path": "tests/integration.sh",
+      "name": "integration.sh",
+      "summary": "Bash smoke-test script for orc (release binary). Launches orc in a tmux session, drives keystrokes via `tmux send-keys`, and polls `tmux capture-pane` with `wait_for` to assert expected UI output patterns. Tests startup render, speak modal open/close, quit flow, and final EXIT=0. Includes a `cleanup` trap to kill the session and prune leftover worktrees/branches.",
+      "content_hash": "bbfe2ffa4a418421",
+      "lines": 216,
+      "children": []
+    },
+    "file:tests/phase0_validation.rs": {
+      "level": "file",
+      "path": "tests/phase0_validation.rs",
+      "name": "phase0_validation.rs",
+      "summary": "Integration tests for MCP, hooks, and session lifecycle using real processes and I/O. Covers `initialize` protocol handshake, `tools/list` returning all 10 tools, `spawn_session`/`list_sessions`/`kill_session` JSON-RPC round-trips, `HookServer` Unix socket NDJSON parsing, and policy evaluation. Uses `tempfile` git repos and in-memory `StateManager`; verifies server info, capabilities, and tool schemas.",
+      "content_hash": "2302a3e720335a82",
+      "lines": 777,
+      "children": []
+    },
+    "file:tests/tui_integration.rs": {
+      "level": "file",
+      "path": "tests/tui_integration.rs",
+      "name": "tui_integration.rs",
+      "summary": "TUI integration tests using `ratatui::TestBackend` (L3) and tmux-driven binary tests (L4). L3 tests assert `ui::render` output strings contain expected agent names, badges (`◐ ✓ ?`), chat messages, review diff content, and modal text. Uses `App::new`, `push_chat`, `add_session`, `focus_tab`, and `ReviewState` construction to exercise layout paths without a real terminal.",
+      "content_hash": "16d71b5fa6769568",
+      "lines": 354,
+      "children": []
+    },
+    "dir:.github/workflows": {
+      "level": "directory",
+      "path": ".github/workflows",
+      "name": "workflows",
+      "summary": "GitHub Actions workflow definitions. Contains a single `build.yml` that runs the full test suite and produces release binaries for Linux x86_64 and macOS arm64 on every push to main. Artifacts are uploaded and made accessible via nightly.link.",
+      "content_hash": "1a62637bd5745224",
+      "children": ["file:.github/workflows/build.yml"]
+    },
+    "dir:.github": {
+      "level": "directory",
+      "path": ".github",
+      "name": ".github",
+      "summary": "GitHub configuration root. Houses the `workflows/` directory with the CI build pipeline. No issue templates or other GitHub-specific configuration files are present.",
+      "content_hash": "45ee61c6acced85c",
+      "children": ["dir:.github/workflows"]
+    },
+    "dir:docs/superpowers/plans": {
+      "level": "directory",
+      "path": "docs/superpowers/plans",
+      "name": "plans",
+      "summary": "Implementation plans for major orc development phases. The `2026-05-09-spec-implementation.md` plan drives the full stream-json worker rewrite (7 phases, file-by-file instructions). The `2026-05-09-ux-polish-handover.md` captures post-rewrite polish issues found in live usage. Both are designed for agentic execution.",
+      "content_hash": "ebaefb653bb7c113",
+      "children": [
+        "file:docs/superpowers/plans/2026-05-09-spec-implementation.md",
+        "file:docs/superpowers/plans/2026-05-09-ux-polish-handover.md"
+      ]
+    },
+    "dir:docs/superpowers": {
+      "level": "directory",
+      "path": "docs/superpowers",
+      "name": "superpowers",
+      "summary": "Container for agentic implementation plans used to drive large refactors. Currently holds the `plans/` subdirectory with the spec-implementation and UX-polish plans. Intended as a workspace for subagent-driven development workflows.",
+      "content_hash": "a2fb16cba73aff69",
+      "children": ["dir:docs/superpowers/plans"]
+    },
+    "dir:docs": {
+      "level": "directory",
+      "path": "docs",
+      "name": "docs",
+      "summary": "Project documentation beyond SPEC.md and CLAUDE.md. `ui-ascii.md` provides ASCII layout snapshots of the live TUI for reference. `auto-resume-design.md` captures research and design decisions for quota-limit recovery (pending implementation). `superpowers/plans/` holds agentic implementation plans for the spec rewrite and UX polish. Together these documents bridge architecture intent and implementation execution.",
+      "content_hash": "4da617710427a145",
+      "children": [
+        "file:docs/auto-resume-design.md",
+        "file:docs/ui-ascii.md",
+        "dir:docs/superpowers"
+      ]
+    },
+    "dir:src/bin": {
+      "level": "directory",
+      "path": "src/bin",
+      "name": "bin",
+      "summary": "Additional binary targets. Contains `fake_claude.rs`, the deterministic stream-json shim used as test infrastructure. Activated via `ORC_CLAUDE_BIN` environment variable; supports both echo mode and scripted mode for driving the full FLOW e2e test suite without spending real API tokens.",
+      "content_hash": "a0a6750f4c40e54c",
+      "children": ["file:src/bin/fake_claude.rs"]
+    },
+    "dir:src/ui": {
+      "level": "directory",
+      "path": "src/ui",
+      "name": "ui",
+      "summary": "All ratatui rendering code. `mod.rs` is the top-level dispatcher that composes header, content area, agents panel, action bar, modals, and backchannel overlay. Submodules handle specialized views: `worker.rs` renders the event log (used by both orc and worker tabs), `panel.rs` the persistent right-side agent cards, `review.rs` the diff/whole-file review panes, `modals.rs` all centered overlay dialogs, `backchannel.rs` the scratch overlay, and `tabs.rs` the horizontal tab strip (now superseded by the panel but kept for reference and tests).",
+      "content_hash": "9468cdf079954a0a",
+      "children": [
+        "file:src/ui/backchannel.rs",
+        "file:src/ui/mod.rs",
+        "file:src/ui/modals.rs",
+        "file:src/ui/panel.rs",
+        "file:src/ui/review.rs",
+        "file:src/ui/tabs.rs",
+        "file:src/ui/worker.rs"
+      ]
+    },
+    "dir:src": {
+      "level": "directory",
+      "path": "src",
+      "name": "src",
+      "summary": "All Rust source code for orc. The top-level module graph: `main.rs` is the binary entry point and event loop; `lib.rs` re-exports everything for integration tests. Core subsystems: `state.rs`/`db.rs` (SQLite-backed single-writer state), `session.rs` (state machine), `worker.rs`/`worker_registry.rs` (stream-json claude children), `orc.rs` (orchestrator brain process), `mcp.rs` (MCP HTTP server with 10 tools), `hooks.rs` (Unix socket hook receiver), `policy.rs` (permission gating), `review.rs` (diff parsing + review state), `input_attachments.rs` (image attachment pipeline), `backchannel.rs` (scratch overlay process), `worktree.rs` (git worktree lifecycle), `tmux.rs` (test harness helpers), `app.rs` (TUI state container + LogEntry types), and the `ui/` and `bin/` subdirectories.",
+      "content_hash": "67108cbcf79ab90d",
+      "children": [
+        "file:src/app.rs",
+        "file:src/backchannel.rs",
+        "file:src/db.rs",
+        "file:src/hooks.rs",
+        "file:src/input_attachments.rs",
+        "file:src/lib.rs",
+        "file:src/main.rs",
+        "file:src/mcp.rs",
+        "file:src/orc.rs",
+        "file:src/policy.rs",
+        "file:src/review.rs",
+        "file:src/session.rs",
+        "file:src/state.rs",
+        "file:src/tmux.rs",
+        "file:src/worker.rs",
+        "file:src/worker_registry.rs",
+        "file:src/worktree.rs",
+        "dir:src/bin",
+        "dir:src/ui"
+      ]
+    },
+    "dir:tests": {
+      "level": "directory",
+      "path": "tests",
+      "name": "tests",
+      "summary": "Integration and end-to-end test suite. `phase0_validation.rs` tests MCP JSON-RPC round-trips, hook socket parsing, and policy evaluation in isolation. `e2e_pipeline.rs` drives the full worker lifecycle (spawn→instruct→mark_done) via `McpServer` directly. `flow_e2e.rs` is the comprehensive FLOW test driving the orc binary through every user-facing scenario via tmux + scripted `fake_claude`. `flow_e2e_scratch.rs` exercises the scratch overlay Ctrl+N attach flow. `tui_integration.rs` tests UI rendering with `ratatui::TestBackend`. `integration.sh` is a legacy bash smoke test.",
+      "content_hash": "aa6c78eb7e90c2bc",
+      "children": [
+        "file:tests/e2e_pipeline.rs",
+        "file:tests/flow_e2e.rs",
+        "file:tests/flow_e2e_scratch.rs",
+        "file:tests/integration.sh",
+        "file:tests/phase0_validation.rs",
+        "file:tests/tui_integration.rs"
+      ]
+    },
+    "dir:.": {
+      "level": "directory",
+      "path": ".",
+      "name": ".",
+      "summary": "Root of the orc project. A Rust 2021 workspace (single crate) for a terminal UI that runs parallel Claude Code conversations with an orchestrator. Key entry points: `src/main.rs` (binary), `src/lib.rs` (library for tests), `SPEC.md` (authoritative architecture), `CLAUDE.md` (build/test/harness instructions). CI via `.github/workflows/build.yml`. Source organized into `src/` (all Rust modules), `tests/` (integration and e2e tests), and `docs/` (design docs and implementation plans).",
+      "content_hash": "91b2746344af09b5",
+      "children": [
+        "file:.gitignore",
+        "file:Cargo.toml",
+        "file:CLAUDE.md",
+        "file:LICENSE",
+        "file:README.md",
+        "file:SPEC.md",
+        "file:TODO.md",
+        "dir:.github",
+        "dir:docs",
+        "dir:src",
+        "dir:tests"
+      ]
+    }
+  }
+}

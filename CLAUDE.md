@@ -6,6 +6,19 @@ Rust TUI tool for running parallel Claude conversations with an orchestrator.
 
 **Architecture and UX: see [SPEC.md](./SPEC.md). It is the source of truth.** Don't guess the design from code — read the spec first, then read code.
 
+## Codebase Navigation (REQUIRED)
+
+Before browsing files to understand the codebase, **query the project-graph index** at `.graph/index.json`. It contains 2-4 sentence summaries of every file and 3-5 sentence summaries of every directory with content hashes for staleness detection.
+
+**Rules — apply to this session and to every spawned subagent / Task / Claude session:**
+- Start any code-exploration task by reading `.graph/index.json` (drill from `dir:.` downward). Use it as the primary orientation tool, alongside SPEC.md for design intent.
+- Only `Read` actual source files when the graph summary is insufficient for the specific change.
+- Run `/project-graph update` once just before committing — not after every small edit — so the graph reflects the final state being committed.
+- If `.graph/index.json` is missing, run `/project-graph build` first.
+- When dispatching subagents, explicitly instruct them to consult `.graph/index.json` before file exploration and to avoid redundant directory traversal.
+
+The skill is published at `ishmum123/project-graph` and installable via `skills.sh`.
+
 ## Build & Run
 
 ```bash
