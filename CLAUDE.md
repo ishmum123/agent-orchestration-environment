@@ -76,9 +76,13 @@ tail /tmp/orc-stderr.log      # for crash output
 TMUX= tmux kill-session -t test-runner 2>/dev/null
 ```
 
-### After any TUI/UX/orchestration change, you MUST live-verify
+### When to run the live e2e harness
 
-Drive the binary through whichever flows your change touches. The minimum bar:
+**Only before `git push` — not after every change.** The tmux harness is expensive in tokens (large pane captures, multiple inspection steps). Per-edit verification is `cargo build` + `cargo test`. The full live-binary flow below runs once, just before pushing, as the final gate.
+
+Exception: if a single change is itself a substantial TUI/UX/orchestration rework and you want to sanity-check it in isolation, run the harness ad hoc. But do not run it after every small edit on the way to a push.
+
+When you do run it, drive the binary through whichever flows your changes touched. The minimum bar:
 
 1. **Startup renders cleanly** — capture pane, confirm tab strip, orc tab content, action bar.
 2. **The flow you changed actually works end-to-end** — type the keystrokes, capture the screen, read the output. Don't infer behavior; observe it.
