@@ -381,6 +381,28 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .unwrap_or("sonnet");
 
+        let session = self.spawn_session(name, task, model).await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "session_id": session.id,
+            "name": session.name,
+            "worktree_path": session.worktree_path,
+            "branch": session.branch,
+            "status": "created"
+        }))?)
+    }
+
+    /// Spawn a fully-equipped worker (worktree + MCP wiring + system
+    /// prompt + child process). Same flow `tool_spawn_session` uses
+    /// behind the JSON-RPC layer, exposed so user-initiated paths
+    /// (e.g. the Ctrl+N attach promotion from the scratch overlay) can
+    /// produce workers indistinguishable from orchestrator-spawned ones.
+    pub(crate) async fn spawn_session(
+        &self,
+        name: &str,
+        task: &str,
+        model: &str,
+    ) -> Result<crate::session::Session> {
         let project_dir = self.project_dir.to_str().unwrap_or(".");
 
         let worktree_path = crate::worktree::create_worktree(project_dir, name).await?;
@@ -439,13 +461,7 @@ impl McpServer {
             }
         }
 
-        Ok(serde_json::to_string(&serde_json::json!({
-            "session_id": session.id,
-            "name": session.name,
-            "worktree_path": worktree_str,
-            "branch": branch,
-            "status": "created"
-        }))?)
+        Ok(session)
     }
 
     async fn tool_instruct_session(&self, args: &Value) -> Result<String> {

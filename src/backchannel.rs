@@ -47,9 +47,112 @@ pub enum PendingPromotion {
     /// Ctrl-B: respawn channel on the given model with the summary as
     /// initial context.
     Model,
-    /// Ctrl-N: hand the summary to orc as a user message and dispose
-    /// of the channel.
-    ToOrc,
+    /// Ctrl-N: kill the channel and spawn a fresh regular worker with
+    /// the summary as its task.
+    AttachAsWorker,
+}
+
+/// Parsed slug + task extracted from the model's summary turn. Used by
+/// the Ctrl+N attach flow to name and brief the new worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarySpec {
+    pub slug: String,
+    pub task: String,
+}
+
+/// Pull a `{slug, task}` pair out of the model's summary reply. The
+/// prompt (see `request_attach_summary`) asks for strict JSON, but
+/// claude sometimes wraps it in prose or a code fence — we extract the
+/// first balanced `{…}` and parse that. On any failure we fall back to
+/// a timestamp slug + the raw text as the task, so a non-JSON reply
+/// (e.g. the echo-mode fake_claude shim) still produces a usable worker.
+pub fn parse_summary(raw: &str) -> SummarySpec {
+    let trimmed = raw.trim();
+    if let Some((start, end)) = find_json_object(trimmed) {
+        if let Ok(v) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+            let slug = v.get("slug").and_then(|x| x.as_str()).map(sanitize_slug);
+            let task = v
+                .get("task")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let (Some(slug), Some(task)) = (slug, task) {
+                if !slug.is_empty() {
+                    return SummarySpec { slug, task };
+                }
+            }
+        }
+    }
+    SummarySpec {
+        slug: fallback_slug(),
+        task: if trimmed.is_empty() {
+            "(scratch chat had no summary)".to_string()
+        } else {
+            trimmed.to_string()
+        },
+    }
+}
+
+fn find_json_object(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn sanitize_slug(raw: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in raw.trim().chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() > 20 {
+        out.truncate(20);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn fallback_slug() -> String {
+    use chrono::Local;
+    format!("scratch-{}", Local::now().format("%H%M%S"))
 }
 
 /// Persistent overlay state. Lives in `App` as `Option<Backchannel>`.
@@ -202,15 +305,31 @@ impl Backchannel {
         Ok(())
     }
 
-    /// Issue a hidden summary request. The next assistant turn will be
-    /// captured into `pending_buffer` (not history) and `pending` drives
-    /// what the main loop does with it.
+    /// Issue a hidden summary request for the Ctrl+B model-promotion
+    /// flow. The next assistant turn lands in `pending_buffer` so the
+    /// main loop can seed a fresh child with it.
     pub async fn request_summary(&mut self, kind: PendingPromotion) -> Result<()> {
         self.pending = Some(kind);
         self.pending_buffer.clear();
         self.thinking = true;
         self.send_raw(
             "Summarize this conversation in 1-3 sentences so it can be handed off. Reply with only the summary.",
+        )
+        .await
+    }
+
+    /// Ctrl+N attach: ask the channel for both a short kebab-case slug
+    /// and a 1-3 sentence task description, as JSON so we can parse
+    /// them apart. The fresh worker uses the slug as its session name
+    /// and the task description as its initial brief.
+    pub async fn request_attach_summary(&mut self) -> Result<()> {
+        self.pending = Some(PendingPromotion::AttachAsWorker);
+        self.pending_buffer.clear();
+        self.thinking = true;
+        self.send_raw(
+            "I'm spinning up a regular worker agent to take this on. Reply with ONLY a JSON object on a single line, no prose, no code fence, in this shape:\n\
+             {\"slug\":\"<short kebab-case identifier, <=20 chars, [a-z0-9-] only>\",\"task\":\"<1-3 sentence task brief for the worker>\"}\n\
+             The slug names the worker (e.g. \"rate-limit\", \"ci-fix\", \"add-flag\"). The task tells the worker what to do.",
         )
         .await
     }
@@ -352,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn pending_summary_captured_then_returned_on_turn_end() {
         let mut bc = fake_bc();
-        bc.pending = Some(PendingPromotion::ToOrc);
+        bc.pending = Some(PendingPromotion::AttachAsWorker);
         // Assistant during pending goes to buffer, not history.
         bc.apply_event(BackchannelEvent::Assistant("a brief summary".into()));
         assert!(bc.history.is_empty());
@@ -361,7 +480,7 @@ mod tests {
         let completed = bc.apply_event(BackchannelEvent::TurnEnd);
         assert!(matches!(
             completed,
-            Some((PendingPromotion::ToOrc, ref s)) if s == "a brief summary"
+            Some((PendingPromotion::AttachAsWorker, ref s)) if s == "a brief summary"
         ));
         assert!(bc.pending.is_none());
         assert!(bc.pending_buffer.is_empty());
@@ -411,6 +530,46 @@ mod tests {
         let evs = parse_events(&raw);
         assert_eq!(evs.len(), 1);
         assert!(matches!(&evs[0], BackchannelEvent::Tool(s) if s == "Read"));
+    }
+
+    #[test]
+    fn parse_summary_extracts_slug_and_task() {
+        let s = parse_summary(r#"{"slug":"rate-limit","task":"Add a rate limiter to the public API."}"#);
+        assert_eq!(s.slug, "rate-limit");
+        assert_eq!(s.task, "Add a rate limiter to the public API.");
+    }
+
+    #[test]
+    fn parse_summary_strips_prose_and_fence() {
+        let s = parse_summary(
+            "Sure! Here you go:\n```json\n{\"slug\":\"Add Flag\",\"task\":\"Add the --foo flag.\"}\n```\n",
+        );
+        assert_eq!(s.slug, "add-flag");
+        assert_eq!(s.task, "Add the --foo flag.");
+    }
+
+    #[test]
+    fn parse_summary_truncates_long_slug() {
+        let s = parse_summary(
+            r#"{"slug":"this-is-a-really-really-long-slug","task":"do it"}"#,
+        );
+        assert!(s.slug.len() <= 20);
+        assert!(s.slug.starts_with("this-is-a-really"));
+    }
+
+    #[test]
+    fn parse_summary_falls_back_when_not_json() {
+        // Echo-mode fake_claude reply: no JSON at all.
+        let s = parse_summary("[fake-claude turn 3] received: please summarize this");
+        assert!(s.slug.starts_with("scratch-"));
+        assert!(s.task.contains("[fake-claude"));
+    }
+
+    #[test]
+    fn parse_summary_falls_back_when_empty() {
+        let s = parse_summary("   ");
+        assert!(s.slug.starts_with("scratch-"));
+        assert!(!s.task.is_empty());
     }
 
     #[test]

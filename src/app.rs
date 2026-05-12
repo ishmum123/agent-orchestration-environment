@@ -318,6 +318,12 @@ pub struct App {
     /// kept alive across overlay open/close until orc quits. Sealed off
     /// from orc's trust root — its events never enter `orc_view`.
     pub backchannel: Option<crate::backchannel::Backchannel>,
+
+    /// Session id that should grab focus once its `SessionCreated`
+    /// broadcast lands. Set by the Ctrl+N attach flow (which spawns a
+    /// worker outside the normal orchestrator path and needs to land
+    /// the user on the new tab).
+    pub pending_focus_session_id: Option<String>,
 }
 
 impl App {
@@ -340,6 +346,7 @@ impl App {
             pending_g: false,
             pending_cleanup: Vec::new(),
             backchannel: None,
+            pending_focus_session_id: None,
         }
     }
 
