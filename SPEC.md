@@ -112,6 +112,26 @@ The binary is resolved via the same `ORC_CLAUDE_BIN`-then-`claude` lookup worker
 
 ---
 
+## Scratch overlay (`?`)
+
+`?` (global, no modal open) toggles a centred overlay containing a persistent backchannel claude conversation. ChatGPT-style: scrollable transcript on top, multi-line input box at the bottom (`Shift-Enter` for newline, `Enter` to send). `Esc` closes the overlay; the backchannel child keeps running so subsequent `?` presses re-open with prior conversation intact.
+
+The backchannel is a stream-json claude child spawned in the project root cwd, on **sonnet** by default. No worktree, no MCP server attachment, no policy gating, no system prompt — it's a sealed-off sidekick for "ask a question, read some code, brainstorm" use that shouldn't pollute orc's context.
+
+**Trust-root isolation.** The backchannel transcript never enters `orc_view.event_log`, never reaches the orchestrator, never appears in the agents panel or task graph. Workers spawned by orc don't see it either. The only escape hatch is `Ctrl-N` below, which is user-initiated.
+
+The help screen lives on `h`. `?` is reserved for the overlay.
+
+Keys, while overlay is open:
+
+- `Esc` — close overlay; channel keeps running.
+- `?` — also closes overlay when the input buffer is empty (so `?` toggles).
+- `Ctrl-X` — kill the backchannel child and drop its state. Next `?` spawns a fresh sonnet channel.
+- `Ctrl-B` — promote to opus. If the conversation is empty, just respawn on opus directly. If non-empty, the channel is asked for a 1–3 sentence summary; on completion the sonnet child is killed and a fresh opus child is spawned with the summary as its first user message (carried forward as a System line in the new transcript).
+- `Ctrl-N` — promote to orc. Asks the channel for a summary; on completion the summary is sent into orc's input stream as a user message prefixed `[from scratch claude]`. The channel is killed. **This is the only path that lets orc's trust root see backchannel content, and it's user-initiated.**
+
+The binary is resolved via the same `ORC_CLAUDE_BIN`-then-`claude` lookup workers use, so harness runs with the `fake_claude` shim work the same way.
+
 ## What's preserved
 
 - **Worktrees**. Each worker gets `git worktree add` to a dedicated branch. This is workspace isolation, unrelated to how the Claude process is run. Worktrees stay.

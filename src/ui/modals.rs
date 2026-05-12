@@ -472,6 +472,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("R", "restart failed worker"),
                 ("^C", "interrupt"),
                 ("n", "fullscreen claude (scratch session, project cwd)"),
+                ("?", "scratch claude overlay (sealed sidekick, sonnet)"),
             ],
         ),
         (
@@ -479,7 +480,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
             &[
                 ("enter", "send chat input"),
                 ("esc", "close modal / deselect"),
-                ("?", "toggle help"),
+                ("h", "toggle help"),
                 ("q", "quit"),
             ],
         ),

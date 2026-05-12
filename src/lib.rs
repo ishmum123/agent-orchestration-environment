@@ -1,6 +1,7 @@
 // Library root: re-export modules for integration tests and external use.
 
 pub mod app;
+pub mod backchannel;
 pub mod db;
 pub mod hooks;
 pub mod mcp;

@@ -8,6 +8,7 @@
 // The top tab strip was removed in the UX overhaul; the agents panel
 // (right-hand side) doubles as the visual tab list.
 
+pub mod backchannel;
 pub mod modals;
 pub mod panel;
 pub mod review;
@@ -84,6 +85,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if let Some(modal) = &app.modal {
         modals::render_modal(frame, area, modal);
+    }
+
+    if let Some(bc) = app.backchannel.as_ref() {
+        if bc.open {
+            backchannel::render_overlay(frame, area, bc, app.tick);
+        }
     }
 }
 
@@ -210,13 +217,24 @@ fn render_orc_welcome(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                "?",
+                "h",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  show all keys", Style::default()),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "?",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  scratch claude (sealed sidekick, sonnet)", Style::default()),
         ]),
         Line::from(vec![
             Span::raw("  "),
@@ -524,8 +542,9 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     parts.push(("n", "claude"));
+    parts.push(("?", "scratch"));
     parts.push(("G", "end"));
-    parts.push(("?", "help"));
+    parts.push(("h", "help"));
     parts.push(("q", "quit"));
 
     // Render with subtle styling: keys in a brighter dim, descriptions

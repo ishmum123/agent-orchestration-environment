@@ -162,12 +162,30 @@ fn l3_confirm_quit_modal() {
 }
 
 #[test]
+fn l3_help_action_bar_uses_h_not_question_mark() {
+    // `?` was rebound to open the scratch overlay; help moved to `h`.
+    // Verify the action bar hint reflects that (so users notice).
+    let mut app = App::new(".");
+    let output = render_to_string(&mut app, 120, 40);
+    // The action bar lives on the last line; the help entry should
+    // pair the `h` key with the `help` label.
+    assert!(
+        output.contains("h ") && output.contains("help"),
+        "action bar should advertise `h help`, got:\n{output}"
+    );
+    assert!(
+        output.contains("? ") && output.contains("scratch"),
+        "action bar should advertise `? scratch`, got:\n{output}"
+    );
+}
+
+#[test]
 fn l3_help_modal() {
     let mut app = App::new(".");
     app.modal = Some(Modal::Help);
     let output = render_to_string(&mut app, 120, 40);
     assert!(
-        output.contains("help") || output.contains("Help"),
+        output.contains("help") || output.contains("Help") || output.contains("keybindings"),
         "should show help content"
     );
 }

@@ -313,6 +313,11 @@ pub struct App {
     /// First half of a `gg` chord (vim-style jump-to-top). Set by `g`,
     /// consumed by next key. Cleared on any other key.
     pub pending_g: bool,
+
+    /// Persistent scratch claude overlay. Spawned on the first `?` and
+    /// kept alive across overlay open/close until orc quits. Sealed off
+    /// from orc's trust root — its events never enter `orc_view`.
+    pub backchannel: Option<crate::backchannel::Backchannel>,
 }
 
 impl App {
@@ -334,6 +339,7 @@ impl App {
             tick: 0,
             pending_g: false,
             pending_cleanup: Vec::new(),
+            backchannel: None,
         }
     }
 

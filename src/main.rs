@@ -1,4 +1,5 @@
 mod app;
+mod backchannel;
 mod db;
 mod hooks;
 mod mcp;
@@ -30,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use app::{App, ChatRole, LogEntry, Modal, TabId};
+use backchannel::{Backchannel, BackchannelEvent};
 use db::Database;
 use hooks::{HookEvent, HookServer};
 use mcp::McpServer;
@@ -266,6 +268,9 @@ async fn main() -> Result<()> {
 
     let _ = orc_process.kill().await;
     worker_registry.kill_all().await;
+    if let Some(bc) = app.backchannel.as_ref() {
+        bc.kill().await;
+    }
 
     result
 }
@@ -285,6 +290,9 @@ async fn run_event_loop(
     mcp_port: u16,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<()> {
+    // Backchannel event receiver. None until the user opens the overlay
+    // for the first time. The Backchannel struct itself lives in `app`.
+    let mut bc_rx: Option<mpsc::UnboundedReceiver<BackchannelEvent>> = None;
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
         // (App passed mutably so render() can pin sticky-bottom scroll.)
@@ -334,6 +342,109 @@ async fn run_event_loop(
                     }
                     KeyAction::ScratchClaude => {
                         run_scratch_claude(terminal, project_dir).await?;
+                    }
+                    KeyAction::ToggleBackchannel => {
+                        if app.backchannel.is_none() {
+                            match Backchannel::spawn(project_dir).await {
+                                Ok((bc, rx)) => {
+                                    app.backchannel = Some(bc);
+                                    bc_rx = Some(rx);
+                                }
+                                Err(e) => {
+                                    app.push_chat(
+                                        ChatRole::System,
+                                        format!("scratch claude failed to start: {e}"),
+                                    );
+                                }
+                            }
+                        } else if let Some(bc) = app.backchannel.as_mut() {
+                            // Toggle visibility on subsequent presses.
+                            bc.open = !bc.open;
+                            if bc.open {
+                                bc.stick_to_bottom = true;
+                            }
+                        }
+                    }
+                    KeyAction::SendBackchannel(msg) => {
+                        if let Some(bc) = app.backchannel.as_mut() {
+                            if let Err(e) = bc.send(&msg).await {
+                                bc.history.push(
+                                    backchannel::BackchannelEntry::System(format!(
+                                        "send failed: {e}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                    KeyAction::KillBackchannel => {
+                        if let Some(bc) = app.backchannel.take() {
+                            bc.kill().await;
+                        }
+                        bc_rx = None;
+                    }
+                    KeyAction::PromoteBackchannelModel(model) => {
+                        // Empty channel → just respawn on the new model.
+                        // Non-empty → ask for a summary, complete on
+                        // arrival (see bc_ev arm below).
+                        let history_empty = app
+                            .backchannel
+                            .as_ref()
+                            .map(|b| b.history.is_empty())
+                            .unwrap_or(true);
+                        if history_empty {
+                            if let Some(bc) = app.backchannel.take() {
+                                bc.kill().await;
+                            }
+                            match Backchannel::spawn_with_model(project_dir, &model, None).await {
+                                Ok((bc, rx)) => {
+                                    app.backchannel = Some(bc);
+                                    bc_rx = Some(rx);
+                                }
+                                Err(e) => {
+                                    bc_rx = None;
+                                    app.push_chat(
+                                        ChatRole::System,
+                                        format!("scratch claude restart failed: {e}"),
+                                    );
+                                }
+                            }
+                        } else if let Some(bc) = app.backchannel.as_mut() {
+                            bc.pending_model = Some(model.clone());
+                            if let Err(e) = bc
+                                .request_summary(backchannel::PendingPromotion::Model)
+                                .await
+                            {
+                                bc.history.push(backchannel::BackchannelEntry::System(
+                                    format!("summary request failed: {e}"),
+                                ));
+                                bc.pending = None;
+                                bc.pending_model = None;
+                            }
+                        }
+                    }
+                    KeyAction::PromoteBackchannelToOrc => {
+                        let history_empty = app
+                            .backchannel
+                            .as_ref()
+                            .map(|b| b.history.is_empty())
+                            .unwrap_or(true);
+                        if history_empty {
+                            // Nothing to hand over — just drop.
+                            if let Some(bc) = app.backchannel.take() {
+                                bc.kill().await;
+                            }
+                            bc_rx = None;
+                        } else if let Some(bc) = app.backchannel.as_mut() {
+                            if let Err(e) = bc
+                                .request_summary(backchannel::PendingPromotion::ToOrc)
+                                .await
+                            {
+                                bc.history.push(backchannel::BackchannelEntry::System(
+                                    format!("summary request failed: {e}"),
+                                ));
+                                bc.pending = None;
+                            }
+                        }
                     }
                     KeyAction::RestartWorker { session_id } => {
                         if let Err(e) = restart_worker(
@@ -408,6 +519,67 @@ async fn run_event_loop(
                 if let Ok(events) = events {
                     for event in events {
                         handle_orc_event(app, event);
+                    }
+                }
+            }
+
+            bc_ev = async {
+                match bc_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(ev) = bc_ev {
+                    let completed = app
+                        .backchannel
+                        .as_mut()
+                        .and_then(|bc| bc.apply_event(ev));
+                    if let Some((kind, summary)) = completed {
+                        match kind {
+                            backchannel::PendingPromotion::Model => {
+                                let target_model = app
+                                    .backchannel
+                                    .as_mut()
+                                    .and_then(|bc| bc.pending_model.take())
+                                    .unwrap_or_else(|| "opus".to_string());
+                                if let Some(bc) = app.backchannel.take() {
+                                    bc.kill().await;
+                                }
+                                match Backchannel::spawn_with_model(
+                                    project_dir,
+                                    &target_model,
+                                    Some(summary),
+                                )
+                                .await
+                                {
+                                    Ok((bc, rx)) => {
+                                        app.backchannel = Some(bc);
+                                        bc_rx = Some(rx);
+                                    }
+                                    Err(e) => {
+                                        bc_rx = None;
+                                        app.push_chat(
+                                            ChatRole::System,
+                                            format!("scratch claude promotion failed: {e}"),
+                                        );
+                                    }
+                                }
+                            }
+                            backchannel::PendingPromotion::ToOrc => {
+                                let promoted = summary.trim().to_string();
+                                if let Some(bc) = app.backchannel.take() {
+                                    bc.kill().await;
+                                }
+                                bc_rx = None;
+                                if !promoted.is_empty() {
+                                    let msg = format!(
+                                        "[from scratch claude] {promoted}"
+                                    );
+                                    app.push_chat(ChatRole::User, msg.clone());
+                                    let _ = orc_process.send(&msg).await;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -532,6 +704,17 @@ enum KeyAction {
     Editor { command: String, target: String, line: Option<usize> },
     ScratchClaude,
     RestartWorker { session_id: String },
+    ToggleBackchannel,
+    SendBackchannel(String),
+    /// Ctrl-X: kill the backchannel child + drop its state.
+    KillBackchannel,
+    /// Ctrl-B: promote the channel to a different model (opus).
+    /// If the conversation is empty, respawn directly; otherwise ask
+    /// for a summary first and complete the swap when it arrives.
+    PromoteBackchannelModel(String),
+    /// Ctrl-N: hand the channel's summary to orc as a user message,
+    /// then drop the channel.
+    PromoteBackchannelToOrc,
 }
 
 /// Clear the spinner flag for a worker once it produces visible output.
@@ -544,6 +727,15 @@ fn clear_thinking(app: &mut App, session_id: &str) {
 /// Append a pasted block to the active modal's text buffer. If no input
 /// modal is open, the paste is dropped (orc has no persistent input box).
 fn handle_paste(text: &str, app: &mut App) {
+    // Pastes land in the backchannel input box when the overlay is open.
+    if app.modal.is_none() {
+        if let Some(bc) = app.backchannel.as_mut() {
+            if bc.open {
+                bc.input.push_str(text);
+                return;
+            }
+        }
+    }
     let modal = app.modal.take();
     let new = match modal {
         Some(Modal::NewTask { target, mut buffer }) => {
@@ -713,6 +905,16 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         return KeyAction::None;
     }
 
+    // The scratch overlay shadows the rest of the keymap while it's
+    // open. Esc closes (channel stays alive); `?` also toggles closed.
+    // Modals (e.g. ConfirmQuit) still take precedence — they can stack
+    // on top of the overlay.
+    if app.modal.is_none()
+        && app.backchannel.as_ref().map(|b| b.open).unwrap_or(false)
+    {
+        return handle_backchannel_key(key, app).await;
+    }
+
     if app.modal.is_some() {
         return handle_modal_key(key, app, state_handle).await;
     }
@@ -734,8 +936,11 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
                 return KeyAction::Quit;
             }
         }
-        KeyCode::Char('?') => {
+        KeyCode::Char('h') => {
             app.modal = Some(Modal::Help);
+        }
+        KeyCode::Char('?') => {
+            return KeyAction::ToggleBackchannel;
         }
         // `c` opens the chat (message orc / talk to the focused worker)
         // on every tab. The old `t` binding stays as an alias for users
@@ -1232,6 +1437,65 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHand
             // Any key dismisses
         }
         None => {}
+    }
+    KeyAction::None
+}
+
+async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
+    // Control-key promotions / kill. Checked before the generic char
+    // routing below so they don't get added to the input buffer.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('x') => return KeyAction::KillBackchannel,
+            KeyCode::Char('b') => return KeyAction::PromoteBackchannelModel("opus".to_string()),
+            KeyCode::Char('n') => return KeyAction::PromoteBackchannelToOrc,
+            _ => {}
+        }
+    }
+
+    let bc = match app.backchannel.as_mut() {
+        Some(b) => b,
+        None => return KeyAction::None,
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            bc.open = false;
+        }
+        KeyCode::Char('?')
+            if !key.modifiers.contains(KeyModifiers::SHIFT)
+                && bc.input.is_empty() =>
+        {
+            // Allow `?` to toggle the overlay closed when the input is
+            // empty. If the user is mid-compose with text in the buffer,
+            // a literal `?` is part of the message instead.
+            bc.open = false;
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            bc.input.push('\n');
+        }
+        KeyCode::Enter => {
+            if !bc.input.trim().is_empty() {
+                let msg = std::mem::take(&mut bc.input);
+                return KeyAction::SendBackchannel(msg);
+            }
+        }
+        KeyCode::Backspace => {
+            bc.input.pop();
+        }
+        KeyCode::Char(c) => {
+            bc.input.push(c);
+        }
+        KeyCode::Up | KeyCode::PageUp => {
+            let amt = if matches!(key.code, KeyCode::PageUp) { 10 } else { 1 };
+            bc.scroll = bc.scroll.saturating_sub(amt);
+            bc.stick_to_bottom = false;
+        }
+        KeyCode::Down | KeyCode::PageDown => {
+            let amt = if matches!(key.code, KeyCode::PageDown) { 10 } else { 1 };
+            bc.scroll = bc.scroll.saturating_add(amt);
+        }
+        _ => {}
     }
     KeyAction::None
 }
