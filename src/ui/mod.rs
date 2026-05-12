@@ -495,7 +495,7 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
             if any_review {
                 parts.push(("r", "review"));
             }
-            parts.push(("^C", "interrupt"));
+            parts.push(("Ctrl+c", "interrupt"));
         }
         TabId::Worker(idx) => {
             if let Some(sv) = app.sessions.get(idx) {
@@ -514,7 +514,7 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
                     }
                     SessionState::Running | SessionState::Blocked { .. } => {
                         parts.push(("⏎", "control"));
-                        parts.push(("^C", "interrupt"));
+                        parts.push(("Ctrl+c", "interrupt"));
                         parts.push(("x", "kill"));
                     }
                 }

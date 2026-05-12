@@ -470,7 +470,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("r", "open review (awaiting review)"),
                 ("x", "kill focused worker"),
                 ("R", "restart failed worker"),
-                ("^C", "interrupt"),
+                ("Ctrl+c", "interrupt"),
                 ("n", "fullscreen claude (scratch session, project cwd)"),
                 ("?", "scratch claude overlay (sealed sidekick, sonnet)"),
             ],

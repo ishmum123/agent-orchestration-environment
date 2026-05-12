@@ -160,15 +160,15 @@ fn render_hints(frame: &mut Frame, area: Rect, _thinking: bool) {
     let hints = Line::from(vec![
         Span::styled("enter", key),
         Span::styled(" send  ", dim),
-        Span::styled("S-enter", key),
+        Span::styled("shift+enter", key),
         Span::styled(" newline  ", dim),
         Span::styled("esc", key),
         Span::styled(" close  ", dim),
-        Span::styled("^X", key),
+        Span::styled("Ctrl+x", key),
         Span::styled(" kill  ", dim),
-        Span::styled("^B", key),
+        Span::styled("Ctrl+b", key),
         Span::styled(" → opus  ", dim),
-        Span::styled("^N", key),
+        Span::styled("Ctrl+n", key),
         Span::styled(" → orc", dim),
     ]);
     frame.render_widget(Paragraph::new(hints), area);
