@@ -12,6 +12,17 @@ pub enum SessionState {
     AwaitingReview { diff_hash: String },
     Done { summary: String },
     Failed { reason: String },
+    /// Claude reported its account is over the rate limit. The session's
+    /// claude child has been killed. `resets_at` is the wall-clock the
+    /// bucket lifts; `bucket` names it (e.g. "five_hour"). When
+    /// `resets_at` is `Some` and within auto-resume range, the quota
+    /// scheduler will respawn the worker once the time passes. When
+    /// `None`, the reset was further out than the auto-resume cap and
+    /// the user must `R` restart manually.
+    WaitingForQuota {
+        resets_at: Option<DateTime<Utc>>,
+        bucket: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +37,21 @@ pub enum SessionMode {
     Watch,
     Control,
 }
+
+/// Snapshot of a paused process's quota state. Shared shape between
+/// `SessionState::WaitingForQuota` (for workers) and `OrcView` (for the
+/// orchestrator brain). `resets_at == None` means the reset was past the
+/// auto-resume cap; the user must restart manually.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaPause {
+    pub resets_at: Option<DateTime<Utc>>,
+    pub bucket: String,
+}
+
+/// Maximum wait the scheduler will auto-resume across. Resets further out
+/// than this are recorded with `resets_at = None` and require a manual
+/// `R` restart.
+pub const QUOTA_AUTORESUME_CAP_SECS: i64 = 5 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -59,6 +85,14 @@ pub enum SessionEvent {
     Finished { summary: String },
     Errored { reason: String },
     Restarted,
+    /// Worker tripped the account quota. `resets_at` is `Some` if the
+    /// scheduler should auto-resume, `None` otherwise (manual restart only).
+    QuotaExceeded {
+        resets_at: Option<DateTime<Utc>>,
+        bucket: String,
+    },
+    /// Scheduler respawned a paused worker and it came back online.
+    QuotaResumed,
 }
 
 pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionState> {
@@ -133,6 +167,22 @@ pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionS
             Ok(SessionState::Running)
         }
 
+        // Quota: Running → WaitingForQuota → Running.
+        (
+            SessionState::Running,
+            SessionEvent::QuotaExceeded { resets_at, bucket },
+        ) => Ok(SessionState::WaitingForQuota {
+            resets_at: *resets_at,
+            bucket: bucket.clone(),
+        }),
+        (SessionState::WaitingForQuota { .. }, SessionEvent::QuotaResumed) => {
+            Ok(SessionState::Running)
+        }
+        // Manual restart from quota also returns to Running.
+        (SessionState::WaitingForQuota { .. }, SessionEvent::Restarted) => {
+            Ok(SessionState::Running)
+        }
+
         // Terminal states — no transitions allowed
         (SessionState::Done { .. }, _) => {
             bail!("invalid transition: Done is a terminal state")
@@ -152,6 +202,7 @@ pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionS
                 SessionState::AwaitingReview { .. } => "AwaitingReview",
                 SessionState::Done { .. } => "Done",
                 SessionState::Failed { .. } => "Failed",
+                SessionState::WaitingForQuota { .. } => "WaitingForQuota",
             };
             let event_name = match event {
                 SessionEvent::Started => "Started",
@@ -166,6 +217,8 @@ pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionS
                 SessionEvent::Finished { .. } => "Finished",
                 SessionEvent::Errored { .. } => "Errored",
                 SessionEvent::Restarted => "Restarted",
+                SessionEvent::QuotaExceeded { .. } => "QuotaExceeded",
+                SessionEvent::QuotaResumed => "QuotaResumed",
             };
             bail!("invalid transition: {} + {}", state_name, event_name)
         }

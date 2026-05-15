@@ -1,10 +1,13 @@
 // Orchestrator brain: spawn and manage the planning agent.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+use crate::worker::{parse_rate_limit_event, RateLimitStatus};
 
 /// Parsed events from the orc brain's stream-json output.
 #[derive(Debug, Clone)]
@@ -31,6 +34,12 @@ pub enum OrcEvent {
     },
     /// Thinking/reasoning block
     Thinking(String),
+    /// Rate-limit state change (warning or exceeded).
+    RateLimit {
+        status: RateLimitStatus,
+        resets_at: DateTime<Utc>,
+        bucket: String,
+    },
 }
 
 /// Parse a raw stream-json Value into zero or more OrcEvents.
@@ -102,6 +111,15 @@ pub fn parse_orc_events(raw: &Value) -> Vec<OrcEvent> {
                 cost_usd,
                 duration_ms,
             });
+        }
+        "rate_limit_event" => {
+            if let Some((status, resets_at, bucket)) = parse_rate_limit_event(raw) {
+                events.push(OrcEvent::RateLimit {
+                    status,
+                    resets_at,
+                    bucket,
+                });
+            }
         }
         _ => {}
     }
@@ -347,8 +365,24 @@ pub async fn write_mcp_config(data_dir: &Path, port: u16) -> Result<PathBuf> {
     Ok(config_path)
 }
 
-/// Spawn the orc brain as a Claude Code process.
+/// Spawn the orc brain as a Claude Code process. Pass `resume_session_id`
+/// to attach via `--resume <id>` and preserve conversation continuity
+/// (used by the quota scheduler after a paused respawn).
 pub async fn spawn_orc(config: &OrcConfig) -> Result<OrcProcess> {
+    spawn_orc_inner(config, None).await
+}
+
+pub async fn spawn_orc_resume(
+    config: &OrcConfig,
+    claude_session_id: &str,
+) -> Result<OrcProcess> {
+    spawn_orc_inner(config, Some(claude_session_id)).await
+}
+
+async fn spawn_orc_inner(
+    config: &OrcConfig,
+    resume_session_id: Option<&str>,
+) -> Result<OrcProcess> {
     let prompt = system_prompt(&config.project_dir);
 
     let mut cmd = Command::new(crate::worker::claude_bin());
@@ -368,6 +402,9 @@ pub async fn spawn_orc(config: &OrcConfig) -> Result<OrcProcess> {
         "--strict-mcp-config",
         "--dangerously-skip-permissions",
     ]);
+    if let Some(sid) = resume_session_id {
+        cmd.args(["--resume", sid]);
+    }
     cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "50");
     cmd.current_dir(&config.project_dir);
     cmd.stdin(std::process::Stdio::piped());

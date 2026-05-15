@@ -217,6 +217,14 @@ pub struct OrcView {
     pub last_context_tokens: Option<u64>,
     /// Inline compose buffer for the orc tab.
     pub compose: ComposeState,
+    /// Set when orc itself tripped its account quota. While Some, orc's
+    /// claude child is dead and the scheduler will either respawn it at
+    /// `resets_at` (if armed) or wait for the user to manually restart.
+    pub quota_paused: Option<crate::session::QuotaPause>,
+    /// Claude session id of the most recent orc brain. Captured from the
+    /// `system` stream-json event so a quota-respawn can `--resume` and
+    /// preserve conversation continuity.
+    pub claude_session_id: Option<String>,
 }
 
 impl OrcView {
@@ -231,6 +239,8 @@ impl OrcView {
             is_thinking: false,
             last_context_tokens: None,
             compose: ComposeState::default(),
+            quota_paused: None,
+            claude_session_id: None,
         }
     }
 
@@ -693,6 +703,7 @@ impl App {
             SessionState::AwaitingReview { .. } => ("◑", Color::Magenta),
             SessionState::Done { .. } => ("✓", Color::Green),
             SessionState::Failed { .. } => ("✗", Color::Red),
+            SessionState::WaitingForQuota { .. } => ("◌", Color::Cyan),
         }
     }
 

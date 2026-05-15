@@ -63,6 +63,7 @@ pub fn render_panel(frame: &mut Frame, area: Rect, app: &App) {
             crate::session::SessionState::AwaitingReview { .. } => "review",
             crate::session::SessionState::Done { .. } => "done",
             crate::session::SessionState::Failed { .. } => "failed",
+            crate::session::SessionState::WaitingForQuota { .. } => "paused",
         };
         let summary = app
             .session_summary(&sv.session.id)

@@ -479,6 +479,27 @@ fn render_orc_welcome(frame: &mut Frame, area: Rect, app: &App) {
 /// One-line header. Left: focused entity (badge + name + state hint).
 /// Right: project basename + worker tally (so multi-orc instances are
 /// distinguishable at a glance).
+/// Build the tab-header hint for a `WaitingForQuota` session: either
+/// `paused — <bucket>, resumes at 15:42` when auto-resume is armed, or
+/// `paused — <bucket>, manual restart required` when the reset is past
+/// the auto-resume cap.
+pub fn format_quota_hint(bucket: &str, resets_at: Option<&chrono::DateTime<chrono::Utc>>) -> String {
+    let bucket_display = match bucket {
+        "five_hour" => "5h limit",
+        "seven_day" => "weekly limit",
+        "seven_day_opus" => "weekly Opus limit",
+        "seven_day_sonnet" => "weekly Sonnet limit",
+        other => other,
+    };
+    match resets_at {
+        Some(t) => {
+            let local: chrono::DateTime<chrono::Local> = (*t).into();
+            format!("paused — {bucket_display}, resumes at {}", local.format("%H:%M"))
+        }
+        None => format!("paused — {bucket_display}, manual restart required"),
+    }
+}
+
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     use crate::session::{BlockKind, SessionState};
 
@@ -505,16 +526,22 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         TabId::Worker(idx) => {
             if let Some(sv) = app.sessions.get(idx) {
                 let (badge, color) = App::state_badge(&sv.session.state);
-                let state_hint = match &sv.session.state {
+                let state_hint: Option<String> = match &sv.session.state {
                     SessionState::Running => None,
-                    SessionState::Blocked { kind, .. } => Some(match kind {
-                        BlockKind::Permission => "blocked: permission",
-                        BlockKind::OrcDecision => "blocked: orc",
-                        BlockKind::UserInput => "blocked: question",
-                    }),
-                    SessionState::AwaitingReview { .. } => Some("awaiting review"),
-                    SessionState::Done { .. } => Some("done"),
-                    SessionState::Failed { .. } => Some("failed"),
+                    SessionState::Blocked { kind, .. } => Some(
+                        match kind {
+                            BlockKind::Permission => "blocked: permission",
+                            BlockKind::OrcDecision => "blocked: orc",
+                            BlockKind::UserInput => "blocked: question",
+                        }
+                        .to_string(),
+                    ),
+                    SessionState::AwaitingReview { .. } => Some("awaiting review".to_string()),
+                    SessionState::Done { .. } => Some("done".to_string()),
+                    SessionState::Failed { .. } => Some("failed".to_string()),
+                    SessionState::WaitingForQuota { resets_at, bucket } => {
+                        Some(format_quota_hint(bucket, resets_at.as_ref()))
+                    }
                 };
                 let mut spans = vec![
                     Span::raw(" "),
@@ -575,11 +602,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         let mut review = 0usize;
         let mut blocked = 0usize;
         let mut failed = 0usize;
+        let mut paused = 0usize;
         for sv in &app.sessions {
             match &sv.session.state {
                 SessionState::AwaitingReview { .. } => review += 1,
                 SessionState::Blocked { .. } => blocked += 1,
                 SessionState::Failed { .. } => failed += 1,
+                SessionState::WaitingForQuota { .. } => paused += 1,
                 _ => {}
             }
         }
@@ -588,6 +617,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         }
         if blocked > 0 {
             tally_parts.push((format!("! {blocked}"), Color::Yellow));
+        }
+        if paused > 0 {
+            tally_parts.push((format!("◌ {paused}"), Color::Cyan));
         }
         if failed > 0 {
             tally_parts.push((format!("✗ {failed}"), Color::Red));
@@ -740,6 +772,10 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
                     SessionState::Running | SessionState::Blocked { .. } => {
                         parts.push(("⏎", "control"));
                         parts.push(("Ctrl+c", "interrupt"));
+                        parts.push(("x", "kill"));
+                    }
+                    SessionState::WaitingForQuota { .. } => {
+                        parts.push(("R", "restart"));
                         parts.push(("x", "kill"));
                     }
                 }

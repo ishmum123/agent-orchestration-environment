@@ -314,6 +314,10 @@ pub async fn sweep_zombie_sessions(handle: &StateHandle) -> usize {
                     .await
             }
             SessionState::Blocked { .. } => handle.remove_session(&s.id).await,
+            // WaitingForQuota persists across orc restarts: the scheduler
+            // will respawn the child once resets_at passes (or wait for
+            // the user's manual restart if resets_at is None).
+            SessionState::WaitingForQuota { .. } => continue,
             _ => continue,
         };
         if result.is_ok() {
@@ -709,6 +713,7 @@ pub fn state_label(state: &SessionState) -> String {
         SessionState::AwaitingReview { .. } => "AwaitingReview".to_string(),
         SessionState::Done { .. } => "Done".to_string(),
         SessionState::Failed { .. } => "Failed".to_string(),
+        SessionState::WaitingForQuota { .. } => "WaitingForQuota".to_string(),
     }
 }
 

@@ -90,6 +90,7 @@ fn state_label(state: &SessionState) -> &'static str {
         SessionState::AwaitingReview { .. } => "AwaitingReview",
         SessionState::Done { .. } => "Done",
         SessionState::Failed { .. } => "Failed",
+        SessionState::WaitingForQuota { .. } => "WaitingForQuota",
     }
 }
 

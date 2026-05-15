@@ -78,6 +78,7 @@ fn state_to_name(state: &SessionState) -> &'static str {
         SessionState::AwaitingReview { .. } => "AwaitingReview",
         SessionState::Done { .. } => "Done",
         SessionState::Failed { .. } => "Failed",
+        SessionState::WaitingForQuota { .. } => "WaitingForQuota",
     }
 }
 

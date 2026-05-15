@@ -264,6 +264,7 @@ async fn main() -> Result<()> {
         &state_handle,
         &mut state_rx,
         &mut orc_process,
+        &orc_config,
         &worker_registry,
         &mut worker_rx,
         &mut orc_inject_rx,
@@ -296,6 +297,7 @@ async fn run_event_loop(
     state_handle: &StateHandle,
     state_rx: &mut tokio::sync::broadcast::Receiver<StateChange>,
     orc_process: &mut OrcProcess,
+    orc_config: &OrcConfig,
     worker_registry: &WorkerRegistry,
     worker_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
     orc_inject_rx: &mut mpsc::Receiver<String>,
@@ -308,6 +310,20 @@ async fn run_event_loop(
     // Backchannel event receiver. None until the user opens the overlay
     // for the first time. The Backchannel struct itself lives in `app`.
     let mut bc_rx: Option<mpsc::UnboundedReceiver<BackchannelEvent>> = None;
+
+    // Quota scheduler tick. Default 10s; harness can compress via
+    // `ORC_QUOTA_TICK_SCALE` (0..1 multiplier, e.g. 0.05 → 500ms).
+    let tick_ms = {
+        let scale: f64 = std::env::var("ORC_QUOTA_TICK_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        (10_000.0 * scale).max(50.0) as u64
+    };
+    let mut quota_tick =
+        tokio::time::interval(Duration::from_millis(tick_ms));
+    quota_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
         // (App passed mutably so render() can pin sticky-bottom scroll.)
@@ -332,20 +348,44 @@ async fn run_event_loop(
                     KeyAction::SendToOrc(msg, attachments) => {
                         let display = format_user_with_attachments(&msg, &attachments);
                         app.push_chat(ChatRole::User, display);
-                        cleanup_idle_done_sessions(
-                            app,
-                            state_handle,
-                            worker_registry,
-                            project_dir,
-                            &msg,
-                        )
-                        .await;
-                        let _ = orc_process.send_with(&msg, &attachments).await;
+                        if app.orc_view.quota_paused.is_some() {
+                            app.orc_view.push(LogEntry::System(
+                                "orc paused — message not delivered".to_string(),
+                            ));
+                        } else {
+                            cleanup_idle_done_sessions(
+                                app,
+                                state_handle,
+                                worker_registry,
+                                project_dir,
+                                &msg,
+                            )
+                            .await;
+                            let _ = orc_process.send_with(&msg, &attachments).await;
+                        }
                     }
                     KeyAction::SendToWorker { session_id, body, attachments } => {
-                        let _ = worker_registry
-                            .send_with(&session_id, &body, &attachments)
-                            .await;
+                        let paused = app
+                            .session_index
+                            .get(&session_id)
+                            .and_then(|&i| app.sessions.get(i))
+                            .map(|sv| matches!(
+                                sv.session.state,
+                                session::SessionState::WaitingForQuota { .. }
+                            ))
+                            .unwrap_or(false);
+                        if paused {
+                            app.push_log(
+                                &session_id,
+                                LogEntry::System(
+                                    "worker paused — message not delivered".to_string(),
+                                ),
+                            );
+                        } else {
+                            let _ = worker_registry
+                                .send_with(&session_id, &body, &attachments)
+                                .await;
+                        }
                     }
                     KeyAction::InterruptOrc => {
                         let _ = orc_process.interrupt().await;
@@ -550,9 +590,35 @@ async fn run_event_loop(
             events = orc_process.read_events() => {
                 if let Ok(events) = events {
                     for event in events {
+                        if let OrcEvent::RateLimit { status, resets_at, bucket } = &event {
+                            handle_rate_limit_orc(
+                                app,
+                                orc_process,
+                                status.clone(),
+                                *resets_at,
+                                bucket.clone(),
+                            )
+                            .await;
+                            continue;
+                        }
                         handle_orc_event(app, event);
                     }
                 }
+            }
+
+            _ = quota_tick.tick() => {
+                run_quota_scheduler(
+                    app,
+                    state_handle,
+                    worker_registry,
+                    orc_process,
+                    orc_config,
+                    project_dir,
+                    hook_sock,
+                    mcp_port,
+                    worker_tx.clone(),
+                )
+                .await;
             }
 
             bc_ev = async {
@@ -737,6 +803,201 @@ async fn handle_worker_event(
             };
             app.push_log(&session_id, LogEntry::System(msg));
             let _ = worker_registry.kill(&session_id).await;
+        }
+        WorkerEvent::RateLimit {
+            session_id,
+            status,
+            resets_at,
+            bucket,
+        } => {
+            handle_rate_limit_worker(
+                app,
+                state_handle,
+                worker_registry,
+                &session_id,
+                status,
+                resets_at,
+                bucket,
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_rate_limit_orc(
+    app: &mut App,
+    orc_process: &mut OrcProcess,
+    status: worker::RateLimitStatus,
+    resets_at: chrono::DateTime<chrono::Utc>,
+    bucket: String,
+) {
+    use worker::RateLimitStatus;
+    let now = chrono::Utc::now();
+    let secs_until = (resets_at - now).num_seconds();
+    match status {
+        RateLimitStatus::Warning => {
+            let local: chrono::DateTime<chrono::Local> = resets_at.into();
+            app.orc_view.push(LogEntry::System(format!(
+                "approaching {} limit, resets at {}",
+                friendly_bucket(&bucket),
+                local.format("%H:%M")
+            )));
+        }
+        RateLimitStatus::Exceeded => {
+            let auto = secs_until > 0 && secs_until < session::QUOTA_AUTORESUME_CAP_SECS;
+            let scheduled = if auto { Some(resets_at) } else { None };
+            let _ = orc_process.kill().await;
+            app.orc_view.is_thinking = false;
+            app.orc_view.alive = false;
+            app.orc_view.quota_paused = Some(session::QuotaPause {
+                resets_at: scheduled,
+                bucket: bucket.clone(),
+            });
+            app.orc_view.push(LogEntry::System(ui::format_quota_hint(
+                &bucket,
+                scheduled.as_ref(),
+            )));
+        }
+    }
+}
+
+async fn handle_rate_limit_worker(
+    app: &mut App,
+    state_handle: &StateHandle,
+    worker_registry: &WorkerRegistry,
+    session_id: &str,
+    status: worker::RateLimitStatus,
+    resets_at: chrono::DateTime<chrono::Utc>,
+    bucket: String,
+) {
+    use worker::RateLimitStatus;
+    let now = chrono::Utc::now();
+    let secs_until = (resets_at - now).num_seconds();
+    match status {
+        RateLimitStatus::Warning => {
+            let local: chrono::DateTime<chrono::Local> = resets_at.into();
+            let msg = format!(
+                "approaching {} limit, resets at {}",
+                friendly_bucket(&bucket),
+                local.format("%H:%M")
+            );
+            app.push_log(session_id, LogEntry::System(msg));
+        }
+        RateLimitStatus::Exceeded => {
+            let auto = secs_until > 0 && secs_until < session::QUOTA_AUTORESUME_CAP_SECS;
+            let scheduled = if auto { Some(resets_at) } else { None };
+            // Kill the child. The scheduler will respawn at resets_at if armed.
+            let _ = worker_registry.kill(session_id).await;
+            let _ = state_handle
+                .apply_event(
+                    session_id,
+                    session::SessionEvent::QuotaExceeded {
+                        resets_at: scheduled,
+                        bucket: bucket.clone(),
+                    },
+                )
+                .await;
+        }
+    }
+}
+
+fn friendly_bucket(bucket: &str) -> &str {
+    match bucket {
+        "five_hour" => "5h",
+        "seven_day" => "weekly",
+        "seven_day_opus" => "weekly Opus",
+        "seven_day_sonnet" => "weekly Sonnet",
+        other => other,
+    }
+}
+
+/// Per-tick walk of paused sessions and orc itself: respawn any whose
+/// `resets_at` has passed. Sessions with `resets_at = None` are skipped
+/// (manual restart only).
+#[allow(clippy::too_many_arguments)]
+async fn run_quota_scheduler(
+    app: &mut App,
+    state_handle: &StateHandle,
+    worker_registry: &WorkerRegistry,
+    orc_process: &mut OrcProcess,
+    orc_config: &OrcConfig,
+    project_dir: &PathBuf,
+    hook_sock: &PathBuf,
+    mcp_port: u16,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+) {
+    let now = chrono::Utc::now();
+
+    // Orc: respawn if armed and due.
+    let orc_due = app
+        .orc_view
+        .quota_paused
+        .as_ref()
+        .and_then(|p| p.resets_at)
+        .is_some_and(|t| t <= now);
+    if orc_due {
+        let resume_sid = app.orc_view.claude_session_id.clone();
+        let spawn_result = match resume_sid.as_deref() {
+            Some(sid) => orc::spawn_orc_resume(orc_config, sid).await,
+            None => orc::spawn_orc(orc_config).await,
+        };
+        match spawn_result {
+            Ok(new_proc) => {
+                *orc_process = new_proc;
+                app.orc_view.alive = true;
+                app.orc_view.quota_paused = None;
+                app.orc_view
+                    .push(LogEntry::System("resumed after quota reset".to_string()));
+            }
+            Err(e) => {
+                app.orc_view.push(LogEntry::System(format!(
+                    "quota auto-resume failed: {e} — try R restart"
+                )));
+                // Clear the pause so it doesn't loop on failure; user can
+                // manually restart.
+                app.orc_view.quota_paused = None;
+            }
+        }
+    }
+
+    // Workers: collect candidates first so we don't hold borrows into
+    // `app` across the await on restart_worker.
+    let candidates: Vec<String> = app
+        .sessions
+        .iter()
+        .filter_map(|sv| {
+            if let session::SessionState::WaitingForQuota { resets_at, .. } = &sv.session.state {
+                resets_at
+                    .filter(|t| *t <= now)
+                    .map(|_| sv.session.id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for id in candidates {
+        match restart_worker(
+            app,
+            state_handle,
+            worker_registry,
+            &id,
+            project_dir,
+            hook_sock,
+            mcp_port,
+            worker_tx.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                app.push_log(&id, LogEntry::System("resumed after quota reset".to_string()));
+            }
+            Err(e) => {
+                app.push_log(
+                    &id,
+                    LogEntry::System(format!("quota auto-resume failed: {e}")),
+                );
+            }
         }
     }
 }
@@ -1524,7 +1785,11 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         KeyCode::Char('R') => {
             if let TabId::Worker(idx) = app.focused_tab {
                 if let Some(sv) = app.sessions.get(idx) {
-                    if matches!(sv.session.state, session::SessionState::Failed { .. }) {
+                    if matches!(
+                        sv.session.state,
+                        session::SessionState::Failed { .. }
+                            | session::SessionState::WaitingForQuota { .. }
+                    ) {
                         return KeyAction::RestartWorker {
                             session_id: sv.session.id.clone(),
                         };
@@ -2251,6 +2516,12 @@ fn handle_state_change(app: &mut App, change: StateChange) {
                         }
                     }
                     session::SessionState::Running => format!("{who} is running"),
+                    session::SessionState::WaitingForQuota { resets_at, bucket } => {
+                        format!(
+                            "{who} {}",
+                            ui::format_quota_hint(bucket, resets_at.as_ref())
+                        )
+                    }
                     other => format!("{who} → {}", state::state_label(other).to_lowercase()),
                 };
                 app.push_chat(ChatRole::System, sentence);
@@ -2365,7 +2636,7 @@ fn handle_orc_event(app: &mut App, event: OrcEvent) {
             app.orc_view.push(LogEntry::TurnEnd { cost_usd });
             app.collapse_last_turn(TabId::Orc);
         }
-        OrcEvent::System { model, .. } => {
+        OrcEvent::System { model, session_id } => {
             if let Some(m) = model {
                 if !app.orc_view.model_announced {
                     app.orc_view
@@ -2373,10 +2644,18 @@ fn handle_orc_event(app: &mut App, event: OrcEvent) {
                     app.orc_view.model_announced = true;
                 }
             }
+            if let Some(sid) = session_id {
+                app.orc_view.claude_session_id = Some(sid);
+            }
         }
         OrcEvent::Thinking(_) => {
             // Hide the text; show only the spinner.
             app.orc_view.is_thinking = true;
+        }
+        OrcEvent::RateLimit { .. } => {
+            // Handled inline in run_event_loop (needs orc_process access).
+            // This arm exists for exhaustiveness; the event is intercepted
+            // before reaching here.
         }
     }
 }

@@ -445,6 +445,23 @@ fn emit_result<W: Write>(out: &mut W) {
     writeln!(out, "{v}").ok();
 }
 
+/// Emit a `rate_limit_event` matching the shape claude-code's CLI uses.
+/// `status` must be "warning" or "exceeded"; `resets_at_epoch` is a unix
+/// timestamp in seconds; `bucket` is the rate-limit type (e.g. "five_hour").
+fn emit_rate_limit<W: Write>(out: &mut W, status: &str, resets_at_epoch: i64, bucket: &str) {
+    let v = json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": status,
+            "rateLimitType": bucket,
+            "resetsAt": resets_at_epoch,
+            "isUsingOverage": false,
+            "overageStatus": "rejected"
+        }
+    });
+    writeln!(out, "{v}").ok();
+}
+
 // ---------------------------------------------------------------------------
 // uuid v4 (no crate dep here)
 // ---------------------------------------------------------------------------
@@ -497,6 +514,21 @@ fn main() {
 
     if script_path.is_none() {
         // Echo mode — preserve original behavior for existing tests.
+        // Optional rate-limit injection: `FAKE_CLAUDE_RATE_LIMIT={warning|exceeded}`
+        // fires on the first turn; `FAKE_CLAUDE_RESETS_IN_SECS=N` (default 60)
+        // controls how far in the future `resetsAt` is; `FAKE_CLAUDE_RATE_LIMIT_BUCKET`
+        // names the bucket (default `five_hour`). Persists via a sentinel file
+        // shared across all fake_claude children so the orc brain + workers
+        // collectively trip once, modeling account-wide behavior.
+        let rl_kind = std::env::var("FAKE_CLAUDE_RATE_LIMIT").ok();
+        let rl_resets_in: i64 = std::env::var("FAKE_CLAUDE_RESETS_IN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let rl_bucket = std::env::var("FAKE_CLAUDE_RATE_LIMIT_BUCKET")
+            .unwrap_or_else(|_| "five_hour".to_string());
+        let sentinel = std::env::temp_dir().join("orc-fake-rate-limit.fired");
+
         let mut turn: u32 = 0;
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
@@ -515,6 +547,34 @@ fn main() {
             } else {
                 String::new()
             };
+
+            // Decide whether to fire a rate-limit event this turn. We do it
+            // once per fake_claude process group, on the first turn.
+            let should_fire = turn == 1 && rl_kind.is_some() && !sentinel.exists();
+            if should_fire {
+                let _ = fs::write(&sentinel, "fired");
+                let kind = rl_kind.as_deref().unwrap_or("");
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let resets_at = now_epoch + rl_resets_in;
+                emit_rate_limit(&mut stdout, kind, resets_at, &rl_bucket);
+                if kind == "exceeded" {
+                    // Hard cap: emit an error result and skip the assistant
+                    // turn entirely — real claude does the same.
+                    let v = json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "total_cost_usd": 0.0
+                    });
+                    writeln!(stdout, "{v}").ok();
+                    stdout.flush().ok();
+                    continue;
+                }
+                // status=warning: fall through to the normal assistant turn.
+            }
+
             emit_assistant_text(
                 &mut stdout,
                 &format!("[fake-claude turn {turn}] received: {snippet}{suffix}"),

@@ -6,12 +6,41 @@
 // raw claude REPL is never visible — orc IS the interface.
 
 use anyhow::Result;
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
+
+/// Rate-limit signal from claude-code's stream-json `rate_limit_event`.
+/// Only `Warning` and `Exceeded` are emitted upstream; `allowed` is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitStatus {
+    Warning,
+    Exceeded,
+}
+
+/// Parse a `rate_limit_event` stream-json message into a typed status + reset
+/// time + bucket. Returns `None` if the event is malformed or `status: allowed`.
+pub fn parse_rate_limit_event(raw: &Value) -> Option<(RateLimitStatus, DateTime<Utc>, String)> {
+    let info = raw.get("rate_limit_info")?;
+    let status_str = info.get("status").and_then(|v| v.as_str())?;
+    let status = match status_str {
+        "warning" => RateLimitStatus::Warning,
+        "exceeded" => RateLimitStatus::Exceeded,
+        _ => return None,
+    };
+    let resets_at_epoch = info.get("resetsAt").and_then(|v| v.as_i64())?;
+    let resets_at = Utc.timestamp_opt(resets_at_epoch, 0).single()?;
+    let bucket = info
+        .get("rateLimitType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Some((status, resets_at, bucket))
+}
 
 #[derive(Debug, Clone)]
 pub enum WorkerEvent {
@@ -55,6 +84,15 @@ pub enum WorkerEvent {
     Usage {
         session_id: String,
         context_tokens: u64,
+    },
+    /// Claude reported a rate-limit state change (warning or exceeded).
+    /// `resets_at` is the unix timestamp the bucket lifts; `bucket` names
+    /// which bucket (e.g. "five_hour", "seven_day_opus").
+    RateLimit {
+        session_id: String,
+        status: RateLimitStatus,
+        resets_at: DateTime<Utc>,
+        bucket: String,
     },
 }
 
@@ -380,6 +418,16 @@ pub fn parse_worker_events(session_id: &str, raw: &Value) -> Vec<WorkerEvent> {
                 cost_usd,
             });
         }
+        "rate_limit_event" => {
+            if let Some((status, resets_at, bucket)) = parse_rate_limit_event(raw) {
+                out.push(WorkerEvent::RateLimit {
+                    session_id: session_id.to_string(),
+                    status,
+                    resets_at,
+                    bucket,
+                });
+            }
+        }
         _ => {}
     }
     out
@@ -506,6 +554,71 @@ mod tests {
     #[test]
     fn parse_unknown_event_type_is_empty() {
         let raw = serde_json::json!({ "type": "unknown" });
+        assert!(parse_worker_events("s1", &raw).is_empty());
+    }
+
+    #[test]
+    fn parse_rate_limit_event_exceeded() {
+        let raw = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "exceeded",
+                "rateLimitType": "five_hour",
+                "resetsAt": 1_700_000_000_i64
+            }
+        });
+        let events = parse_worker_events("s1", &raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WorkerEvent::RateLimit {
+                status, bucket, resets_at, ..
+            } => {
+                assert_eq!(*status, RateLimitStatus::Exceeded);
+                assert_eq!(bucket, "five_hour");
+                assert_eq!(resets_at.timestamp(), 1_700_000_000);
+            }
+            _ => panic!("expected RateLimit"),
+        }
+    }
+
+    #[test]
+    fn parse_rate_limit_event_warning() {
+        let raw = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "warning",
+                "rateLimitType": "seven_day_opus",
+                "resetsAt": 1_700_000_000_i64
+            }
+        });
+        let events = parse_worker_events("s1", &raw);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WorkerEvent::RateLimit { status, bucket, .. } => {
+                assert_eq!(*status, RateLimitStatus::Warning);
+                assert_eq!(bucket, "seven_day_opus");
+            }
+            _ => panic!("expected RateLimit"),
+        }
+    }
+
+    #[test]
+    fn parse_rate_limit_event_allowed_is_ignored() {
+        let raw = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "resetsAt": 1_700_000_000_i64
+            }
+        });
+        assert!(parse_worker_events("s1", &raw).is_empty());
+    }
+
+    #[test]
+    fn parse_rate_limit_event_malformed_is_ignored() {
+        // No rate_limit_info object → drop.
+        let raw = serde_json::json!({ "type": "rate_limit_event" });
         assert!(parse_worker_events("s1", &raw).is_empty());
     }
 }
