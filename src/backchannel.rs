@@ -203,6 +203,11 @@ impl Backchannel {
             "--verbose",
             "--model",
             model,
+            // Scratch is a sealed trust root with no MCP/hooks. Without
+            // this flag the CLI tries to ask the user for tool approval
+            // on stdin, but stdin is piped, so the prompt never reaches
+            // anyone and the tool call silently fails.
+            "--dangerously-skip-permissions",
         ]);
         cmd.current_dir(project_dir);
         cmd.stdin(std::process::Stdio::piped());
@@ -353,6 +358,18 @@ impl Backchannel {
     pub async fn kill(&self) {
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
+    }
+
+    /// Cancel the in-flight turn without killing the conversation. Mirrors
+    /// `WorkerHandle::interrupt` — SIGINT to the child, which claude treats
+    /// as cancel-current-turn and stays alive.
+    pub async fn interrupt(&self) {
+        let child = self.child.lock().await;
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGINT);
+            }
+        }
     }
 
     /// Apply an event from the reader task into history. Returns the

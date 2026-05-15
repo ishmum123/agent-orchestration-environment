@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -23,18 +23,13 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, bc: &mut Backchannel, tick:
     let rect = centered_rect(90, 90, area);
     frame.render_widget(Clear, rect);
 
-    let title = format!(" scratch claude ({}) ", bc.model);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    if inner.height < 6 {
+    if rect.height < 6 {
         return;
     }
 
     // Rows: [transcript | compose (5 rows) | hint (1 row)]
+    // No outer wrapper block — render_event_log and render_compose draw
+    // their own bordered frames, matching the worker/orc tab layout.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -42,7 +37,7 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, bc: &mut Backchannel, tick:
             Constraint::Length(5),  // compose box
             Constraint::Length(1),  // hint bar
         ])
-        .split(inner);
+        .split(rect);
 
     // Autoscroll: pin to the tail when stick_to_bottom is set.
     let events_area = chunks[0];
@@ -63,11 +58,12 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, bc: &mut Backchannel, tick:
         &bc.model,
     );
 
+    let compose_title = format!("scratch · {}", bc.model);
     render_compose(
         frame,
         chunks[1],
         &bc.compose,
-        "scratch",
+        &compose_title,
         bc.thinking,
         tick,
     );
@@ -85,6 +81,8 @@ fn render_hints(frame: &mut Frame, area: Rect) {
         Span::styled(" newline  ", dim),
         Span::styled("esc", key),
         Span::styled(" close  ", dim),
+        Span::styled("Ctrl+c", key),
+        Span::styled(" interrupt  ", dim),
         Span::styled("Ctrl+x", key),
         Span::styled(" kill  ", dim),
         Span::styled("Ctrl+b", key),

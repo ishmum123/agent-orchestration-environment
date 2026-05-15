@@ -237,6 +237,13 @@ async fn main() -> Result<()> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableBracketedPaste)?;
+    {
+        let basename = project_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let _ = io::stdout().execute(terminal::SetTitle(format!("orc - {basename}")));
+    }
     // Ask the terminal to deliver Shift+Enter etc. via the Kitty
     // keyboard protocol (CSI u). Modern terminals (kitty, ghostty,
     // wezterm, alacritty, iTerm2 ≥ 3.5, foot) honour this; others
@@ -385,6 +392,15 @@ async fn run_event_loop(
                                     )),
                                 );
                             }
+                        }
+                    }
+                    KeyAction::InterruptBackchannel => {
+                        if let Some(bc) = app.backchannel.as_mut() {
+                            bc.interrupt().await;
+                            bc.thinking = false;
+                            bc.history.push(crate::app::LogEntry::System(
+                                "interrupted".into(),
+                            ));
                         }
                     }
                     KeyAction::KillBackchannel => {
@@ -745,6 +761,8 @@ enum KeyAction {
     RestartWorker { session_id: String },
     ToggleBackchannel,
     SendBackchannel(String),
+    /// Ctrl-C: cancel the in-flight scratch turn without killing the child.
+    InterruptBackchannel,
     /// Ctrl-X: kill the backchannel child + drop its state.
     KillBackchannel,
     /// Ctrl-B: promote the channel to a different model (opus).
@@ -1910,6 +1928,7 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
     // routing below so they don't get added to the input buffer.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
+            KeyCode::Char('c') => return KeyAction::InterruptBackchannel,
             KeyCode::Char('x') => return KeyAction::KillBackchannel,
             KeyCode::Char('b') => return KeyAction::PromoteBackchannelModel("opus".to_string()),
             KeyCode::Char('n') => return KeyAction::AttachBackchannelAsWorker,
