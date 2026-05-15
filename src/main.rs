@@ -19,6 +19,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     KeyModifiers,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -165,19 +166,11 @@ async fn main() -> Result<()> {
 
     let mut app = App::new(&project_str).with_state_handle(state_handle.clone());
     app.orc_view.model = orc_config.model.clone();
-    app.push_chat(ChatRole::System, format!("orc v2 — MCP on port {mcp_port}"));
 
     // Restore non-terminal sessions from the per-project DB so opening
     // orc twice on the same project picks up where it left off.
     let restored = restore_previous_sessions(&mut app, &state_handle).await;
-    if restored.running.is_empty() && restored.review.is_empty() {
-        // Fresh project — first-frame welcome modal.
-        app.modal = Some(Modal::NewTask {
-            target: TabId::Orc,
-            buffer: String::new(),
-            attachments: input_attachments::AttachmentSet::new(),
-        });
-    } else {
+    if !restored.running.is_empty() || !restored.review.is_empty() {
         for name in &restored.review {
             app.orc_view
                 .event_log
@@ -201,6 +194,7 @@ async fn main() -> Result<()> {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = io::stdout();
+        let _ = out.execute(PopKeyboardEnhancementFlags);
         let _ = out.execute(DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
         let _ = out.execute(LeaveAlternateScreen);
@@ -243,6 +237,14 @@ async fn main() -> Result<()> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableBracketedPaste)?;
+    // Ask the terminal to deliver Shift+Enter etc. via the Kitty
+    // keyboard protocol (CSI u). Modern terminals (kitty, ghostty,
+    // wezterm, alacritty, iTerm2 ≥ 3.5, foot) honour this; others
+    // silently ignore the request, in which case Alt+Enter still
+    // works as the fallback newline shortcut.
+    let _ = io::stdout().execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    ));
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -266,6 +268,7 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
     let _ = io::stdout().execute(DisableBracketedPaste);
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
@@ -802,6 +805,250 @@ fn clear_thinking(app: &mut App, session_id: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inline orc-tab compose-buffer editing helpers
+//
+// The buffer lives in `app.orc_compose` (a String); `app.orc_compose_cursor`
+// is a byte offset that always lands on a char boundary. These functions
+// keep that invariant while inserting, deleting, and moving the cursor.
+// ---------------------------------------------------------------------------
+
+fn compose_clamp_cursor(app: &mut App) {
+    let len = app.orc_compose.len();
+    if app.orc_compose_cursor > len {
+        app.orc_compose_cursor = len;
+    }
+    // Walk back to the nearest char boundary if we landed mid-codepoint.
+    while app.orc_compose_cursor > 0
+        && !app.orc_compose.is_char_boundary(app.orc_compose_cursor)
+    {
+        app.orc_compose_cursor -= 1;
+    }
+}
+
+fn compose_insert_str(app: &mut App, s: &str) {
+    compose_clamp_cursor(app);
+    let i = app.orc_compose_cursor;
+    app.orc_compose.insert_str(i, s);
+    app.orc_compose_cursor = i + s.len();
+}
+
+fn compose_insert_char(app: &mut App, c: char) {
+    compose_clamp_cursor(app);
+    let i = app.orc_compose_cursor;
+    app.orc_compose.insert(i, c);
+    app.orc_compose_cursor = i + c.len_utf8();
+}
+
+fn compose_delete_before(app: &mut App) {
+    compose_clamp_cursor(app);
+    if app.orc_compose_cursor == 0 {
+        return;
+    }
+    let i = app.orc_compose_cursor;
+    let prev_len = app.orc_compose[..i]
+        .chars()
+        .next_back()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
+    let start = i - prev_len;
+    app.orc_compose.replace_range(start..i, "");
+    app.orc_compose_cursor = start;
+}
+
+fn compose_delete_after(app: &mut App) {
+    compose_clamp_cursor(app);
+    let i = app.orc_compose_cursor;
+    if i >= app.orc_compose.len() {
+        return;
+    }
+    let next_len = app.orc_compose[i..]
+        .chars()
+        .next()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
+    app.orc_compose.replace_range(i..i + next_len, "");
+}
+
+fn compose_move_left(app: &mut App) {
+    compose_clamp_cursor(app);
+    if app.orc_compose_cursor == 0 {
+        return;
+    }
+    let i = app.orc_compose_cursor;
+    let prev_len = app.orc_compose[..i]
+        .chars()
+        .next_back()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
+    app.orc_compose_cursor = i - prev_len;
+}
+
+fn compose_move_right(app: &mut App) {
+    compose_clamp_cursor(app);
+    let i = app.orc_compose_cursor;
+    if i >= app.orc_compose.len() {
+        return;
+    }
+    let next_len = app.orc_compose[i..]
+        .chars()
+        .next()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
+    app.orc_compose_cursor = i + next_len;
+}
+
+/// Return `(line_start, line_end)` byte offsets of the line containing
+/// `cursor`. `line_end` is the offset of the trailing `\n` (or the end
+/// of the buffer if this is the last line).
+fn compose_line_bounds(buf: &str, cursor: usize) -> (usize, usize) {
+    let start = buf[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = buf[cursor..]
+        .find('\n')
+        .map(|off| cursor + off)
+        .unwrap_or(buf.len());
+    (start, end)
+}
+
+fn compose_move_line_start(app: &mut App) {
+    compose_clamp_cursor(app);
+    let (start, _) = compose_line_bounds(&app.orc_compose, app.orc_compose_cursor);
+    app.orc_compose_cursor = start;
+}
+
+fn compose_move_line_end(app: &mut App) {
+    compose_clamp_cursor(app);
+    let (_, end) = compose_line_bounds(&app.orc_compose, app.orc_compose_cursor);
+    app.orc_compose_cursor = end;
+}
+
+/// Move the cursor to `col` characters into the line that starts at
+/// `line_start_byte` and ends at `line_end_byte`. If the line is shorter
+/// than `col` chars, the cursor lands at the line's end.
+fn compose_seek_col(
+    buf: &str,
+    line_start: usize,
+    line_end: usize,
+    col: usize,
+) -> usize {
+    let mut byte = line_start;
+    let mut seen = 0usize;
+    for (off, c) in buf[line_start..line_end].char_indices() {
+        if seen == col {
+            return line_start + off;
+        }
+        byte = line_start + off + c.len_utf8();
+        seen += 1;
+    }
+    byte.min(line_end)
+}
+
+fn compose_move_up(app: &mut App) {
+    compose_clamp_cursor(app);
+    let buf = &app.orc_compose;
+    let i = app.orc_compose_cursor;
+    let (line_start, _) = compose_line_bounds(buf, i);
+    if line_start == 0 {
+        return; // already on first line
+    }
+    let col = buf[line_start..i].chars().count();
+    let prev_line_end = line_start - 1; // the '\n' before line_start
+    let prev_line_start = buf[..prev_line_end]
+        .rfind('\n')
+        .map(|n| n + 1)
+        .unwrap_or(0);
+    app.orc_compose_cursor =
+        compose_seek_col(buf, prev_line_start, prev_line_end, col);
+}
+
+fn compose_move_down(app: &mut App) {
+    compose_clamp_cursor(app);
+    let buf = &app.orc_compose;
+    let i = app.orc_compose_cursor;
+    let (line_start, line_end) = compose_line_bounds(buf, i);
+    if line_end >= buf.len() {
+        return; // already on last line
+    }
+    let col = buf[line_start..i].chars().count();
+    let next_line_start = line_end + 1; // skip the '\n'
+    let next_line_end = buf[next_line_start..]
+        .find('\n')
+        .map(|off| next_line_start + off)
+        .unwrap_or(buf.len());
+    app.orc_compose_cursor =
+        compose_seek_col(buf, next_line_start, next_line_end, col);
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn compose_word_left(app: &mut App) {
+    compose_clamp_cursor(app);
+    let buf = &app.orc_compose;
+    let mut i = app.orc_compose_cursor;
+    // Skip non-word chars going left, then skip a run of word chars.
+    let prev_char = |buf: &str, i: usize| -> Option<(char, usize)> {
+        buf[..i].chars().next_back().map(|c| (c, c.len_utf8()))
+    };
+    while let Some((c, w)) = prev_char(buf, i) {
+        if is_word_char(c) {
+            break;
+        }
+        i -= w;
+    }
+    while let Some((c, w)) = prev_char(buf, i) {
+        if !is_word_char(c) {
+            break;
+        }
+        i -= w;
+    }
+    app.orc_compose_cursor = i;
+}
+
+fn compose_word_delete_before(app: &mut App) {
+    let end = app.orc_compose_cursor;
+    compose_word_left(app);
+    let start = app.orc_compose_cursor;
+    if start < end {
+        app.orc_compose.replace_range(start..end, "");
+    }
+}
+
+fn compose_word_delete_after(app: &mut App) {
+    let start = app.orc_compose_cursor;
+    compose_word_right(app);
+    let end = app.orc_compose_cursor;
+    if start < end {
+        app.orc_compose.replace_range(start..end, "");
+        app.orc_compose_cursor = start;
+    }
+}
+
+fn compose_word_right(app: &mut App) {
+    compose_clamp_cursor(app);
+    let buf = &app.orc_compose;
+    let mut i = app.orc_compose_cursor;
+    let next_char = |buf: &str, i: usize| -> Option<(char, usize)> {
+        buf[i..].chars().next().map(|c| (c, c.len_utf8()))
+    };
+    // Skip a run of word chars (if currently inside one), then skip
+    // following non-word chars.
+    while let Some((c, w)) = next_char(buf, i) {
+        if !is_word_char(c) {
+            break;
+        }
+        i += w;
+    }
+    while let Some((c, w)) = next_char(buf, i) {
+        if is_word_char(c) {
+            break;
+        }
+        i += w;
+    }
+    app.orc_compose_cursor = i;
+}
+
 /// Append a pasted block to the active modal's text buffer. If no input
 /// modal is open, the paste is dropped (orc has no persistent input box).
 ///
@@ -827,6 +1074,17 @@ fn handle_paste(text: &str, app: &mut App) {
                 }
                 return;
             }
+        }
+        // Inline orc compose bar: paste lands here when on the orc tab
+        // with nothing covering it.
+        if matches!(app.focused_tab, TabId::Orc) && app.review.is_none() {
+            for a in attachments {
+                app.orc_compose_attachments.push(a);
+            }
+            if !has_image_attachments {
+                compose_insert_str(app, text);
+            }
+            return;
         }
     }
     let modal = app.modal.take();
@@ -1028,6 +1286,126 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         return handle_review_key(key, app, state_handle).await;
     }
 
+    // Chat-first orc tab uses a modal editor:
+    //   - Insert mode (default): printable keys feed the compose bar.
+    //   - Nav mode: legacy single-letter hotkeys take over (`c`, `q`,
+    //     `h`, `?`, `n`, `r`, `R`, `x`, `G`, `!`, `1`-`9`).
+    // Esc toggles between the two; the buffer is preserved across the
+    // switch so the user can briefly pop out for a shortcut and return
+    // to their half-typed message.
+    if matches!(app.focused_tab, TabId::Orc) {
+        if matches!(key.code, KeyCode::Esc) {
+            app.orc_nav_mode = !app.orc_nav_mode;
+            return KeyAction::None;
+        }
+
+        if !app.orc_nav_mode {
+            // Ctrl-V clipboard image/text paste into the inline buffer.
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v'))
+            {
+                match input_attachments::try_from_clipboard() {
+                    Some(Ok(a)) => app.orc_compose_attachments.push(a),
+                    Some(Err(_)) => {}
+                    None => {
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            if let Ok(text) = cb.get_text() {
+                                compose_insert_str(app, &text);
+                            }
+                        }
+                    }
+                }
+                return KeyAction::None;
+            }
+
+            // Cursor navigation. Alt+Left/Right jump by word, Home/End
+            // snap to line edges, Up/Down move between visual lines.
+            match key.code {
+                KeyCode::Left => {
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        compose_word_left(app);
+                    } else {
+                        compose_move_left(app);
+                    }
+                    return KeyAction::None;
+                }
+                KeyCode::Right => {
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        compose_word_right(app);
+                    } else {
+                        compose_move_right(app);
+                    }
+                    return KeyAction::None;
+                }
+                KeyCode::Up => {
+                    compose_move_up(app);
+                    return KeyAction::None;
+                }
+                KeyCode::Down => {
+                    compose_move_down(app);
+                    return KeyAction::None;
+                }
+                KeyCode::Home => {
+                    compose_move_line_start(app);
+                    return KeyAction::None;
+                }
+                KeyCode::End => {
+                    compose_move_line_end(app);
+                    return KeyAction::None;
+                }
+                KeyCode::Delete => {
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        compose_word_delete_after(app);
+                    } else {
+                        compose_delete_after(app);
+                    }
+                    return KeyAction::None;
+                }
+                _ => {}
+            }
+
+            match key.code {
+                KeyCode::Enter => {
+                    // Shift+Enter / Alt+Enter inserts a newline so the
+                    // compose box grows and the user can author multi-line
+                    // messages. Plain Enter still sends.
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        compose_insert_char(app, '\n');
+                        return KeyAction::None;
+                    }
+                    if !app.orc_compose.is_empty() || !app.orc_compose_attachments.is_empty() {
+                        let body = std::mem::take(&mut app.orc_compose);
+                        let imgs = app.orc_compose_attachments.take_all();
+                        app.orc_compose_cursor = 0;
+                        return KeyAction::SendToOrc(body, imgs);
+                    }
+                    return KeyAction::None;
+                }
+                KeyCode::Backspace => {
+                    if app.orc_compose.is_empty() && !app.orc_compose_attachments.is_empty() {
+                        app.orc_compose_attachments.pop();
+                    } else if key.modifiers.contains(KeyModifiers::ALT) {
+                        compose_word_delete_before(app);
+                    } else {
+                        compose_delete_before(app);
+                    }
+                    return KeyAction::None;
+                }
+                KeyCode::Char(c) => {
+                    compose_insert_char(app, c);
+                    return KeyAction::None;
+                }
+                // Tab / BackTab / arrows / PageUp / PageDown / Home / End
+                // fall through to the existing handlers.
+                _ => {}
+            }
+        }
+        // Nav mode falls through to the legacy hotkey `match` below.
+        // Stays in nav mode until the user presses Esc again.
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             if app.sessions.iter().any(|s| {
@@ -1058,8 +1436,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
             });
         }
         // On a worker tab, plain Enter (with no modal open) toggles
-        // control mode. Cheap one-key toggle so the user doesn't have
-        // to remember another letter.
+        // control mode. The orc tab consumed Enter upstream as "send
+        // the inline compose buffer".
         KeyCode::Enter => {
             if let TabId::Worker(idx) = app.focused_tab {
                 if let Some(sv) = app.sessions.get(idx) {

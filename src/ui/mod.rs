@@ -40,15 +40,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_header(frame, layout[0], app);
 
-    // Split main area into [content | agents panel].
-    let panel_w = panel::PANEL_WIDTH.min(layout[1].width.saturating_sub(20));
-    let main_split = Layout::horizontal([
-        Constraint::Min(20),
-        Constraint::Length(panel_w),
-    ])
-    .split(layout[1]);
-    let content_area = main_split[0];
-    let panel_area = main_split[1];
+    // Right-side agents panel is hidden when there are no workers — the
+    // single orc card it would show is redundant with the welcome panel
+    // and the header. Workers spawning reclaim the panel.
+    let show_panel = !app.sessions.is_empty();
+    let (content_area, panel_area) = if show_panel {
+        let panel_w = panel::PANEL_WIDTH.min(layout[1].width.saturating_sub(20));
+        let split = Layout::horizontal([
+            Constraint::Min(20),
+            Constraint::Length(panel_w),
+        ])
+        .split(layout[1]);
+        (split[0], split[1])
+    } else {
+        (layout[1], Rect::new(0, 0, 0, 0))
+    };
 
     // Autoscroll pass: if a tab is sticky-to-bottom, pin its scroll value
     // to the end before rendering. Width used for wrap accounting matches
@@ -60,7 +66,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Hard-clear the chat and panel regions before drawing — works
     // around stale-cell bleed between tab switches with Paragraph wrap.
     frame.render_widget(Clear, content_area);
-    frame.render_widget(Clear, panel_area);
+    if show_panel {
+        frame.render_widget(Clear, panel_area);
+    }
 
     if let Some(rev) = &app.review {
         review::render_review(frame, content_area, rev);
@@ -79,7 +87,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    panel::render_panel(frame, panel_area, app);
+    if show_panel {
+        panel::render_panel(frame, panel_area, app);
+    }
 
     render_action_bar(frame, layout[2], app);
 
@@ -109,8 +119,18 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
         // inside render_event_log.
         let (effective_inner_h, wrapped) = match tab {
             TabId::Orc => {
+                // Orc tab reserves a variable number of rows at the bottom
+                // for the compose box (grows with the buffer, capped). Match
+                // that here so max_scroll lines up.
+                let cbox = orc_compose_box_height(&app.orc_compose);
+                let compose_h = if content_area.height > cbox + 2 {
+                    cbox as usize
+                } else {
+                    0
+                };
+                let effective = inner_h.saturating_sub(compose_h);
                 let wrapped = worker::wrapped_line_count(&app.orc_view.event_log, inner_w);
-                (inner_h, wrapped)
+                (effective, wrapped)
             }
             TabId::Worker(i) => {
                 let sv = &app.sessions[i];
@@ -137,38 +157,230 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
     }
 }
 
-/// Render the orc tab as an event-log peer to worker tabs. On a fresh
-/// session (only system bootstrap lines, no user/assistant content yet),
-/// show a welcome panel instead of two cryptic bracket lines.
+/// Maximum number of text rows inside the compose box. The box itself
+/// is `inner_rows + 2` tall (top + bottom border). Beyond this cap the
+/// buffer is windowed to the tail so the user always sees what they're
+/// currently typing.
+const ORC_COMPOSE_MAX_INNER: usize = 6;
+
+/// Compute the inner text-row count for the compose box given the
+/// current buffer. Always at least 1 (so the placeholder fits when
+/// the buffer is empty).
+fn orc_compose_inner_rows(buffer: &str) -> usize {
+    if buffer.is_empty() {
+        return 1;
+    }
+    buffer.split('\n').count().clamp(1, ORC_COMPOSE_MAX_INNER)
+}
+
+/// Total height of the compose box (inner rows + 2 for borders).
+fn orc_compose_box_height(buffer: &str) -> u16 {
+    (orc_compose_inner_rows(buffer) + 2) as u16
+}
+
+/// Render the orc tab as a chat-first surface: transcript (or welcome
+/// panel when empty) on top, persistent input bar pinned to the bottom.
 fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
     use crate::app::LogEntry;
+
+    let compose_h = orc_compose_box_height(&app.orc_compose);
+    let (transcript_area, compose_area) = if area.height > compose_h + 2 {
+        let split = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(compose_h),
+        ])
+        .split(area);
+        (split[0], split[1])
+    } else {
+        (area, Rect::new(0, 0, 0, 0))
+    };
+
     let has_real_content = app
         .orc_view
         .event_log
         .iter()
         .any(|e| !matches!(e, LogEntry::System(_)));
     if !has_real_content {
-        render_orc_welcome(frame, area, app);
-        return;
+        render_orc_welcome(frame, transcript_area, app);
+    } else {
+        let scroll = app.scroll_pos(TabId::Orc);
+        worker::render_event_log(
+            frame,
+            transcript_area,
+            &app.orc_view.event_log,
+            scroll,
+            app.orc_view.is_thinking,
+            app.tick,
+        );
     }
-    let scroll = app.scroll_pos(TabId::Orc);
-    worker::render_event_log(
-        frame,
-        area,
-        &app.orc_view.event_log,
-        scroll,
-        app.orc_view.is_thinking,
-        app.tick,
-    );
+
+    if compose_area.height > 0 {
+        render_orc_compose(frame, compose_area, app);
+    }
 }
 
-/// Centred welcome panel inside the events frame. Shown on first paint
-/// when the orchestrator has not yet received any work.
-fn render_orc_welcome(frame: &mut Frame, area: Rect, app: &App) {
+/// Persistent inline "talk to orc" input bar. Edits the live
+/// `app.orc_compose` buffer directly — pressing Enter sends, Esc
+/// clears, Backspace deletes. No modal involved on the orc tab.
+fn render_orc_compose(frame: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders};
+    let thinking = app.orc_view.is_thinking;
+    let nav = app.orc_nav_mode;
+    let title = if nav {
+        " navigation mode — Esc to resume typing ".to_string()
+    } else if thinking {
+        " talk to orc · ◐ thinking ".to_string()
+    } else {
+        " talk to orc ".to_string()
+    };
+    let title_style = if nav {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else if thinking {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let border_style = if nav {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" events ", Style::default().fg(Color::DarkGray)));
+        .border_style(border_style)
+        .title(Span::styled(title, title_style));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width < 4 {
+        return;
+    }
+
+    let buffer = &app.orc_compose;
+    let attach_n = app.orc_compose_attachments.len();
+    let is_empty = buffer.is_empty() && attach_n == 0;
+
+    if is_empty {
+        let placeholder = if nav {
+            "(typing disabled · Esc to resume)"
+        } else {
+            "type to talk to orc · ⏎ send · Esc for shortcuts"
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(" "));
+        if attach_n > 0 {
+            spans.push(Span::styled(
+                format!("[{attach_n} img] "),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        spans.push(Span::styled(
+            placeholder.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+        return;
+    }
+
+    // Resolve cursor → (logical_row, col_chars).
+    let cursor_byte = app.orc_compose_cursor.min(buffer.len());
+    let cursor_row = buffer[..cursor_byte].matches('\n').count();
+    let line_start = buffer[..cursor_byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let cursor_col = buffer[line_start..cursor_byte].chars().count();
+
+    // Window the buffer to a slice that keeps the cursor row visible.
+    let all_lines: Vec<&str> = buffer.split('\n').collect();
+    let total = all_lines.len();
+    let visible_n = (inner.height as usize).min(total);
+    // Default to showing the tail; bump the window up if the cursor is
+    // somewhere earlier so it never scrolls off.
+    let mut start = total.saturating_sub(visible_n);
+    if cursor_row < start {
+        start = cursor_row;
+    }
+    if cursor_row >= start + visible_n {
+        start = (cursor_row + 1).saturating_sub(visible_n);
+    }
+    let visible = &all_lines[start..start + visible_n];
+
+    let cursor_glyph = if (app.tick / 60) % 2 == 0 { "▏" } else { " " };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible.len());
+    for (i, line_text) in visible.iter().enumerate() {
+        let abs_row = start + i;
+        let is_cursor_row = abs_row == cursor_row;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(" "));
+        let mut prefix_w = 1usize;
+        if i == 0 && start == 0 && attach_n > 0 {
+            let chip = format!("[{attach_n} img] ");
+            prefix_w += chip.chars().count();
+            spans.push(Span::styled(
+                chip,
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+
+        let avail = (inner.width as usize).saturating_sub(prefix_w);
+
+        if !is_cursor_row {
+            // Non-cursor row: truncate the tail if too wide.
+            let display: String = line_text.chars().take(avail).collect();
+            spans.push(Span::raw(display));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // Cursor row: render the char under the cursor as a reverse-
+        // video overlay so the cursor occupies the same cell as the
+        // character. Blink by toggling the reverse modifier on/off.
+        let line_chars: Vec<char> = line_text.chars().collect();
+        let line_len = line_chars.len();
+        // The cursor may sit one position past the last char (at line
+        // end). Reserve space for that "virtual" cell.
+        let virtual_len = line_len + 1;
+        // Slide the visible window so the cursor cell stays in view.
+        let h_start = if cursor_col < avail {
+            0
+        } else {
+            cursor_col + 1 - avail
+        };
+        let h_end = (h_start + avail).min(virtual_len);
+
+        let before: String = line_chars
+            [h_start..cursor_col.min(h_end).min(line_len)]
+            .iter()
+            .collect();
+        spans.push(Span::raw(before));
+
+        let cursor_char = line_chars.get(cursor_col).copied().unwrap_or(' ');
+        let blink_on = (app.tick / 60) % 2 == 0;
+        let _ = cursor_glyph; // legacy thin glyph; kept for future fallback
+        let cursor_style = if blink_on {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(cursor_char.to_string(), cursor_style));
+
+        if cursor_col < line_len {
+            let after_start = cursor_col + 1;
+            let after: String = line_chars[after_start..h_end.min(line_len)]
+                .iter()
+                .collect();
+            spans.push(Span::raw(after));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Centred welcome panel rendered in the transcript area when the orc
+/// has no real content yet. Below it the persistent compose bar gives
+/// the chat affordance; this panel is the orientation copy.
+fn render_orc_welcome(frame: &mut Frame, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders};
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 4 || inner.width < 20 {
@@ -181,91 +393,43 @@ fn render_orc_welcome(frame: &mut Frame, area: Rect, app: &App) {
         app.orc_view.model.clone()
     };
 
-    let lines: Vec<Line> = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  ◐ orc",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  · {model}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  the orchestrator is ready. give it a task and it will plan,",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            "  delegate to workers, and report back.",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "c",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  chat with orc (give it a task)", Style::default()),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "h",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  show all keys", Style::default()),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "?",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  scratch claude (sealed sidekick, sonnet)", Style::default()),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "q",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  quit", Style::default()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  workers spawn into their own git worktrees. you read their tabs;",
+    // Vertical centering so the welcome text sits in the middle of the
+    // transcript box rather than hugging the top.
+    let body_lines: u16 = 5;
+    let pad_top = inner.height.saturating_sub(body_lines) / 2;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for _ in 0..pad_top {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "◐  orc",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   · {model}"),
             Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  you intervene with c, x, R, r — never with raw shell access.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("project: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.project_dir.display().to_string(),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-    ];
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "     parallel claude conversations, orchestrated.",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "     describe a task and orc will spawn a worker.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(vec![
+        Span::raw("     "),
+        Span::styled("project: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.project_dir.display().to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -444,6 +608,23 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Insert mode on the orc tab swallows letter hotkeys, so the long
+    // action bar would be misleading. Show a single hint pointing to
+    // Esc; the full bar reappears the moment we enter nav mode.
+    if matches!(app.focused_tab, TabId::Orc) && !app.orc_nav_mode {
+        let bar = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  for shortcuts", Style::default().fg(Color::DarkGray)),
+        ]))
+        .style(Style::default().bg(Color::Black));
+        frame.render_widget(bar, area);
+        return;
+    }
+
     // In review mode the global keymap is replaced by a review keymap;
     // show only the review keys so the user doesn't see disabled hints.
     if app.review.is_some() {
@@ -482,22 +663,23 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
     // exists. Worker-state-specific keys come first so the most relevant
     // action is closest to the eye.
     let mut parts: Vec<(&'static str, &'static str)> = Vec::new();
-    parts.push(("c", "chat"));
-
     match app.focused_tab {
         TabId::Orc => {
-            // If a worker is awaiting review, surface `r review` on the
-            // orc tab so the user can act from there without first
-            // hunting for the right worker tab.
+            // Inline compose owns most keys; surface only what's still
+            // relevant. Send/edit affordances are on the compose bar
+            // itself; the action bar shows navigation + global escapes.
+            parts.push(("⏎", "send"));
+            parts.push(("Ctrl+c", "interrupt"));
             let any_review = app.sessions.iter().any(|sv| {
                 matches!(sv.session.state, SessionState::AwaitingReview { .. })
             });
             if any_review {
-                parts.push(("r", "review"));
+                // `r` is buffered when typing — surface review via the
+                // attention cycle instead.
             }
-            parts.push(("Ctrl+c", "interrupt"));
         }
         TabId::Worker(idx) => {
+            parts.push(("c", "chat"));
             if let Some(sv) = app.sessions.get(idx) {
                 match &sv.session.state {
                     SessionState::AwaitingReview { .. } => {

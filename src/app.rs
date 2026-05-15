@@ -327,6 +327,20 @@ pub struct App {
     /// worker outside the normal orchestrator path and needs to land
     /// the user on the new tab).
     pub pending_focus_session_id: Option<String>,
+
+    /// Inline compose buffer for the orc tab. Edited directly via the
+    /// chat-first input bar — no modal involved on this tab.
+    pub orc_compose: String,
+    /// Cursor position as a byte index into `orc_compose`. Always lands
+    /// on a char boundary; helpers in main.rs enforce that.
+    pub orc_compose_cursor: usize,
+    pub orc_compose_attachments: crate::input_attachments::AttachmentSet,
+
+    /// Modal editor flag for the orc tab. `false` = insert mode (default;
+    /// printable keys feed the compose buffer). `true` = nav mode
+    /// (single-letter hotkeys behave like the legacy keymap). Esc
+    /// toggles between the two; the buffer is preserved across switches.
+    pub orc_nav_mode: bool,
 }
 
 impl App {
@@ -350,6 +364,10 @@ impl App {
             pending_cleanup: Vec::new(),
             backchannel: None,
             pending_focus_session_id: None,
+            orc_compose: String::new(),
+            orc_compose_cursor: 0,
+            orc_compose_attachments: crate::input_attachments::AttachmentSet::new(),
+            orc_nav_mode: false,
         }
     }
 
