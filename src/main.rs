@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use app::{App, ChatRole, LogEntry, Modal, TabId};
+use app::{App, ChatRole, ComposeState, LogEntry, Modal, TabId};
 use backchannel::{Backchannel, BackchannelEvent};
 use db::Database;
 use hooks::{HookEvent, HookServer};
@@ -806,96 +806,92 @@ fn clear_thinking(app: &mut App, session_id: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Inline orc-tab compose-buffer editing helpers
+// Inline compose-buffer editing helpers
 //
-// The buffer lives in `app.orc_compose` (a String); `app.orc_compose_cursor`
-// is a byte offset that always lands on a char boundary. These functions
-// keep that invariant while inserting, deleting, and moving the cursor.
+// Operate on a `ComposeState` (buffer + byte-index cursor). The cursor is
+// always kept on a char boundary; helpers enforce that invariant.
 // ---------------------------------------------------------------------------
 
-fn compose_clamp_cursor(app: &mut App) {
-    let len = app.orc_compose.len();
-    if app.orc_compose_cursor > len {
-        app.orc_compose_cursor = len;
+fn compose_clamp_cursor(s: &mut ComposeState) {
+    let len = s.buffer.len();
+    if s.cursor > len {
+        s.cursor = len;
     }
-    // Walk back to the nearest char boundary if we landed mid-codepoint.
-    while app.orc_compose_cursor > 0
-        && !app.orc_compose.is_char_boundary(app.orc_compose_cursor)
-    {
-        app.orc_compose_cursor -= 1;
+    while s.cursor > 0 && !s.buffer.is_char_boundary(s.cursor) {
+        s.cursor -= 1;
     }
 }
 
-fn compose_insert_str(app: &mut App, s: &str) {
-    compose_clamp_cursor(app);
-    let i = app.orc_compose_cursor;
-    app.orc_compose.insert_str(i, s);
-    app.orc_compose_cursor = i + s.len();
+fn compose_insert_str(s: &mut ComposeState, text: &str) {
+    compose_clamp_cursor(s);
+    let i = s.cursor;
+    s.buffer.insert_str(i, text);
+    s.cursor = i + text.len();
 }
 
-fn compose_insert_char(app: &mut App, c: char) {
-    compose_clamp_cursor(app);
-    let i = app.orc_compose_cursor;
-    app.orc_compose.insert(i, c);
-    app.orc_compose_cursor = i + c.len_utf8();
+fn compose_insert_char(s: &mut ComposeState, c: char) {
+    compose_clamp_cursor(s);
+    let i = s.cursor;
+    s.buffer.insert(i, c);
+    s.cursor = i + c.len_utf8();
 }
 
-fn compose_delete_before(app: &mut App) {
-    compose_clamp_cursor(app);
-    if app.orc_compose_cursor == 0 {
+fn compose_delete_before(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    if s.cursor == 0 {
         return;
     }
-    let i = app.orc_compose_cursor;
-    let prev_len = app.orc_compose[..i]
+    let i = s.cursor;
+    let prev_len = s.buffer[..i]
         .chars()
         .next_back()
         .map(|c| c.len_utf8())
         .unwrap_or(0);
     let start = i - prev_len;
-    app.orc_compose.replace_range(start..i, "");
-    app.orc_compose_cursor = start;
+    s.buffer.replace_range(start..i, "");
+    s.cursor = start;
 }
 
-fn compose_delete_after(app: &mut App) {
-    compose_clamp_cursor(app);
-    let i = app.orc_compose_cursor;
-    if i >= app.orc_compose.len() {
+fn compose_delete_after(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let i = s.cursor;
+    if i >= s.buffer.len() {
         return;
     }
-    let next_len = app.orc_compose[i..]
+    let next_len = s.buffer[i..]
         .chars()
         .next()
         .map(|c| c.len_utf8())
         .unwrap_or(0);
-    app.orc_compose.replace_range(i..i + next_len, "");
+    s.buffer.replace_range(i..i + next_len, "");
 }
 
-fn compose_move_left(app: &mut App) {
-    compose_clamp_cursor(app);
-    if app.orc_compose_cursor == 0 {
+fn compose_move_left(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    if s.cursor == 0 {
         return;
     }
-    let i = app.orc_compose_cursor;
-    let prev_len = app.orc_compose[..i]
+    let i = s.cursor;
+    let prev_len = s.buffer[..i]
         .chars()
         .next_back()
         .map(|c| c.len_utf8())
         .unwrap_or(0);
-    app.orc_compose_cursor = i - prev_len;
+    s.cursor = i - prev_len;
 }
 
-fn compose_move_right(app: &mut App) {
-    compose_clamp_cursor(app);
-    let i = app.orc_compose_cursor;
-    if i >= app.orc_compose.len() {
+fn compose_move_right(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let i = s.cursor;
+    if i >= s.buffer.len() {
         return;
     }
-    let next_len = app.orc_compose[i..]
+    let next_len = s.buffer[i..]
         .chars()
         .next()
         .map(|c| c.len_utf8())
         .unwrap_or(0);
-    app.orc_compose_cursor = i + next_len;
+    s.cursor = i + next_len;
 }
 
 /// Return `(line_start, line_end)` byte offsets of the line containing
@@ -910,27 +906,22 @@ fn compose_line_bounds(buf: &str, cursor: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn compose_move_line_start(app: &mut App) {
-    compose_clamp_cursor(app);
-    let (start, _) = compose_line_bounds(&app.orc_compose, app.orc_compose_cursor);
-    app.orc_compose_cursor = start;
+fn compose_move_line_start(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let (start, _) = compose_line_bounds(&s.buffer, s.cursor);
+    s.cursor = start;
 }
 
-fn compose_move_line_end(app: &mut App) {
-    compose_clamp_cursor(app);
-    let (_, end) = compose_line_bounds(&app.orc_compose, app.orc_compose_cursor);
-    app.orc_compose_cursor = end;
+fn compose_move_line_end(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let (_, end) = compose_line_bounds(&s.buffer, s.cursor);
+    s.cursor = end;
 }
 
-/// Move the cursor to `col` characters into the line that starts at
-/// `line_start_byte` and ends at `line_end_byte`. If the line is shorter
-/// than `col` chars, the cursor lands at the line's end.
-fn compose_seek_col(
-    buf: &str,
-    line_start: usize,
-    line_end: usize,
-    col: usize,
-) -> usize {
+/// Move the cursor to `col` characters into the line bounded by
+/// `[line_start, line_end]`. If the line is shorter than `col`, lands at
+/// the line's end.
+fn compose_seek_col(buf: &str, line_start: usize, line_end: usize, col: usize) -> usize {
     let mut byte = line_start;
     let mut seen = 0usize;
     for (off, c) in buf[line_start..line_end].char_indices() {
@@ -943,51 +934,45 @@ fn compose_seek_col(
     byte.min(line_end)
 }
 
-fn compose_move_up(app: &mut App) {
-    compose_clamp_cursor(app);
-    let buf = &app.orc_compose;
-    let i = app.orc_compose_cursor;
+fn compose_move_up(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let buf = &s.buffer;
+    let i = s.cursor;
     let (line_start, _) = compose_line_bounds(buf, i);
     if line_start == 0 {
-        return; // already on first line
+        return;
     }
     let col = buf[line_start..i].chars().count();
-    let prev_line_end = line_start - 1; // the '\n' before line_start
-    let prev_line_start = buf[..prev_line_end]
-        .rfind('\n')
-        .map(|n| n + 1)
-        .unwrap_or(0);
-    app.orc_compose_cursor =
-        compose_seek_col(buf, prev_line_start, prev_line_end, col);
+    let prev_line_end = line_start - 1;
+    let prev_line_start = buf[..prev_line_end].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    s.cursor = compose_seek_col(buf, prev_line_start, prev_line_end, col);
 }
 
-fn compose_move_down(app: &mut App) {
-    compose_clamp_cursor(app);
-    let buf = &app.orc_compose;
-    let i = app.orc_compose_cursor;
+fn compose_move_down(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let buf = &s.buffer;
+    let i = s.cursor;
     let (line_start, line_end) = compose_line_bounds(buf, i);
     if line_end >= buf.len() {
-        return; // already on last line
+        return;
     }
     let col = buf[line_start..i].chars().count();
-    let next_line_start = line_end + 1; // skip the '\n'
+    let next_line_start = line_end + 1;
     let next_line_end = buf[next_line_start..]
         .find('\n')
         .map(|off| next_line_start + off)
         .unwrap_or(buf.len());
-    app.orc_compose_cursor =
-        compose_seek_col(buf, next_line_start, next_line_end, col);
+    s.cursor = compose_seek_col(buf, next_line_start, next_line_end, col);
 }
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-fn compose_word_left(app: &mut App) {
-    compose_clamp_cursor(app);
-    let buf = &app.orc_compose;
-    let mut i = app.orc_compose_cursor;
-    // Skip non-word chars going left, then skip a run of word chars.
+fn compose_word_left(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let buf = &s.buffer;
+    let mut i = s.cursor;
     let prev_char = |buf: &str, i: usize| -> Option<(char, usize)> {
         buf[..i].chars().next_back().map(|c| (c, c.len_utf8()))
     };
@@ -1003,37 +988,16 @@ fn compose_word_left(app: &mut App) {
         }
         i -= w;
     }
-    app.orc_compose_cursor = i;
+    s.cursor = i;
 }
 
-fn compose_word_delete_before(app: &mut App) {
-    let end = app.orc_compose_cursor;
-    compose_word_left(app);
-    let start = app.orc_compose_cursor;
-    if start < end {
-        app.orc_compose.replace_range(start..end, "");
-    }
-}
-
-fn compose_word_delete_after(app: &mut App) {
-    let start = app.orc_compose_cursor;
-    compose_word_right(app);
-    let end = app.orc_compose_cursor;
-    if start < end {
-        app.orc_compose.replace_range(start..end, "");
-        app.orc_compose_cursor = start;
-    }
-}
-
-fn compose_word_right(app: &mut App) {
-    compose_clamp_cursor(app);
-    let buf = &app.orc_compose;
-    let mut i = app.orc_compose_cursor;
+fn compose_word_right(s: &mut ComposeState) {
+    compose_clamp_cursor(s);
+    let buf = &s.buffer;
+    let mut i = s.cursor;
     let next_char = |buf: &str, i: usize| -> Option<(char, usize)> {
         buf[i..].chars().next().map(|c| (c, c.len_utf8()))
     };
-    // Skip a run of word chars (if currently inside one), then skip
-    // following non-word chars.
     while let Some((c, w)) = next_char(buf, i) {
         if !is_word_char(c) {
             break;
@@ -1046,7 +1010,26 @@ fn compose_word_right(app: &mut App) {
         }
         i += w;
     }
-    app.orc_compose_cursor = i;
+    s.cursor = i;
+}
+
+fn compose_word_delete_before(s: &mut ComposeState) {
+    let end = s.cursor;
+    compose_word_left(s);
+    let start = s.cursor;
+    if start < end {
+        s.buffer.replace_range(start..end, "");
+    }
+}
+
+fn compose_word_delete_after(s: &mut ComposeState) {
+    let start = s.cursor;
+    compose_word_right(s);
+    let end = s.cursor;
+    if start < end {
+        s.buffer.replace_range(start..end, "");
+        s.cursor = start;
+    }
 }
 
 /// Append a pasted block to the active modal's text buffer. If no input
@@ -1075,29 +1058,22 @@ fn handle_paste(text: &str, app: &mut App) {
                 return;
             }
         }
-        // Inline orc compose bar: paste lands here when on the orc tab
-        // with nothing covering it.
-        if matches!(app.focused_tab, TabId::Orc) && app.review.is_none() {
-            for a in attachments {
-                app.orc_compose_attachments.push(a);
+        // Inline compose bar: paste lands in the focused tab's compose
+        // buffer when nothing is covering it.
+        if app.review.is_none() {
+            if let Some(cs) = app.focused_compose_mut() {
+                for a in attachments {
+                    cs.attachments.push(a);
+                }
+                if !has_image_attachments {
+                    compose_insert_str(cs, text);
+                }
+                return;
             }
-            if !has_image_attachments {
-                compose_insert_str(app, text);
-            }
-            return;
         }
     }
     let modal = app.modal.take();
     let new = match modal {
-        Some(Modal::NewTask { target, mut buffer, attachments: mut set }) => {
-            for a in attachments {
-                set.push(a);
-            }
-            if !has_image_attachments {
-                buffer.push_str(text);
-            }
-            Some(Modal::NewTask { target, buffer, attachments: set })
-        }
         Some(Modal::AskUser {
             session_id,
             question_id,
@@ -1286,31 +1262,40 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         return handle_review_key(key, app, state_handle).await;
     }
 
-    // Chat-first orc tab uses a modal editor:
+    // Chat-first modal editor on both orc and worker tabs:
     //   - Insert mode (default): printable keys feed the compose bar.
-    //   - Nav mode: legacy single-letter hotkeys take over (`c`, `q`,
-    //     `h`, `?`, `n`, `r`, `R`, `x`, `G`, `!`, `1`-`9`).
+    //   - Nav mode: legacy single-letter hotkeys take over.
     // Esc toggles between the two; the buffer is preserved across the
-    // switch so the user can briefly pop out for a shortcut and return
-    // to their half-typed message.
-    if matches!(app.focused_tab, TabId::Orc) {
+    // switch. Each tab carries its own compose state.
+    if app.focused_compose().is_some() {
         if matches!(key.code, KeyCode::Esc) {
-            app.orc_nav_mode = !app.orc_nav_mode;
+            if let Some(cs) = app.focused_compose_mut() {
+                cs.nav_mode = !cs.nav_mode;
+            }
             return KeyAction::None;
         }
 
-        if !app.orc_nav_mode {
+        let nav_mode = app.focused_compose().map(|c| c.nav_mode).unwrap_or(false);
+        if !nav_mode {
             // Ctrl-V clipboard image/text paste into the inline buffer.
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('v'))
             {
-                match input_attachments::try_from_clipboard() {
-                    Some(Ok(a)) => app.orc_compose_attachments.push(a),
-                    Some(Err(_)) => {}
-                    None => {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            if let Ok(text) = cb.get_text() {
-                                compose_insert_str(app, &text);
+                let img = input_attachments::try_from_clipboard();
+                let cb_text = if matches!(img, None) {
+                    arboard::Clipboard::new()
+                        .ok()
+                        .and_then(|mut cb| cb.get_text().ok())
+                } else {
+                    None
+                };
+                if let Some(cs) = app.focused_compose_mut() {
+                    match img {
+                        Some(Ok(a)) => cs.attachments.push(a),
+                        Some(Err(_)) => {}
+                        None => {
+                            if let Some(text) = cb_text {
+                                compose_insert_str(cs, &text);
                             }
                         }
                     }
@@ -1320,44 +1305,39 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
 
             // Cursor navigation. Alt+Left/Right jump by word, Home/End
             // snap to line edges, Up/Down move between visual lines.
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
                 KeyCode::Left => {
-                    if key.modifiers.contains(KeyModifiers::ALT) {
-                        compose_word_left(app);
-                    } else {
-                        compose_move_left(app);
+                    if let Some(cs) = app.focused_compose_mut() {
+                        if alt { compose_word_left(cs); } else { compose_move_left(cs); }
                     }
                     return KeyAction::None;
                 }
                 KeyCode::Right => {
-                    if key.modifiers.contains(KeyModifiers::ALT) {
-                        compose_word_right(app);
-                    } else {
-                        compose_move_right(app);
+                    if let Some(cs) = app.focused_compose_mut() {
+                        if alt { compose_word_right(cs); } else { compose_move_right(cs); }
                     }
                     return KeyAction::None;
                 }
                 KeyCode::Up => {
-                    compose_move_up(app);
+                    if let Some(cs) = app.focused_compose_mut() { compose_move_up(cs); }
                     return KeyAction::None;
                 }
                 KeyCode::Down => {
-                    compose_move_down(app);
+                    if let Some(cs) = app.focused_compose_mut() { compose_move_down(cs); }
                     return KeyAction::None;
                 }
                 KeyCode::Home => {
-                    compose_move_line_start(app);
+                    if let Some(cs) = app.focused_compose_mut() { compose_move_line_start(cs); }
                     return KeyAction::None;
                 }
                 KeyCode::End => {
-                    compose_move_line_end(app);
+                    if let Some(cs) = app.focused_compose_mut() { compose_move_line_end(cs); }
                     return KeyAction::None;
                 }
                 KeyCode::Delete => {
-                    if key.modifiers.contains(KeyModifiers::ALT) {
-                        compose_word_delete_after(app);
-                    } else {
-                        compose_delete_after(app);
+                    if let Some(cs) = app.focused_compose_mut() {
+                        if alt { compose_word_delete_after(cs); } else { compose_delete_after(cs); }
                     }
                     return KeyAction::None;
                 }
@@ -1372,33 +1352,61 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
                     if key.modifiers.contains(KeyModifiers::SHIFT)
                         || key.modifiers.contains(KeyModifiers::ALT)
                     {
-                        compose_insert_char(app, '\n');
+                        if let Some(cs) = app.focused_compose_mut() {
+                            compose_insert_char(cs, '\n');
+                        }
                         return KeyAction::None;
                     }
-                    if !app.orc_compose.is_empty() || !app.orc_compose_attachments.is_empty() {
-                        let body = std::mem::take(&mut app.orc_compose);
-                        let imgs = app.orc_compose_attachments.take_all();
-                        app.orc_compose_cursor = 0;
-                        return KeyAction::SendToOrc(body, imgs);
+                    // Send the buffer to the focused agent.
+                    let target = app.focused_tab;
+                    let (body, imgs) = if let Some(cs) = app.focused_compose_mut() {
+                        if cs.buffer.is_empty() && cs.attachments.is_empty() {
+                            return KeyAction::None;
+                        }
+                        let body = std::mem::take(&mut cs.buffer);
+                        let imgs = cs.attachments.take_all();
+                        cs.cursor = 0;
+                        (body, imgs)
+                    } else {
+                        return KeyAction::None;
+                    };
+                    match target {
+                        TabId::Orc => return KeyAction::SendToOrc(body, imgs),
+                        TabId::Worker(idx) => {
+                            if let Some(sv) = app.sessions.get(idx) {
+                                let id = sv.session.id.clone();
+                                let display = format_user_with_attachments(&body, &imgs);
+                                app.push_log(&id, LogEntry::UserText(display));
+                                return KeyAction::SendToWorker {
+                                    session_id: id,
+                                    body,
+                                    attachments: imgs,
+                                };
+                            }
+                            return KeyAction::None;
+                        }
                     }
-                    return KeyAction::None;
                 }
                 KeyCode::Backspace => {
-                    if app.orc_compose.is_empty() && !app.orc_compose_attachments.is_empty() {
-                        app.orc_compose_attachments.pop();
-                    } else if key.modifiers.contains(KeyModifiers::ALT) {
-                        compose_word_delete_before(app);
-                    } else {
-                        compose_delete_before(app);
+                    if let Some(cs) = app.focused_compose_mut() {
+                        if cs.buffer.is_empty() && !cs.attachments.is_empty() {
+                            cs.attachments.pop();
+                        } else if alt {
+                            compose_word_delete_before(cs);
+                        } else {
+                            compose_delete_before(cs);
+                        }
                     }
                     return KeyAction::None;
                 }
                 KeyCode::Char(c) => {
-                    compose_insert_char(app, c);
+                    if let Some(cs) = app.focused_compose_mut() {
+                        compose_insert_char(cs, c);
+                    }
                     return KeyAction::None;
                 }
-                // Tab / BackTab / arrows / PageUp / PageDown / Home / End
-                // fall through to the existing handlers.
+                // Tab / BackTab / PageUp / PageDown fall through to the
+                // existing handlers.
                 _ => {}
             }
         }
@@ -1425,19 +1433,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
         KeyCode::Char('?') => {
             return KeyAction::ToggleBackchannel;
         }
-        // `c` opens the chat (message orc / talk to the focused worker)
-        // on every tab. The old `t` binding stays as an alias for users
-        // who built muscle memory before the rebind.
-        KeyCode::Char('c') | KeyCode::Char('t') => {
-            app.modal = Some(Modal::NewTask {
-                target: app.focused_tab,
-                buffer: String::new(),
-                attachments: input_attachments::AttachmentSet::new(),
-            });
-        }
-        // On a worker tab, plain Enter (with no modal open) toggles
-        // control mode. The orc tab consumed Enter upstream as "send
-        // the inline compose buffer".
+        // In nav mode on a worker tab, Enter toggles Watch/Control mode.
+        // Insert mode consumes Enter upstream as "send the inline buffer".
         KeyCode::Enter => {
             if let TabId::Worker(idx) = app.focused_tab {
                 if let Some(sv) = app.sessions.get(idx) {
@@ -1600,74 +1597,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
 async fn handle_modal_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) -> KeyAction {
     let modal = app.modal.take();
     match modal {
-        Some(Modal::NewTask { target, mut buffer, mut attachments }) => {
-            // Ctrl+V: try the OS clipboard for an image (or image path
-            // in text). Falls back to inserting clipboard text into the
-            // buffer when nothing image-like is found.
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('v'))
-            {
-                match input_attachments::try_from_clipboard() {
-                    Some(Ok(a)) => attachments.push(a),
-                    Some(Err(_)) => { /* surfaced silently — keep modal open */ }
-                    None => {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            if let Ok(text) = cb.get_text() {
-                                buffer.push_str(&text);
-                            }
-                        }
-                    }
-                }
-                app.modal = Some(Modal::NewTask { target, buffer, attachments });
-                return KeyAction::None;
-            }
-            match key.code {
-            KeyCode::Esc => {}
-            KeyCode::Enter
-                if (!buffer.is_empty() || !attachments.is_empty())
-                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                let imgs = attachments.take_all();
-                match target {
-                    TabId::Orc => return KeyAction::SendToOrc(buffer, imgs),
-                    TabId::Worker(idx) => {
-                        if let Some(sv) = app.sessions.get(idx) {
-                            let id = sv.session.id.clone();
-                            let body = buffer.clone();
-                            let display = format_user_with_attachments(&body, &imgs);
-                            app.push_log(&id, LogEntry::UserText(display));
-                            return KeyAction::SendToWorker {
-                                session_id: id,
-                                body,
-                                attachments: imgs,
-                            };
-                        }
-                    }
-                }
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                buffer.push('\n');
-                app.modal = Some(Modal::NewTask { target, buffer, attachments });
-            }
-            KeyCode::Char(c) => {
-                buffer.push(c);
-                app.modal = Some(Modal::NewTask { target, buffer, attachments });
-            }
-            KeyCode::Backspace => {
-                // Backspace on empty input deletes the rightmost chip;
-                // otherwise edits the buffer normally.
-                if buffer.is_empty() && !attachments.is_empty() {
-                    attachments.pop();
-                } else {
-                    buffer.pop();
-                }
-                app.modal = Some(Modal::NewTask { target, buffer, attachments });
-            }
-            _ => {
-                app.modal = Some(Modal::NewTask { target, buffer, attachments });
-            }
-            }
-        }
         Some(Modal::AskUser {
             session_id,
             question_id,

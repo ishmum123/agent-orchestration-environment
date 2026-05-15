@@ -1003,6 +1003,7 @@ mod tests {
             stick_to_bottom: true,
             is_thinking: false,
             last_context_tokens: None,
+            compose: crate::app::ComposeState::default(),
         }
     }
 

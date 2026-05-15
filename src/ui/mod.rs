@@ -81,7 +81,29 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 let scroll = app.scroll_pos(TabId::Worker(idx));
                 let tick = app.tick;
                 if let Some(sv) = app.sessions.get(idx) {
-                    worker::render_worker(frame, content_area, sv, scroll, tick);
+                    let cbox = compose_box_height(&sv.compose.buffer);
+                    let (top, bottom) = if content_area.height > cbox + 2 {
+                        let split = Layout::vertical([
+                            Constraint::Min(1),
+                            Constraint::Length(cbox),
+                        ])
+                        .split(content_area);
+                        (split[0], split[1])
+                    } else {
+                        (content_area, Rect::new(0, 0, 0, 0))
+                    };
+                    worker::render_worker(frame, top, sv, scroll, tick);
+                    if bottom.height > 0 {
+                        let title = format!("talk to {}", sv.session.name);
+                        render_compose(
+                            frame,
+                            bottom,
+                            &sv.compose,
+                            &title,
+                            sv.is_thinking,
+                            tick,
+                        );
+                    }
                 }
             }
         }
@@ -122,7 +144,7 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
                 // Orc tab reserves a variable number of rows at the bottom
                 // for the compose box (grows with the buffer, capped). Match
                 // that here so max_scroll lines up.
-                let cbox = orc_compose_box_height(&app.orc_compose);
+                let cbox = compose_box_height(&app.orc_view.compose.buffer);
                 let compose_h = if content_area.height > cbox + 2 {
                     cbox as usize
                 } else {
@@ -138,7 +160,13 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
                 let task_h: usize = if task_is_empty || content_area.height < 6 { 0 } else { 1 };
                 let dec_count = sv.permissions.len().min(8);
                 let dec_h: usize = if dec_count > 0 { dec_count + 2 } else { 0 };
-                let effective = inner_h.saturating_sub(task_h + dec_h);
+                let cbox = compose_box_height(&sv.compose.buffer);
+                let compose_h: usize = if content_area.height > cbox + 2 {
+                    cbox as usize
+                } else {
+                    0
+                };
+                let effective = inner_h.saturating_sub(task_h + dec_h + compose_h);
                 let wrapped = worker::wrapped_line_count(&sv.event_log, inner_w);
                 (effective, wrapped)
             }
@@ -161,21 +189,21 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
 /// is `inner_rows + 2` tall (top + bottom border). Beyond this cap the
 /// buffer is windowed to the tail so the user always sees what they're
 /// currently typing.
-const ORC_COMPOSE_MAX_INNER: usize = 6;
+const COMPOSE_MAX_INNER: usize = 6;
 
 /// Compute the inner text-row count for the compose box given the
 /// current buffer. Always at least 1 (so the placeholder fits when
 /// the buffer is empty).
-fn orc_compose_inner_rows(buffer: &str) -> usize {
+fn compose_inner_rows(buffer: &str) -> usize {
     if buffer.is_empty() {
         return 1;
     }
-    buffer.split('\n').count().clamp(1, ORC_COMPOSE_MAX_INNER)
+    buffer.split('\n').count().clamp(1, COMPOSE_MAX_INNER)
 }
 
 /// Total height of the compose box (inner rows + 2 for borders).
-fn orc_compose_box_height(buffer: &str) -> u16 {
-    (orc_compose_inner_rows(buffer) + 2) as u16
+fn compose_box_height(buffer: &str) -> u16 {
+    (compose_inner_rows(buffer) + 2) as u16
 }
 
 /// Render the orc tab as a chat-first surface: transcript (or welcome
@@ -183,7 +211,7 @@ fn orc_compose_box_height(buffer: &str) -> u16 {
 fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
     use crate::app::LogEntry;
 
-    let compose_h = orc_compose_box_height(&app.orc_compose);
+    let compose_h = compose_box_height(&app.orc_view.compose.buffer);
     let (transcript_area, compose_area) = if area.height > compose_h + 2 {
         let split = Layout::vertical([
             Constraint::Min(1),
@@ -215,23 +243,37 @@ fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     if compose_area.height > 0 {
-        render_orc_compose(frame, compose_area, app);
+        render_compose(
+            frame,
+            compose_area,
+            &app.orc_view.compose,
+            "talk to orc",
+            app.orc_view.is_thinking,
+            app.tick,
+        );
     }
 }
 
-/// Persistent inline "talk to orc" input bar. Edits the live
-/// `app.orc_compose` buffer directly — pressing Enter sends, Esc
-/// clears, Backspace deletes. No modal involved on the orc tab.
-fn render_orc_compose(frame: &mut Frame, area: Rect, app: &App) {
+/// Persistent inline input bar for talking to an agent. Used by both
+/// the orc tab (with `OrcView::compose`) and worker tabs (with
+/// `SessionView::compose`). The title prefix labels who you're talking
+/// to; `thinking` toggles the "◐ thinking" badge.
+fn render_compose(
+    frame: &mut Frame,
+    area: Rect,
+    cs: &crate::app::ComposeState,
+    title_prefix: &str,
+    thinking: bool,
+    tick: u64,
+) {
     use ratatui::widgets::{Block, Borders};
-    let thinking = app.orc_view.is_thinking;
-    let nav = app.orc_nav_mode;
+    let nav = cs.nav_mode;
     let title = if nav {
         " navigation mode — Esc to resume typing ".to_string()
     } else if thinking {
-        " talk to orc · ◐ thinking ".to_string()
+        format!(" {title_prefix} · ◐ thinking ")
     } else {
-        " talk to orc ".to_string()
+        format!(" {title_prefix} ")
     };
     let title_style = if nav {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -255,15 +297,15 @@ fn render_orc_compose(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let buffer = &app.orc_compose;
-    let attach_n = app.orc_compose_attachments.len();
+    let buffer = &cs.buffer;
+    let attach_n = cs.attachments.len();
     let is_empty = buffer.is_empty() && attach_n == 0;
 
     if is_empty {
         let placeholder = if nav {
             "(typing disabled · Esc to resume)"
         } else {
-            "type to talk to orc · ⏎ send · Esc for shortcuts"
+            "type to talk · ⏎ send · Esc for shortcuts"
         };
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::raw(" "));
@@ -282,7 +324,7 @@ fn render_orc_compose(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     // Resolve cursor → (logical_row, col_chars).
-    let cursor_byte = app.orc_compose_cursor.min(buffer.len());
+    let cursor_byte = cs.cursor.min(buffer.len());
     let cursor_row = buffer[..cursor_byte].matches('\n').count();
     let line_start = buffer[..cursor_byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let cursor_col = buffer[line_start..cursor_byte].chars().count();
@@ -302,7 +344,7 @@ fn render_orc_compose(frame: &mut Frame, area: Rect, app: &App) {
     }
     let visible = &all_lines[start..start + visible_n];
 
-    let cursor_glyph = if (app.tick / 60) % 2 == 0 { "▏" } else { " " };
+    let cursor_glyph = if (tick / 60) % 2 == 0 { "▏" } else { " " };
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible.len());
     for (i, line_text) in visible.iter().enumerate() {
@@ -353,7 +395,7 @@ fn render_orc_compose(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw(before));
 
         let cursor_char = line_chars.get(cursor_col).copied().unwrap_or(' ');
-        let blink_on = (app.tick / 60) % 2 == 0;
+        let blink_on = (tick / 60) % 2 == 0;
         let _ = cursor_glyph; // legacy thin glyph; kept for future fallback
         let cursor_style = if blink_on {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -608,10 +650,11 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Insert mode on the orc tab swallows letter hotkeys, so the long
-    // action bar would be misleading. Show a single hint pointing to
-    // Esc; the full bar reappears the moment we enter nav mode.
-    if matches!(app.focused_tab, TabId::Orc) && !app.orc_nav_mode {
+    // Insert mode swallows letter hotkeys, so the long action bar would
+    // be misleading. Show a single hint pointing to Esc; the full bar
+    // reappears the moment we enter nav mode.
+    let in_insert = app.focused_compose().map(|c| !c.nav_mode).unwrap_or(false);
+    if in_insert {
         let bar = Paragraph::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(

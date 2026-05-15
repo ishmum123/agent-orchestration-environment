@@ -147,6 +147,25 @@ pub struct PermissionEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Inline compose state — shared by both orc tab and worker tabs.
+// ---------------------------------------------------------------------------
+
+/// Modal-editor state for a chat-first input box. Held per-tab so each
+/// agent keeps its own half-typed draft across tab switches.
+#[derive(Debug, Clone, Default)]
+pub struct ComposeState {
+    pub buffer: String,
+    /// Byte index into `buffer`. Must always land on a char boundary;
+    /// helpers in main.rs enforce that.
+    pub cursor: usize,
+    pub attachments: AttachmentSet,
+    /// `false` = insert mode (printable keys feed the buffer).
+    /// `true`  = nav mode (legacy single-letter hotkeys take over).
+    /// Esc toggles between the two; the buffer is preserved.
+    pub nav_mode: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Session view — UI projection of authoritative state
 // ---------------------------------------------------------------------------
 
@@ -171,6 +190,8 @@ pub struct SessionView {
     /// Latest assistant turn's full context-window occupancy in tokens
     /// (input + cache_read + cache_creation). None until first turn.
     pub last_context_tokens: Option<u64>,
+    /// Inline compose buffer for this worker tab.
+    pub compose: ComposeState,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +215,8 @@ pub struct OrcView {
     pub is_thinking: bool,
     /// See `SessionView::last_context_tokens`.
     pub last_context_tokens: Option<u64>,
+    /// Inline compose buffer for the orc tab.
+    pub compose: ComposeState,
 }
 
 impl OrcView {
@@ -207,6 +230,7 @@ impl OrcView {
             stick_to_bottom: true,
             is_thinking: false,
             last_context_tokens: None,
+            compose: ComposeState::default(),
         }
     }
 
@@ -231,11 +255,6 @@ impl Default for OrcView {
 
 #[derive(Debug, Clone)]
 pub enum Modal {
-    NewTask {
-        target: TabId,
-        buffer: String,
-        attachments: AttachmentSet,
-    },
     AskUser {
         session_id: String,
         question_id: String,
@@ -327,20 +346,6 @@ pub struct App {
     /// worker outside the normal orchestrator path and needs to land
     /// the user on the new tab).
     pub pending_focus_session_id: Option<String>,
-
-    /// Inline compose buffer for the orc tab. Edited directly via the
-    /// chat-first input bar — no modal involved on this tab.
-    pub orc_compose: String,
-    /// Cursor position as a byte index into `orc_compose`. Always lands
-    /// on a char boundary; helpers in main.rs enforce that.
-    pub orc_compose_cursor: usize,
-    pub orc_compose_attachments: crate::input_attachments::AttachmentSet,
-
-    /// Modal editor flag for the orc tab. `false` = insert mode (default;
-    /// printable keys feed the compose buffer). `true` = nav mode
-    /// (single-letter hotkeys behave like the legacy keymap). Esc
-    /// toggles between the two; the buffer is preserved across switches.
-    pub orc_nav_mode: bool,
 }
 
 impl App {
@@ -364,10 +369,22 @@ impl App {
             pending_cleanup: Vec::new(),
             backchannel: None,
             pending_focus_session_id: None,
-            orc_compose: String::new(),
-            orc_compose_cursor: 0,
-            orc_compose_attachments: crate::input_attachments::AttachmentSet::new(),
-            orc_nav_mode: false,
+        }
+    }
+
+    /// Mutable accessor for the compose state of the focused tab.
+    pub fn focused_compose_mut(&mut self) -> Option<&mut ComposeState> {
+        match self.focused_tab {
+            TabId::Orc => Some(&mut self.orc_view.compose),
+            TabId::Worker(idx) => self.sessions.get_mut(idx).map(|sv| &mut sv.compose),
+        }
+    }
+
+    /// Read-only accessor for the compose state of the focused tab.
+    pub fn focused_compose(&self) -> Option<&ComposeState> {
+        match self.focused_tab {
+            TabId::Orc => Some(&self.orc_view.compose),
+            TabId::Worker(idx) => self.sessions.get(idx).map(|sv| &sv.compose),
         }
     }
 
@@ -501,6 +518,7 @@ impl App {
             stick_to_bottom: true,
             is_thinking: false,
             last_context_tokens: None,
+            compose: ComposeState::default(),
         });
     }
 

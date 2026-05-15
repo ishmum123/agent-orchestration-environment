@@ -2,15 +2,6 @@
 
 Agent Orchestration Environment (AOE). A TUI that runs multiple Claude Code sessions as agents, with one orchestrator coordinating them.
 
-## Demo
-
-End-to-end run of the FLOW integration test (`cargo test --test flow_e2e`)
-driving orc through spawn → clarify → explore → edit → verify → review →
-rework → approve → mark_done → kill, all via the deterministic `fake_claude`
-shim and a local bare-remote git push:
-
-![orc end-to-end flow](flow-e2e-greenfield.gif)
-
 ## Why
 
 My workflow has shifted to running Claude Code in the terminal and using the IDE as a diff viewer. Running two or three Claude sessions in parallel for multi-tasking made one thing obvious: the bottleneck moves from writing code to jumping between tabs answering trivial questions — which library, which file, which name.

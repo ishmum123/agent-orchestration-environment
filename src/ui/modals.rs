@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{Modal, TabId};
+use crate::app::Modal;
 use crate::input_attachments::AttachmentSet;
 
 // Max chips rendered inline; overflow becomes "+N more".
@@ -51,9 +51,6 @@ fn truncate_name(s: &str, max: usize) -> String {
 
 pub fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
     match modal {
-        Modal::NewTask { target, buffer, attachments } => {
-            render_new_task(frame, area, *target, buffer, attachments)
-        }
         Modal::AskUser {
             session_id,
             question_id: _,
@@ -190,46 +187,6 @@ fn render_input_box_with_placeholder(
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
-}
-
-// ---------------------------------------------------------------------------
-// New task modal
-// ---------------------------------------------------------------------------
-
-fn render_new_task(
-    frame: &mut Frame,
-    area: Rect,
-    target: TabId,
-    buffer: &str,
-    attachments: &AttachmentSet,
-) {
-    let rect = centered_rect(60, 40, area);
-    frame.render_widget(Clear, rect);
-
-    let title = match target {
-        TabId::Orc => "speak to orc".to_string(),
-        TabId::Worker(idx) => format!("speak to worker #{}", idx + 1),
-    };
-    let block = modal_block(&title);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let (body, hint_area) = split_body_hint(inner);
-
-    let placeholder = match target {
-        TabId::Orc => "describe a task — orc will plan and delegate",
-        TabId::Worker(_) => "send a message to this worker",
-    };
-
-    render_input_with_chips(frame, body, buffer, placeholder, attachments);
-
-    let hints = hint_line(&[
-        ("enter", "send"),
-        ("shift+enter", "nl"),
-        ("ctrl+v", "img"),
-        ("esc", "cancel"),
-    ]);
-    frame.render_widget(Paragraph::new(hints), hint_area);
 }
 
 /// Split `area` into an optional chip row (1 line, shown only when
@@ -646,22 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn new_task_modal_renders() {
-        let modal = Modal::NewTask {
-            target: TabId::Orc,
-            buffer: "add OAuth".into(),
-            attachments: AttachmentSet::new(),
-        };
-        let output = render_to_string(&modal);
-        assert!(output.contains("speak to orc"));
-        // With non-empty buffer the placeholder is hidden; buffer text shows.
-        assert!(output.contains("add OAuth"));
-        assert!(output.contains("enter"));
-        assert!(output.contains("send"));
-        assert!(output.contains("cancel"));
-    }
-
-    #[test]
     fn ask_user_modal_renders() {
         let modal = Modal::AskUser {
             session_id: "explore-agents".into(),
@@ -730,7 +671,6 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let small = Rect::new(0, 0, 10, 5);
         for modal in &[
-            Modal::NewTask { target: TabId::Orc, buffer: "x".into(), attachments: AttachmentSet::new() },
             Modal::ConfirmQuit,
             Modal::Help,
         ] {
