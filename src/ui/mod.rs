@@ -119,7 +119,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         modals::render_modal(frame, area, modal);
     }
 
-    if let Some(bc) = app.backchannel.as_ref() {
+    if let Some(bc) = app.backchannel.as_mut() {
         if bc.open {
             backchannel::render_overlay(frame, area, bc, app.tick);
         }
@@ -259,7 +259,7 @@ fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
 /// the orc tab (with `OrcView::compose`) and worker tabs (with
 /// `SessionView::compose`). The title prefix labels who you're talking
 /// to; `thinking` toggles the "◐ thinking" badge.
-fn render_compose(
+pub(crate) fn render_compose(
     frame: &mut Frame,
     area: Rect,
     cs: &crate::app::ComposeState,

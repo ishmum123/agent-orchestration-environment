@@ -452,27 +452,21 @@ fn render_entry(out: &mut Vec<Line<'static>>, entry: &LogEntry, speaker: &str, w
     match entry {
         LogEntry::UserText(t) => {
             let t = sanitize(t);
-            push_prefixed_lines(
-                out,
-                "you   ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                &t,
-                Style::default(),
-            );
+            let prefix = "you   ".to_string();
+            let prefix_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            let (md_lines, is_table) = render_markdown(&t, width);
+            emit_assistant_lines(out, md_lines, is_table, &prefix, prefix_style);
         }
         LogEntry::OrcInstruction(t) => {
             let t = sanitize(t);
-            push_prefixed_lines(
-                out,
-                "orc → ",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-                &t,
-                Style::default(),
-            );
+            let prefix = "orc → ".to_string();
+            let prefix_style = Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD);
+            let (md_lines, is_table) = render_markdown(&t, width);
+            emit_assistant_lines(out, md_lines, is_table, &prefix, prefix_style);
         }
         LogEntry::AssistantText(t) => {
             let t = sanitize(t);
@@ -937,7 +931,6 @@ fn render_markdown(text: &str, table_width: usize) -> (Vec<Line<'static>>, Vec<b
     let mut in_code_block = false;
     let mut list_depth: usize = 0;
     let mut list_index_stack: Vec<Option<u64>> = Vec::new();
-    let mut item_pending_marker = false;
     let mut block_just_ended = false;
     // Table mode: while inside a Table, divert text events into the
     // current cell instead of `current`. On TagEnd::Table we flush.
@@ -1115,7 +1108,17 @@ fn render_markdown(text: &str, table_width: usize) -> (Vec<Line<'static>>, Vec<b
                     if !current.is_empty() {
                         flush(&mut current, &mut lines, &mut is_table);
                     }
-                    item_pending_marker = true;
+                    let indent = "  ".repeat(list_depth.saturating_sub(1));
+                    let last_idx = list_index_stack.len().saturating_sub(1);
+                    let marker = match list_index_stack.get_mut(last_idx) {
+                        Some(Some(n)) => {
+                            let m = format!("{n}. ");
+                            *n += 1;
+                            m
+                        }
+                        _ => "• ".to_string(),
+                    };
+                    current.push(Span::raw(format!("{indent}{marker}")));
                 }
                 Tag::Emphasis => {
                     let s = style(&style_stack).add_modifier(Modifier::ITALIC);
@@ -1183,20 +1186,6 @@ fn render_markdown(text: &str, table_width: usize) -> (Vec<Line<'static>>, Vec<b
                 }
             },
             Event::Text(t) => {
-                if item_pending_marker {
-                    let indent = "  ".repeat(list_depth.saturating_sub(1));
-                    let last_idx = list_index_stack.len().saturating_sub(1);
-                    let marker = match list_index_stack.get_mut(last_idx) {
-                        Some(Some(n)) => {
-                            let m = format!("{n}. ");
-                            *n += 1;
-                            m
-                        }
-                        _ => "• ".to_string(),
-                    };
-                    current.push(Span::raw(format!("{indent}{marker}")));
-                    item_pending_marker = false;
-                }
                 if in_code_block {
                     let body = t.into_string();
                     for (i, ln) in body.split('\n').enumerate() {
@@ -1381,8 +1370,8 @@ fn format_events_title(
 /// Build the spinner line shown at the tail while an agent is in a
 /// thinking phase. Animated via `tick` so each frame shows a new glyph.
 fn thinking_line(tick: u64) -> Line<'static> {
-    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let g = FRAMES[(tick / 4) as usize % FRAMES.len()];
+    const FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+    let g = FRAMES[(tick / 5) as usize % FRAMES.len()];
     Line::from(vec![
         Span::styled(
             format!("{g} "),

@@ -17,19 +17,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::input_attachments::{Attachment, AttachmentSet};
+use crate::app::{ComposeState, LogEntry};
+use crate::input_attachments::Attachment;
 use crate::worker::claude_bin;
-
-/// One entry in the backchannel transcript.
-#[derive(Debug, Clone)]
-pub enum BackchannelEntry {
-    User(String),
-    Assistant(String),
-    /// Tool calls are flattened to `[tool: name]` — sonnet rarely calls
-    /// tools when asked questions, but we collapse rather than render.
-    Tool(String),
-    System(String),
-}
 
 /// Events emitted from the reader task back to the main event loop.
 #[derive(Debug, Clone)]
@@ -160,10 +150,10 @@ fn fallback_slug() -> String {
 /// Survives overlay close (Esc); only torn down on orc quit, Ctrl-X,
 /// Ctrl-B promotion, Ctrl-N promotion, or when the child exits.
 pub struct Backchannel {
-    /// Visible chat log.
-    pub history: Vec<BackchannelEntry>,
-    /// Multi-line composing buffer.
-    pub input: String,
+    /// Visible chat log — same shape as worker/orc tabs.
+    pub history: Vec<LogEntry>,
+    /// Inline compose buffer (text + cursor + staged image attachments).
+    pub compose: ComposeState,
     /// Scroll offset from top of history (wrapped lines, like worker tabs).
     pub scroll: usize,
     /// Tail-follow the latest entry.
@@ -181,9 +171,6 @@ pub struct Backchannel {
     pub pending_model: Option<String>,
     /// Accumulator for the summary turn's text blocks.
     pub pending_buffer: String,
-    /// Pending image attachments staged via Ctrl+V or bracketed paste.
-    /// Drained into the next outgoing user message.
-    pub attachments: AttachmentSet,
 
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -267,7 +254,7 @@ impl Backchannel {
 
         let mut bc = Self {
             history: Vec::new(),
-            input: String::new(),
+            compose: ComposeState::default(),
             scroll: 0,
             stick_to_bottom: true,
             thinking: false,
@@ -276,7 +263,6 @@ impl Backchannel {
             pending: None,
             pending_model: None,
             pending_buffer: String::new(),
-            attachments: AttachmentSet::new(),
             child: child_arc,
             stdin: stdin_arc,
         };
@@ -285,7 +271,7 @@ impl Backchannel {
             // Hand the prior summary to the new child as a user message
             // so the conversation has continuity. Recorded as a System
             // entry so the user can see what was carried over.
-            bc.history.push(BackchannelEntry::System(format!(
+            bc.history.push(LogEntry::System(format!(
                 "(carried over from previous channel) {seed_text}"
             )));
             bc.send_raw(&seed_text).await.ok();
@@ -344,9 +330,9 @@ impl Backchannel {
     }
 
     /// Send a user message into the child + record it in history.
-    /// Drains the pending `attachments` into the same message.
+    /// Drains the pending `compose.attachments` into the same message.
     pub async fn send(&mut self, message: &str) -> Result<()> {
-        let imgs = self.attachments.take_all();
+        let imgs = self.compose.attachments.take_all();
         self.send_raw_with(message, &imgs).await?;
         let suffix = if imgs.is_empty() {
             String::new()
@@ -358,7 +344,7 @@ impl Backchannel {
             )
         };
         self.history
-            .push(BackchannelEntry::User(format!("{message}{suffix}")));
+            .push(LogEntry::UserText(format!("{message}{suffix}")));
         self.thinking = true;
         self.stick_to_bottom = true;
         Ok(())
@@ -381,13 +367,15 @@ impl Backchannel {
                     }
                     self.pending_buffer.push_str(&text);
                 } else {
-                    self.history.push(BackchannelEntry::Assistant(text));
+                    self.history.push(LogEntry::AssistantText(text));
                 }
             }
             BackchannelEvent::Tool(name) => {
                 if self.pending.is_none() {
-                    self.history
-                        .push(BackchannelEntry::Tool(format!("[tool: {name}]")));
+                    self.history.push(LogEntry::ToolUse {
+                        name,
+                        input_summary: String::new(),
+                    });
                 }
             }
             BackchannelEvent::TurnEnd => {
@@ -403,7 +391,7 @@ impl Backchannel {
                     Some(c) => format!("backchannel exited with code {c}"),
                     None => "backchannel exited".to_string(),
                 };
-                self.history.push(BackchannelEntry::System(msg));
+                self.history.push(LogEntry::System(msg));
                 self.thinking = false;
             }
         }
@@ -465,7 +453,7 @@ mod tests {
         let stdin = tchild.stdin.take().unwrap();
         Backchannel {
             history: Vec::new(),
-            input: String::new(),
+            compose: ComposeState::default(),
             scroll: 0,
             stick_to_bottom: true,
             thinking: false,
@@ -474,7 +462,6 @@ mod tests {
             pending: None,
             pending_model: None,
             pending_buffer: String::new(),
-            attachments: AttachmentSet::new(),
             child: Arc::new(Mutex::new(tchild)),
             stdin: Arc::new(Mutex::new(stdin)),
         }
@@ -487,7 +474,7 @@ mod tests {
         let completed = bc.apply_event(BackchannelEvent::Assistant("hi".into()));
         assert!(completed.is_none());
         assert_eq!(bc.history.len(), 1);
-        assert!(matches!(&bc.history[0], BackchannelEntry::Assistant(s) if s == "hi"));
+        assert!(matches!(&bc.history[0], LogEntry::AssistantText(s) if s == "hi"));
     }
 
     #[tokio::test]
@@ -520,8 +507,8 @@ mod tests {
     async fn close_preserves_history() {
         // Simulates open → close → reopen with prior conversation intact.
         let mut bc = fake_bc();
-        bc.history.push(BackchannelEntry::User("hello".into()));
-        bc.history.push(BackchannelEntry::Assistant("hi".into()));
+        bc.history.push(LogEntry::UserText("hello".into()));
+        bc.history.push(LogEntry::AssistantText("hi".into()));
         bc.open = false;
         assert_eq!(bc.history.len(), 2);
         bc.open = true;

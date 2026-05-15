@@ -380,7 +380,7 @@ async fn run_event_loop(
                         if let Some(bc) = app.backchannel.as_mut() {
                             if let Err(e) = bc.send(&msg).await {
                                 bc.history.push(
-                                    backchannel::BackchannelEntry::System(format!(
+                                    crate::app::LogEntry::System(format!(
                                         "send failed: {e}"
                                     )),
                                 );
@@ -425,7 +425,7 @@ async fn run_event_loop(
                                 .request_summary(backchannel::PendingPromotion::Model)
                                 .await
                             {
-                                bc.history.push(backchannel::BackchannelEntry::System(
+                                bc.history.push(crate::app::LogEntry::System(
                                     format!("summary request failed: {e}"),
                                 ));
                                 bc.pending = None;
@@ -445,7 +445,7 @@ async fn run_event_loop(
                             .unwrap_or(true);
                         if history_empty {
                             if let Some(bc) = app.backchannel.as_mut() {
-                                bc.history.push(backchannel::BackchannelEntry::System(
+                                bc.history.push(crate::app::LogEntry::System(
                                     "nothing to attach — say something first.".to_string(),
                                 ));
                             }
@@ -455,7 +455,7 @@ async fn run_event_loop(
                             // processes stdin messages serially. This is
                             // the cleanest "wait for in-flight" handling.
                             if let Err(e) = bc.request_attach_summary().await {
-                                bc.history.push(backchannel::BackchannelEntry::System(
+                                bc.history.push(crate::app::LogEntry::System(
                                     format!("summary request failed: {e}"),
                                 ));
                                 bc.pending = None;
@@ -604,7 +604,7 @@ async fn run_event_loop(
                                         // when TurnEnd fired.
                                         if let Some(bc) = app.backchannel.as_mut() {
                                             bc.history.push(
-                                                backchannel::BackchannelEntry::System(
+                                                crate::app::LogEntry::System(
                                                     format!(
                                                         "attach failed (worker spawn): {e}"
                                                     ),
@@ -1050,10 +1050,10 @@ fn handle_paste(text: &str, app: &mut App) {
         if let Some(bc) = app.backchannel.as_mut() {
             if bc.open {
                 for a in attachments {
-                    bc.attachments.push(a);
+                    bc.compose.attachments.push(a);
                 }
                 if !has_image_attachments {
-                    bc.input.push_str(text);
+                    compose_insert_str(&mut bc.compose, text);
                 }
                 return;
             }
@@ -1916,12 +1916,12 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyCode::Char('v') => {
                 if let Some(bc) = app.backchannel.as_mut() {
                     match input_attachments::try_from_clipboard() {
-                        Some(Ok(a)) => bc.attachments.push(a),
+                        Some(Ok(a)) => bc.compose.attachments.push(a),
                         Some(Err(_)) => {}
                         None => {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 if let Ok(text) = cb.get_text() {
-                                    bc.input.push_str(&text);
+                                    compose_insert_str(&mut bc.compose, &text);
                                 }
                             }
                         }
@@ -1944,7 +1944,7 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
         }
         KeyCode::Char('?')
             if !key.modifiers.contains(KeyModifiers::SHIFT)
-                && bc.input.is_empty() =>
+                && bc.compose.buffer.is_empty() =>
         {
             // Allow `?` to toggle the overlay closed when the input is
             // empty. If the user is mid-compose with text in the buffer,
@@ -1952,24 +1952,30 @@ async fn handle_backchannel_key(key: KeyEvent, app: &mut App) -> KeyAction {
             bc.open = false;
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            bc.input.push('\n');
+            compose_insert_char(&mut bc.compose, '\n');
         }
         KeyCode::Enter => {
-            if !bc.input.trim().is_empty() || !bc.attachments.is_empty() {
-                let msg = std::mem::take(&mut bc.input);
+            if !bc.compose.buffer.trim().is_empty() || !bc.compose.attachments.is_empty() {
+                let msg = std::mem::take(&mut bc.compose.buffer);
+                bc.compose.cursor = 0;
                 return KeyAction::SendBackchannel(msg);
             }
         }
         KeyCode::Backspace => {
             // Backspace on empty input deletes the rightmost chip.
-            if bc.input.is_empty() && !bc.attachments.is_empty() {
-                bc.attachments.pop();
+            if bc.compose.buffer.is_empty() && !bc.compose.attachments.is_empty() {
+                bc.compose.attachments.pop();
             } else {
-                bc.input.pop();
+                compose_delete_before(&mut bc.compose);
             }
         }
+        KeyCode::Left => compose_move_left(&mut bc.compose),
+        KeyCode::Right => compose_move_right(&mut bc.compose),
+        KeyCode::Home => compose_move_line_start(&mut bc.compose),
+        KeyCode::End => compose_move_line_end(&mut bc.compose),
+        KeyCode::Delete => compose_delete_after(&mut bc.compose),
         KeyCode::Char(c) => {
-            bc.input.push(c);
+            compose_insert_char(&mut bc.compose, c);
         }
         KeyCode::Up | KeyCode::PageUp => {
             let amt = if matches!(key.code, KeyCode::PageUp) { 10 } else { 1 };
