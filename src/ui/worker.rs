@@ -50,6 +50,7 @@ pub fn render_worker(
         scroll,
         session_view.is_thinking,
         tick,
+        &session_view.session.name,
     );
     if decisions_height > 0 {
         render_decisions(frame, chunks[2], session_view);
@@ -213,172 +214,134 @@ fn sanitize(s: &str) -> String {
     out
 }
 
-/// Convert a structured log into renderable lines. Used by both the orc tab
-/// and worker tabs — same model for both.
-pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(log.len());
-    // Insert a blank visual gap before "primary" entries (user, orc,
-    // assistant). Without spacing, consecutive turns run flush and
-    // the eye can't find paragraph boundaries.
-    let push_gap = |out: &mut Vec<Line<'static>>| {
-        if !out.is_empty()
-            && !out
-                .last()
-                .map(|l| l.spans.is_empty())
-                .unwrap_or(true)
-        {
-            out.push(Line::from(""));
+/// Tool-call counts accumulated while walking a contiguous run of
+/// collapsible tool entries.
+#[derive(Default, Clone, Copy)]
+struct ToolCounts {
+    reads: u32,
+    greps: u32,
+    lists: u32,
+    globs: u32,
+    edits: u32,
+    writes: u32,
+    other: u32,
+}
+
+impl ToolCounts {
+    fn is_empty(&self) -> bool {
+        self.reads + self.greps + self.lists + self.globs + self.edits + self.writes + self.other
+            == 0
+    }
+    fn add(&mut self, bare: &str) {
+        match bare {
+            "Read" => self.reads += 1,
+            "Grep" => self.greps += 1,
+            "LS" | "List" => self.lists += 1,
+            "Glob" => self.globs += 1,
+            "Edit" | "MultiEdit" => self.edits += 1,
+            "Write" => self.writes += 1,
+            _ => self.other += 1,
+        }
+    }
+    fn sub(&mut self, bare: &str) {
+        match bare {
+            "Read" => self.reads = self.reads.saturating_sub(1),
+            "Grep" => self.greps = self.greps.saturating_sub(1),
+            "LS" | "List" => self.lists = self.lists.saturating_sub(1),
+            "Glob" => self.globs = self.globs.saturating_sub(1),
+            "Edit" | "MultiEdit" => self.edits = self.edits.saturating_sub(1),
+            "Write" => self.writes = self.writes.saturating_sub(1),
+            _ => self.other = self.other.saturating_sub(1),
+        }
+    }
+    fn parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut push = |n: u32, sing: &str, plur: &str| {
+            if n > 0 {
+                parts.push(format!("{} {}", n, if n == 1 { sing } else { plur }));
+            }
+        };
+        push(self.reads, "read", "reads");
+        push(self.greps, "grep", "greps");
+        push(self.lists, "list", "lists");
+        push(self.globs, "glob", "globs");
+        push(self.edits, "edit", "edits");
+        push(self.writes, "write", "writes");
+        push(self.other, "action", "actions");
+        parts
+    }
+}
+
+fn bare_tool_name(name: &str) -> &str {
+    name.strip_prefix("mcp__orc__").unwrap_or(name)
+}
+
+/// Render unit produced by collapsing the raw event log. Collapsible
+/// tool calls fold into `Batch`; Bash, errors, and everything else flow
+/// through as `Direct`. `ErrorPair` lifts an errored tool's preceding
+/// `ToolUse` out of its batch so the error line has context.
+enum Unit<'a> {
+    Direct(&'a LogEntry),
+    Batch(ToolCounts),
+    ErrorPair {
+        use_entry: Option<&'a LogEntry>,
+        result_entry: &'a LogEntry,
+    },
+}
+
+/// Collapse successive non-Bash, non-error tool entries into a single
+/// summary `Batch`. Bash calls + their results, errored results, and any
+/// non-tool entries render as today.
+fn collapse_tool_groups(log: &[LogEntry]) -> Vec<Unit<'_>> {
+    let mut out: Vec<Unit> = Vec::with_capacity(log.len());
+    let mut counts = ToolCounts::default();
+    // The most recent collapsed ToolUse (so we can lift it on error) and
+    // its bare name (so we can decrement counts on lift).
+    let mut last_collapsed: Option<(&LogEntry, String)> = None;
+    let mut last_was_bash_use = false;
+
+    let flush = |counts: &mut ToolCounts, out: &mut Vec<Unit>| {
+        if !counts.is_empty() {
+            out.push(Unit::Batch(*counts));
+            *counts = ToolCounts::default();
         }
     };
+
     for entry in log {
-        // Add a leading gap before turn-like entries so distinct
-        // utterances are visually separated.
         match entry {
-            LogEntry::UserText(_)
-            | LogEntry::OrcInstruction(_)
-            | LogEntry::AssistantText(_) => push_gap(&mut out),
-            _ => {}
-        }
-        match entry {
-            LogEntry::UserText(t) => {
-                let t = sanitize(t);
-                push_prefixed_lines(
-                    &mut out,
-                    "you   ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                    &t,
-                    Style::default(),
-                );
-            }
-            LogEntry::OrcInstruction(t) => {
-                let t = sanitize(t);
-                push_prefixed_lines(
-                    &mut out,
-                    "orc → ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                    &t,
-                    Style::default(),
-                );
-            }
-            LogEntry::AssistantText(t) => {
-                let t = sanitize(t);
-                for line in render_markdown(&t) {
-                    out.push(line);
+            LogEntry::ToolUse { name, .. } => {
+                let bare = bare_tool_name(name);
+                if bare == "Bash" {
+                    flush(&mut counts, &mut out);
+                    last_collapsed = None;
+                    last_was_bash_use = true;
+                    out.push(Unit::Direct(entry));
+                } else {
+                    counts.add(bare);
+                    last_collapsed = Some((entry, bare.to_string()));
+                    last_was_bash_use = false;
                 }
             }
-            LogEntry::Thinking(t) => {
-                let t = sanitize(t);
-                let trimmed = t.trim();
-                if trimmed.is_empty() {
-                    continue;
+            LogEntry::ToolResult { is_error: true, .. } => {
+                let lifted = last_collapsed.take();
+                if let Some((_, ref bare)) = lifted {
+                    counts.sub(bare);
                 }
-                let lines: Vec<&str> = trimmed.split('\n').collect();
-                let cap = 3usize;
-                let n = lines.len();
-                for (i, ln) in lines.iter().enumerate().take(cap) {
-                    let body = if i == 0 {
-                        format!("(thinking) {ln}")
-                    } else {
-                        format!("           {ln}")
-                    };
-                    out.push(Line::from(Span::styled(
-                        body,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                }
-                if n > cap {
-                    out.push(Line::from(Span::styled(
-                        format!("           … ({} more lines)", n - cap),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                }
+                flush(&mut counts, &mut out);
+                out.push(Unit::ErrorPair {
+                    use_entry: lifted.map(|(e, _)| e),
+                    result_entry: entry,
+                });
+                last_was_bash_use = false;
             }
-            LogEntry::ToolUse {
-                name,
-                input_summary,
-            } => out.push(Line::from(vec![
-                Span::styled("→ ", Style::default().fg(Color::Yellow)),
-                Span::raw(format!("{}{}", sanitize(name), sanitize(input_summary))),
-            ])),
-            LogEntry::ToolResult { text, is_error } => {
-                let color = if *is_error { Color::Red } else { Color::Green };
-                let text = sanitize(text);
-                let lines: Vec<&str> = text.split('\n').collect();
-                let cap = 5usize;
-                let body_style = Style::default();
-                let arrow_style = Style::default().fg(color);
-                let n = lines.len();
-                for (i, ln) in lines.iter().enumerate().take(cap) {
-                    // Per-line char cap to avoid extreme widths.
-                    let trimmed: String = ln.chars().take(200).collect();
-                    let trimmed = if ln.chars().count() > 200 {
-                        format!("{trimmed}…")
-                    } else {
-                        trimmed
-                    };
-                    let prefix = if i == 0 { "← " } else { "  " };
-                    out.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), arrow_style),
-                        Span::styled(trimmed, body_style),
-                    ]));
+            LogEntry::ToolResult { is_error: false, .. } => {
+                if last_was_bash_use {
+                    out.push(Unit::Direct(entry));
+                    last_was_bash_use = false;
                 }
-                if n > cap {
-                    out.push(Line::from(Span::styled(
-                        format!("  … ({} more lines)", n - cap),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-            LogEntry::System(s) => {
-                // Render as a dim prose line with a leading `· ` so the
-                // event reads like a natural sentence — no bracketed
-                // wrap that makes it look like a log marker.
-                let s = sanitize(s);
-                for (i, ln) in s.split('\n').enumerate() {
-                    let prefix = if i == 0 { "· " } else { "  " };
-                    out.push(Line::from(Span::styled(
-                        format!("{prefix}{ln}"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-            LogEntry::Notify(s) => {
-                // Bright call-to-action prose. Leading filled bullet +
-                // brighter colour so the eye finds it among dim system
-                // lines. No brackets — reads as a sentence.
-                let s = sanitize(s);
-                for (i, ln) in s.split('\n').enumerate() {
-                    let mut spans: Vec<Span<'static>> = Vec::new();
-                    if i == 0 {
-                        spans.push(Span::styled(
-                            "● ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                    } else {
-                        spans.push(Span::raw("  "));
-                    }
-                    spans.push(Span::styled(
-                        ln.to_string(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    out.push(Line::from(spans));
-                }
-            }
-            LogEntry::TurnEnd { cost_usd: _ } => {
-                // No textual divider — just a blank line for breathing room.
-                out.push(Line::from(""));
+                // Otherwise: success result for a collapsed tool — counted
+                // in its ToolUse, drop the body.
+                last_collapsed = None;
             }
             LogEntry::Exploration {
                 reads,
@@ -386,33 +349,293 @@ pub fn log_lines(log: &[LogEntry]) -> Vec<Line<'static>> {
                 lists,
                 globs,
             } => {
-                let mut parts: Vec<String> = Vec::new();
-                let push = |n: u32, label: &str, parts: &mut Vec<String>| {
-                    if n > 0 {
-                        parts.push(format!(
-                            "{} {}",
-                            n,
-                            if n == 1 { label.trim_end_matches('s') } else { label }
-                        ));
-                    }
-                };
-                push(*reads, "reads", &mut parts);
-                push(*greps, "greps", &mut parts);
-                push(*lists, "lists", &mut parts);
-                push(*globs, "globs", &mut parts);
-                if parts.is_empty() {
-                    continue;
+                counts.reads += reads;
+                counts.greps += greps;
+                counts.lists += lists;
+                counts.globs += globs;
+                last_collapsed = None;
+                last_was_bash_use = false;
+            }
+            _ => {
+                flush(&mut counts, &mut out);
+                last_collapsed = None;
+                last_was_bash_use = false;
+                out.push(Unit::Direct(entry));
+            }
+        }
+    }
+    flush(&mut counts, &mut out);
+    out
+}
+
+/// Convert a structured log into renderable lines. Used by both the orc tab
+/// and worker tabs — same model for both. `speaker` is the name shown as
+/// the prefix on `AssistantText` lines (worker name on a worker tab,
+/// `"orc"` on the orc tab).
+pub fn log_lines(log: &[LogEntry], speaker: &str) -> Vec<Line<'static>> {
+    let units = collapse_tool_groups(log);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(units.len());
+
+    let push_gap = |out: &mut Vec<Line<'static>>| {
+        if !out.is_empty()
+            && !out
+                .last()
+                .map(|l| l.spans.iter().all(|s| s.content.is_empty()))
+                .unwrap_or(true)
+        {
+            out.push(Line::from(""));
+        }
+    };
+
+    // Group identifier for gap-on-transition logic. Higher = "more
+    // disruptive" but only equality matters.
+    fn unit_group(u: &Unit) -> u8 {
+        match u {
+            Unit::Direct(e) => match e {
+                LogEntry::UserText(_) | LogEntry::OrcInstruction(_) | LogEntry::AssistantText(_) => 1,
+                LogEntry::ToolUse { .. } | LogEntry::ToolResult { .. } | LogEntry::Exploration { .. } => 2,
+                LogEntry::Thinking(_) => 3,
+                LogEntry::System(_) => 4,
+                LogEntry::Notify(_) => 5,
+                LogEntry::TurnEnd { .. } => 0,
+            },
+            Unit::Batch(_) | Unit::ErrorPair { .. } => 2,
+        }
+    }
+
+    let mut prev_group: Option<u8> = None;
+    for unit in &units {
+        let g = unit_group(unit);
+        if g != 0 {
+            match prev_group {
+                Some(prev) if prev != g => push_gap(&mut out),
+                Some(_) if g == 1 => push_gap(&mut out),
+                _ => {}
+            }
+        }
+        prev_group = Some(g);
+        match unit {
+            Unit::Batch(c) => render_batch_line(&mut out, c),
+            Unit::ErrorPair {
+                use_entry,
+                result_entry,
+            } => {
+                if let Some(use_e) = use_entry {
+                    render_entry(&mut out, use_e, speaker);
                 }
+                render_entry(&mut out, result_entry, speaker);
+            }
+            Unit::Direct(e) => render_entry(&mut out, e, speaker),
+        }
+    }
+    out
+}
+
+/// Emit one dim summary line for a collapsed tool batch. No leading sigil
+/// — keeps it visually distinct from system (`·`) and notify (`●`).
+fn render_batch_line(out: &mut Vec<Line<'static>>, counts: &ToolCounts) {
+    let parts = counts.parts();
+    if parts.is_empty() {
+        return;
+    }
+    out.push(Line::from(Span::styled(
+        format!("(did: {})", parts.join(", ")),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+}
+
+/// Render a single LogEntry to one-or-more output lines. Extracted so
+/// `ErrorPair` can render its two member entries with the same path.
+fn render_entry(out: &mut Vec<Line<'static>>, entry: &LogEntry, speaker: &str) {
+    match entry {
+        LogEntry::UserText(t) => {
+            let t = sanitize(t);
+            push_prefixed_lines(
+                out,
+                "you   ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                &t,
+                Style::default(),
+            );
+        }
+        LogEntry::OrcInstruction(t) => {
+            let t = sanitize(t);
+            push_prefixed_lines(
+                out,
+                "orc → ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                &t,
+                Style::default(),
+            );
+        }
+        LogEntry::AssistantText(t) => {
+            let t = sanitize(t);
+            let mut md = render_markdown(&t);
+            let prefix = format!("{speaker} ");
+            prepend_speaker(
+                &mut md,
+                &prefix,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            );
+            for line in md {
+                out.push(line);
+            }
+        }
+        LogEntry::Thinking(t) => {
+            let t = sanitize(t);
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let lines: Vec<&str> = trimmed.split('\n').collect();
+            let cap = 3usize;
+            let n = lines.len();
+            for (i, ln) in lines.iter().enumerate().take(cap) {
+                let body = if i == 0 {
+                    format!("(thinking) {ln}")
+                } else {
+                    format!("           {ln}")
+                };
                 out.push(Line::from(Span::styled(
-                    format!("(explored: {})", parts.join(", ")),
+                    body,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
+            if n > cap {
+                out.push(Line::from(Span::styled(
+                    format!("           … ({} more lines)", n - cap),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
                 )));
             }
         }
+        LogEntry::ToolUse {
+            name,
+            input_summary,
+        } => out.push(Line::from(vec![
+            Span::styled("→ ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}{}", sanitize(name), sanitize(input_summary))),
+        ])),
+        LogEntry::ToolResult { text, is_error } => {
+            let color = if *is_error { Color::Red } else { Color::Green };
+            let text = sanitize(text);
+            let lines: Vec<&str> = text.split('\n').collect();
+            let cap = 5usize;
+            let body_style = if *is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            let arrow_style = Style::default().fg(color);
+            let n = lines.len();
+            for (i, ln) in lines.iter().enumerate().take(cap) {
+                let trimmed: String = ln.chars().take(200).collect();
+                let trimmed = if ln.chars().count() > 200 {
+                    format!("{trimmed}…")
+                } else {
+                    trimmed
+                };
+                let prefix = if i == 0 { "← " } else { "  " };
+                out.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), arrow_style),
+                    Span::styled(trimmed, body_style),
+                ]));
+            }
+            if n > cap {
+                out.push(Line::from(Span::styled(
+                    format!("  … ({} more lines)", n - cap),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        LogEntry::System(s) => {
+            let s = sanitize(s);
+            for (i, ln) in s.split('\n').enumerate() {
+                let prefix = if i == 0 { "· " } else { "  " };
+                out.push(Line::from(Span::styled(
+                    format!("{prefix}{ln}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        LogEntry::Notify(s) => {
+            let s = sanitize(s);
+            for (i, ln) in s.split('\n').enumerate() {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                if i == 0 {
+                    spans.push(Span::styled(
+                        "● ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(
+                    ln.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                out.push(Line::from(spans));
+            }
+        }
+        LogEntry::TurnEnd { cost_usd: _ } => {
+            out.push(Line::from(""));
+        }
+        LogEntry::Exploration {
+            reads,
+            greps,
+            lists,
+            globs,
+        } => {
+            // Should not reach here under collapse (Exploration merges
+            // into a Batch), but render defensively if it does.
+            let counts = ToolCounts {
+                reads: *reads,
+                greps: *greps,
+                lists: *lists,
+                globs: *globs,
+                ..Default::default()
+            };
+            render_batch_line(out, &counts);
+        }
     }
-    out
+}
+
+/// Prepend a speaker prefix to the first non-empty line of a markdown
+/// block and indent every other non-empty line by the prefix's width.
+/// Empty paragraph-separator lines are left untouched so blank gaps
+/// stay blank.
+fn prepend_speaker(lines: &mut [Line<'static>], prefix: &str, prefix_style: Style) {
+    let indent = " ".repeat(prefix.chars().count());
+    let mut prefixed = false;
+    for line in lines.iter_mut() {
+        let has_content = line.spans.iter().any(|s| !s.content.is_empty());
+        if !has_content {
+            continue;
+        }
+        let mut spans = std::mem::take(&mut line.spans);
+        if !prefixed {
+            spans.insert(0, Span::styled(prefix.to_string(), prefix_style));
+            prefixed = true;
+        } else {
+            spans.insert(0, Span::raw(indent.clone()));
+        }
+        line.spans = spans;
+    }
 }
 
 /// Push a multi-line text block, prefixing the first line with `prefix`
@@ -716,8 +939,9 @@ pub fn render_event_log(
     scroll: usize,
     thinking: bool,
     tick: u64,
+    speaker: &str,
 ) {
-    let mut lines = log_lines(log);
+    let mut lines = log_lines(log, speaker);
     if thinking {
         lines.push(thinking_line(tick));
     }
@@ -853,8 +1077,8 @@ fn thinking_line(tick: u64) -> Line<'static> {
 
 /// Compute how many wrapped lines `log` produces at the given inner width.
 /// Used by the autoscroll path to pin the view to the bottom.
-pub fn wrapped_line_count(log: &[LogEntry], inner_width: u16) -> usize {
-    let lines = log_lines(log);
+pub fn wrapped_line_count(log: &[LogEntry], inner_width: u16, speaker: &str) -> usize {
+    let lines = log_lines(log, speaker);
     wrap_lines_to_rows(&lines, inner_width as usize).len()
 }
 

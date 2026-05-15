@@ -151,7 +151,7 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
                     0
                 };
                 let effective = inner_h.saturating_sub(compose_h);
-                let wrapped = worker::wrapped_line_count(&app.orc_view.event_log, inner_w);
+                let wrapped = worker::wrapped_line_count(&app.orc_view.event_log, inner_w, "orc");
                 (effective, wrapped)
             }
             TabId::Worker(i) => {
@@ -167,7 +167,7 @@ fn autoscroll(app: &mut App, content_area: Rect, inner_w: u16, inner_h: usize) {
                     0
                 };
                 let effective = inner_h.saturating_sub(task_h + dec_h + compose_h);
-                let wrapped = worker::wrapped_line_count(&sv.event_log, inner_w);
+                let wrapped = worker::wrapped_line_count(&sv.event_log, inner_w, &sv.session.name);
                 (effective, wrapped)
             }
         };
@@ -239,6 +239,7 @@ fn render_orc_tab(frame: &mut Frame, area: Rect, app: &App) {
             scroll,
             app.orc_view.is_thinking,
             app.tick,
+            "orc",
         );
     }
 
