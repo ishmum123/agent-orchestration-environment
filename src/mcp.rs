@@ -21,12 +21,14 @@ use tokio::sync::mpsc;
 /// the effect of these tools elsewhere — modals, panel, state badges).
 pub const ORC_MCP_TOOL_NAMES: &[&str] = &[
     "spawn_session",
+    "respawn_session",
     "instruct_session",
     "kill_session",
     "ask_user",
     "list_sessions",
     "mark_done",
     "submit_for_review",
+    "merge_session",
     "answer_worker",
     "current_summary",
     "update_task_graph",
@@ -235,6 +237,31 @@ impl McpServer {
                 }),
             },
             ToolDef {
+                name: "merge_session".into(),
+                description: "Merge a finished worker's branch into target_branch and optionally push. The user's main worktree must be on target_branch with a clean working tree, otherwise the merge is refused.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Worker session to merge" },
+                        "target_branch": { "type": "string", "description": "Branch to merge into (e.g., \"main\", \"feature-x\")" },
+                        "push": { "type": "boolean", "description": "Push target_branch to origin after merging", "default": false }
+                    },
+                    "required": ["session_id", "target_branch"]
+                }),
+            },
+            ToolDef {
+                name: "respawn_session".into(),
+                description: "Kill a stuck worker and start a fresh worker conversation in the same worktree, with `handoff` delivered as the new worker's first message. Use after a worker has failed multiple review cycles — the fresh context cuts through stuck reasoning while preserving the work-in-progress on disk.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "stale_session_id": { "type": "string", "description": "Session whose worker process to replace" },
+                        "handoff": { "type": "string", "description": "Initial message for the fresh worker (typically the reviewer's last verdict + what to fix)" }
+                    },
+                    "required": ["stale_session_id", "handoff"]
+                }),
+            },
+            ToolDef {
                 name: "answer_worker".into(),
                 description: "Answer a worker's pending ask_user question. First-responder wins (user OR orc). Pass the worker's session_id and your answer."
                     .into(),
@@ -331,12 +358,14 @@ impl McpServer {
 
         let result = match tool_name {
             "spawn_session" => self.tool_spawn_session(&args).await,
+            "respawn_session" => self.tool_respawn_session(&args).await,
             "instruct_session" => self.tool_instruct_session(&args).await,
             "kill_session" => self.tool_kill_session(&args).await,
             "ask_user" => self.tool_ask_user(&args).await,
             "list_sessions" => self.tool_list_sessions(&args).await,
             "mark_done" => self.tool_mark_done(&args).await,
             "submit_for_review" => self.tool_submit_for_review(&args).await,
+            "merge_session" => self.tool_merge_session(&args).await,
             "answer_worker" => self.tool_answer_worker(&args).await,
             "current_summary" => self.tool_current_summary(&args).await,
             "update_task_graph" => self.tool_update_task_graph(&args).await,
@@ -790,6 +819,185 @@ impl McpServer {
         }))?)
     }
 
+    async fn tool_merge_session(&self, args: &Value) -> Result<String> {
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'session_id'"))?;
+        let target_branch = args
+            .get("target_branch")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'target_branch'"))?;
+        let push = args.get("push").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let session = self
+            .state
+            .get_session(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {}", session_id))?;
+        if session.branch.is_empty() {
+            anyhow::bail!("session {} has no branch to merge", session_id);
+        }
+
+        let project_dir = self.project_dir.to_str().unwrap_or(".");
+        let current_branch = run_git(project_dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+        if current_branch.trim() != target_branch {
+            anyhow::bail!(
+                "merge refused: project's main worktree is on '{}', not '{}'. \
+                 Ask the user to checkout '{}' first.",
+                current_branch.trim(),
+                target_branch,
+                target_branch
+            );
+        }
+
+        let dirty = run_git(project_dir, &["status", "--porcelain"]).await?;
+        if !dirty.trim().is_empty() {
+            anyhow::bail!(
+                "merge refused: '{}' has uncommitted changes. \
+                 Ask the user to commit or stash before merging.",
+                target_branch
+            );
+        }
+
+        let merge_msg = format!("merge orc/{} into {}", session.name, target_branch);
+        let merge_out =
+            run_git_raw(project_dir, &["merge", "--no-edit", "-m", &merge_msg, &session.branch])
+                .await?;
+        if !merge_out.status.success() {
+            let stderr = String::from_utf8_lossy(&merge_out.stderr).to_string();
+            let _ = run_git_raw(project_dir, &["merge", "--abort"]).await;
+            anyhow::bail!("git merge failed: {}", stderr.trim());
+        }
+
+        let merge_stdout = String::from_utf8_lossy(&merge_out.stdout).to_string();
+        let mut pushed = false;
+        let mut push_error: Option<String> = None;
+        if push {
+            let push_out =
+                run_git_raw(project_dir, &["push", "origin", target_branch]).await?;
+            if push_out.status.success() {
+                pushed = true;
+            } else {
+                push_error = Some(
+                    String::from_utf8_lossy(&push_out.stderr)
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+
+        let push_part = if push {
+            if pushed {
+                ", pushed to origin".to_string()
+            } else {
+                format!(
+                    ", but push to origin FAILED: {}",
+                    push_error.as_deref().unwrap_or("unknown")
+                )
+            }
+        } else {
+            String::new()
+        };
+        self.inject_orc_event(&format!(
+            "[internal status — do NOT reply or narrate to the user; \
+             the UI has already notified them]\n\
+             Merged worker {name} into {target_branch}{push_part}.",
+            name = session.name
+        ))
+        .await;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "merged_into": target_branch,
+            "pushed": pushed,
+            "push_error": push_error,
+            "merge_output": merge_stdout.trim(),
+        }))?)
+    }
+
+    async fn tool_respawn_session(&self, args: &Value) -> Result<String> {
+        let stale_session_id = args
+            .get("stale_session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'stale_session_id'"))?;
+        let handoff = args
+            .get("handoff")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'handoff'"))?;
+
+        let session = self
+            .state
+            .get_session(stale_session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {}", stale_session_id))?;
+        if session.worktree_path.is_empty() {
+            anyhow::bail!(
+                "session {} has no worktree; nothing to respawn into",
+                stale_session_id
+            );
+        }
+
+        // Kill the stale child but keep the worktree, branch, and DB row.
+        let _ = self.workers.kill(stale_session_id).await;
+
+        let mcp_cfg = generate_mcp_config(self.mcp_port);
+        let mcp_cfg_path =
+            std::env::temp_dir().join(format!("orc-worker-mcp-{}.json", session.name));
+        let _ = tokio::fs::write(
+            &mcp_cfg_path,
+            serde_json::to_string_pretty(&mcp_cfg).unwrap_or_default(),
+        )
+        .await;
+
+        let worker_prompt = worker_system_prompt(
+            &session.id,
+            &session.name,
+            &session.task,
+            &session.worktree_path,
+            &session.branch,
+        );
+        let worktree = std::path::PathBuf::from(&session.worktree_path);
+        match crate::worker::spawn_worker(
+            session.id.clone(),
+            worktree,
+            session.model.clone(),
+            mcp_cfg_path,
+            worker_prompt,
+            handoff.to_string(),
+            self.worker_tx.clone(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                self.workers.insert(handle).await;
+            }
+            Err(e) => {
+                anyhow::bail!("failed to respawn worker: {}", e);
+            }
+        }
+
+        // Reset state to Running so the rest of the system treats this as a
+        // live worker again.
+        let _ = self
+            .state
+            .apply_event(&session.id, SessionEvent::Restarted)
+            .await;
+
+        let _ = self.worker_tx.send(WorkerEvent::OrcInstruction {
+            session_id: session.id.clone(),
+            text: format!("[respawned with handoff] {handoff}"),
+        });
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "ok": true,
+            "session_id": session.id,
+            "name": session.name,
+            "worktree_path": session.worktree_path,
+        }))?)
+    }
+
     async fn tool_current_summary(&self, args: &Value) -> Result<String> {
         let summary = args
             .get("summary")
@@ -858,6 +1066,27 @@ impl McpServer {
             "run_id": run_id
         }))?)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Git helpers (used by merge_session)
+// ---------------------------------------------------------------------------
+
+async fn run_git(cwd: &str, args: &[&str]) -> Result<String> {
+    let output = run_git_raw(cwd, args).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git {}: {}", args.join(" "), stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn run_git_raw(cwd: &str, args: &[&str]) -> Result<std::process::Output> {
+    Ok(tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,7 +1400,7 @@ mod tests {
         let resp = server.handle_request(&req).await.unwrap();
         assert!(resp.error.is_none());
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 10);
+        assert_eq!(tools, 12);
     }
 
     #[tokio::test]

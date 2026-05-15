@@ -124,6 +124,15 @@ pub fn transition(state: &SessionState, event: &SessionEvent) -> Result<SessionS
             })
         }
 
+        // Restart from any non-terminal state resets to Running. Used by
+        // `respawn_session` after killing a stuck worker — the underlying
+        // worktree is preserved, the conversation is fresh.
+        (SessionState::Running, SessionEvent::Restarted) => Ok(SessionState::Running),
+        (SessionState::Blocked { .. }, SessionEvent::Restarted) => Ok(SessionState::Running),
+        (SessionState::AwaitingReview { .. }, SessionEvent::Restarted) => {
+            Ok(SessionState::Running)
+        }
+
         // Terminal states — no transitions allowed
         (SessionState::Done { .. }, _) => {
             bail!("invalid transition: Done is a terminal state")

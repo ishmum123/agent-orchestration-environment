@@ -78,19 +78,11 @@ TMUX= tmux kill-session -t test-runner 2>/dev/null
 
 ### When to run the live e2e harness
 
-**Only before `git push` — not after every change.** The tmux harness is expensive in tokens (large pane captures, multiple inspection steps). Per-edit verification is `cargo build` + `cargo test`. The full live-binary flow below runs once, just before pushing, as the final gate.
+Per-edit verification is `cargo build` + `cargo test`. Run the live tmux harness ad hoc when you want extra confidence on a substantial TUI/UX/orchestration change — not as a routine pre-push gate.
 
-Exception: if a single change is itself a substantial TUI/UX/orchestration rework and you want to sanity-check it in isolation, run the harness ad hoc. But do not run it after every small edit on the way to a push.
+When you do run it, drive whichever flows your change touched. Useful checks: startup renders cleanly, the flow works end-to-end, clean exit (`q` → `EXIT=0`, no orphans via `pgrep -lf orc` / `pgrep -lf claude`), `cargo run -- doctor` passes, DB state is sane.
 
-When you do run it, drive the binary through whichever flows your changes touched. The minimum bar:
-
-1. **Startup renders cleanly** — capture pane, confirm tab strip, orc tab content, action bar.
-2. **The flow you changed actually works end-to-end** — type the keystrokes, capture the screen, read the output. Don't infer behavior; observe it.
-3. **Clean exit** — `q` (and `y` if a confirm modal appears) → `EXIT=0`, no leftover background processes (`pgrep -lf orc`, `pgrep -lf claude`).
-4. **`cargo run -- doctor` passes** with no orphans flagged.
-5. **State is sane** — `sqlite3 ~/.config/orc/state.db "select name, state from sessions"` shows what you'd expect after the run.
-
-If the change touches the actual *content* of worker output (e.g. parsing a new event shape, markdown rendering of real claude text), drive a run without `ORC_CLAUDE_BIN` so a real claude child fires. That costs tokens. For everything else — focus, layout, scroll, modal stacking, paste/Enter races, exit cleanup — the shim is sufficient.
+If the change touches the actual *content* of worker output (e.g. parsing a new event shape, markdown rendering of real claude text), drive a run without `ORC_CLAUDE_BIN` so a real claude child fires. For everything else — focus, layout, scroll, modal stacking, paste/Enter races, exit cleanup — the shim is sufficient.
 
 ### Useful inspection while running
 
