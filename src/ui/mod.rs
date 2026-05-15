@@ -723,7 +723,6 @@ fn render_action_bar(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         TabId::Worker(idx) => {
-            parts.push(("c", "chat"));
             if let Some(sv) = app.sessions.get(idx) {
                 match &sv.session.state {
                     SessionState::AwaitingReview { .. } => {

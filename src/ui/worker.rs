@@ -372,7 +372,7 @@ fn collapse_tool_groups(log: &[LogEntry]) -> Vec<Unit<'_>> {
 /// and worker tabs — same model for both. `speaker` is the name shown as
 /// the prefix on `AssistantText` lines (worker name on a worker tab,
 /// `"orc"` on the orc tab).
-pub fn log_lines(log: &[LogEntry], speaker: &str) -> Vec<Line<'static>> {
+pub fn log_lines(log: &[LogEntry], speaker: &str, width: usize) -> Vec<Line<'static>> {
     let units = collapse_tool_groups(log);
     let mut out: Vec<Line<'static>> = Vec::with_capacity(units.len());
 
@@ -421,11 +421,11 @@ pub fn log_lines(log: &[LogEntry], speaker: &str) -> Vec<Line<'static>> {
                 result_entry,
             } => {
                 if let Some(use_e) = use_entry {
-                    render_entry(&mut out, use_e, speaker);
+                    render_entry(&mut out, use_e, speaker, width);
                 }
-                render_entry(&mut out, result_entry, speaker);
+                render_entry(&mut out, result_entry, speaker, width);
             }
-            Unit::Direct(e) => render_entry(&mut out, e, speaker),
+            Unit::Direct(e) => render_entry(&mut out, e, speaker, width),
         }
     }
     out
@@ -448,7 +448,7 @@ fn render_batch_line(out: &mut Vec<Line<'static>>, counts: &ToolCounts) {
 
 /// Render a single LogEntry to one-or-more output lines. Extracted so
 /// `ErrorPair` can render its two member entries with the same path.
-fn render_entry(out: &mut Vec<Line<'static>>, entry: &LogEntry, speaker: &str) {
+fn render_entry(out: &mut Vec<Line<'static>>, entry: &LogEntry, speaker: &str, width: usize) {
     match entry {
         LogEntry::UserText(t) => {
             let t = sanitize(t);
@@ -476,18 +476,12 @@ fn render_entry(out: &mut Vec<Line<'static>>, entry: &LogEntry, speaker: &str) {
         }
         LogEntry::AssistantText(t) => {
             let t = sanitize(t);
-            let mut md = render_markdown(&t);
             let prefix = format!("{speaker} ");
-            prepend_speaker(
-                &mut md,
-                &prefix,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            );
-            for line in md {
-                out.push(line);
-            }
+            let prefix_style = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+            let (md_lines, is_table) = render_markdown(&t, width);
+            emit_assistant_lines(out, md_lines, is_table, &prefix, prefix_style);
         }
         LogEntry::Thinking(t) => {
             let t = sanitize(t);
@@ -615,26 +609,48 @@ fn render_entry(out: &mut Vec<Line<'static>>, entry: &LogEntry, speaker: &str) {
     }
 }
 
-/// Prepend a speaker prefix to the first non-empty line of a markdown
-/// block and indent every other non-empty line by the prefix's width.
-/// Empty paragraph-separator lines are left untouched so blank gaps
-/// stay blank.
-fn prepend_speaker(lines: &mut [Line<'static>], prefix: &str, prefix_style: Style) {
+/// Lay out an assistant turn's markdown output. Prose lines get the
+/// speaker prefix on the first non-empty line and an indent on each
+/// subsequent non-empty line. Table lines break out of the indent and
+/// render full-width at column 0; if the first non-empty content is a
+/// table (no leading prose), a prefix-only line is emitted above it so
+/// the speaker label still anchors the turn.
+fn emit_assistant_lines(
+    out: &mut Vec<Line<'static>>,
+    lines: Vec<Line<'static>>,
+    is_table: Vec<bool>,
+    prefix: &str,
+    prefix_style: Style,
+) {
     let indent = " ".repeat(prefix.chars().count());
-    let mut prefixed = false;
-    for line in lines.iter_mut() {
+    let mut prefix_placed = false;
+    for (i, mut line) in lines.into_iter().enumerate() {
+        let table_line = is_table.get(i).copied().unwrap_or(false);
         let has_content = line.spans.iter().any(|s| !s.content.is_empty());
+        if table_line {
+            if has_content && !prefix_placed {
+                out.push(Line::from(Span::styled(
+                    prefix.trim_end().to_string(),
+                    prefix_style,
+                )));
+                prefix_placed = true;
+            }
+            out.push(line);
+            continue;
+        }
         if !has_content {
+            out.push(line);
             continue;
         }
         let mut spans = std::mem::take(&mut line.spans);
-        if !prefixed {
+        if !prefix_placed {
             spans.insert(0, Span::styled(prefix.to_string(), prefix_style));
-            prefixed = true;
+            prefix_placed = true;
         } else {
             spans.insert(0, Span::raw(indent.clone()));
         }
         line.spans = spans;
+        out.push(line);
     }
 }
 
@@ -703,15 +719,218 @@ pub fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Sum of display widths of every char in a span sequence. Used by
+/// table layout to size columns by content.
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    spans
+        .iter()
+        .flat_map(|s| s.content.chars())
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+/// Flatten spans to a plain String, discarding styling. Used by the
+/// prose fallback when columns won't fit.
+fn spans_text(spans: &[Span<'static>]) -> String {
+    let mut out = String::new();
+    for s in spans {
+        out.push_str(&s.content);
+    }
+    out
+}
+
+/// Wrap a span sequence into Lines no wider than `width`. Splits at
+/// arbitrary char boundaries (never word-breaks — table cells are short
+/// enough that mid-word splits are rare in practice). Span styles
+/// survive the split.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return vec![Line::from(spans.to_vec())];
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w: usize = 0;
+    for span in spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cw > 0 && cur_w + cw > width {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur_w = 0;
+            }
+            buf.push(ch);
+            cur_w += cw;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(Line::from(cur));
+    }
+    out
+}
+
+/// Render a table as an aligned grid sized to `width`. Returns `None`
+/// if even 4-char minimum cells exceed the available width — caller
+/// should fall back to `render_table_prose`.
+fn render_table_aligned(
+    rows: &[Vec<Vec<Span<'static>>>],
+    has_header: bool,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    use unicode_width::UnicodeWidthChar;
+    let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    const MIN_CELL: usize = 4;
+    let sep_total = 3 * num_cols.saturating_sub(1);
+    if width < MIN_CELL * num_cols + sep_total {
+        return None;
+    }
+
+    // Natural widths, then shrink proportionally above the minimum if
+    // the natural total overflows.
+    let mut col_widths: Vec<usize> = vec![0; num_cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            col_widths[i] = col_widths[i].max(spans_width(cell));
+        }
+    }
+    let natural_total: usize = col_widths.iter().sum::<usize>() + sep_total;
+    if natural_total > width {
+        let avail = width - sep_total;
+        let extras: Vec<usize> = col_widths.iter().map(|w| w.saturating_sub(MIN_CELL)).collect();
+        let total_extra: usize = extras.iter().sum();
+        let remaining = avail - MIN_CELL * num_cols;
+        col_widths = if total_extra == 0 {
+            vec![MIN_CELL; num_cols]
+        } else {
+            let mut nw: Vec<usize> = extras
+                .iter()
+                .map(|e| MIN_CELL + (remaining * e) / total_extra)
+                .collect();
+            let used: usize = nw.iter().sum();
+            if used < avail {
+                nw[num_cols - 1] += avail - used;
+            }
+            nw
+        };
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let empty: Vec<Span<'static>> = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        let cell_lines: Vec<Vec<Line<'static>>> = (0..num_cols)
+            .map(|ci| {
+                let cell = row.get(ci).unwrap_or(&empty);
+                wrap_spans(cell, col_widths[ci])
+            })
+            .collect();
+        let row_h = cell_lines.iter().map(|cl| cl.len().max(1)).max().unwrap_or(1);
+        for sub in 0..row_h {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for ci in 0..num_cols {
+                if ci > 0 {
+                    spans.push(Span::styled(
+                        " │ ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                let cell_w = col_widths[ci];
+                if let Some(line) = cell_lines[ci].get(sub) {
+                    let mut used: usize = 0;
+                    for s in &line.spans {
+                        spans.push(s.clone());
+                        used += s
+                            .content
+                            .chars()
+                            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                            .sum::<usize>();
+                    }
+                    if used < cell_w {
+                        spans.push(Span::raw(" ".repeat(cell_w - used)));
+                    }
+                } else {
+                    spans.push(Span::raw(" ".repeat(cell_w)));
+                }
+            }
+            out.push(Line::from(spans));
+        }
+        if has_header && ri == 0 {
+            let total = col_widths.iter().sum::<usize>() + sep_total;
+            out.push(Line::from(Span::styled(
+                "─".repeat(total),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    Some(out)
+}
+
+/// Prose fallback: render each data row as `Header: value · Header:
+/// value` joined by middots. Used when the aligned grid can't fit.
+fn render_table_prose(
+    rows: &[Vec<Vec<Span<'static>>>],
+    has_header: bool,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let (header, data): (Option<Vec<String>>, &[Vec<Vec<Span<'static>>>]) = if has_header
+        && !rows.is_empty()
+    {
+        let h: Vec<String> = rows[0].iter().map(|c| spans_text(c)).collect();
+        (Some(h), &rows[1..])
+    } else {
+        (None, rows)
+    };
+    for row in data {
+        let parts: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let body = spans_text(cell);
+                match &header {
+                    Some(h) => {
+                        let label = h.get(i).cloned().unwrap_or_default();
+                        if label.is_empty() {
+                            body
+                        } else {
+                            format!("{label}: {body}")
+                        }
+                    }
+                    None => body,
+                }
+            })
+            .collect();
+        out.push(Line::from(Span::raw(parts.join(" · "))));
+    }
+    out
+}
+
 /// Render assistant text via `pulldown-cmark` into ratatui Lines. Handles
 /// headings, emphasis, code (inline + fenced), lists, blockquotes, links,
-/// and horizontal rules. Soft breaks render as spaces; hard breaks and
-/// block-level boundaries flush the current line.
-fn render_markdown(text: &str) -> Vec<Line<'static>> {
-    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+/// horizontal rules, and tables. Soft breaks render as spaces; hard
+/// breaks and block-level boundaries flush the current line.
+/// `table_width` is the column budget for tables (which break out of
+/// the speaker indent to use the full pane). Returns `(lines, is_table)`
+/// where `is_table[i]` is true iff `lines[i]` belongs to a rendered
+/// table block — caller uses this to skip the prefix indent for those
+/// lines.
+fn render_markdown(text: &str, table_width: usize) -> (Vec<Line<'static>>, Vec<bool>) {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-    let parser = Parser::new(text);
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(text, opts);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut is_table: Vec<bool> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default()];
     // Track structural state.
@@ -720,6 +939,13 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut list_index_stack: Vec<Option<u64>> = Vec::new();
     let mut item_pending_marker = false;
     let mut block_just_ended = false;
+    // Table mode: while inside a Table, divert text events into the
+    // current cell instead of `current`. On TagEnd::Table we flush.
+    let mut in_table = false;
+    let mut has_header = false;
+    let mut rows: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
+    let mut current_row: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current_cell: Vec<Span<'static>> = Vec::new();
 
     let style = |stack: &Vec<Style>| -> Style {
         stack.last().copied().unwrap_or_default()
@@ -731,24 +957,119 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
         }
     };
 
-    let flush =
-        |current: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
-            if current.is_empty() {
-                lines.push(Line::from(""));
-            } else {
-                lines.push(Line::from(std::mem::take(current)));
-            }
-        };
+    let flush = |current: &mut Vec<Span<'static>>,
+                 lines: &mut Vec<Line<'static>>,
+                 is_table: &mut Vec<bool>| {
+        if current.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(std::mem::take(current)));
+        }
+        is_table.push(false);
+    };
 
     for event in parser {
+        // Table mode handling. Table events always take precedence, and
+        // while inside a table we divert text/inline events into the
+        // active cell rather than emitting lines.
+        match &event {
+            Event::Start(Tag::Table(_)) => {
+                if !current.is_empty() {
+                    flush(&mut current, &mut lines, &mut is_table);
+                }
+                if !lines.is_empty() && !block_just_ended {
+                    lines.push(Line::from(""));
+                    is_table.push(false);
+                }
+                in_table = true;
+                has_header = false;
+                rows.clear();
+                current_row.clear();
+                current_cell.clear();
+                block_just_ended = false;
+                continue;
+            }
+            Event::End(TagEnd::Table) => {
+                if !rows.is_empty() {
+                    let table_rows = std::mem::take(&mut rows);
+                    let table_lines = render_table_aligned(&table_rows, has_header, table_width)
+                        .unwrap_or_else(|| render_table_prose(&table_rows, has_header));
+                    for tl in table_lines {
+                        lines.push(tl);
+                        is_table.push(true);
+                    }
+                }
+                in_table = false;
+                block_just_ended = true;
+                continue;
+            }
+            Event::Start(Tag::TableHead) => {
+                has_header = true;
+                continue;
+            }
+            Event::End(TagEnd::TableHead) => continue,
+            Event::Start(Tag::TableRow) => {
+                current_row.clear();
+                continue;
+            }
+            Event::End(TagEnd::TableRow) => {
+                rows.push(std::mem::take(&mut current_row));
+                continue;
+            }
+            Event::Start(Tag::TableCell) => {
+                current_cell.clear();
+                continue;
+            }
+            Event::End(TagEnd::TableCell) => {
+                current_row.push(std::mem::take(&mut current_cell));
+                continue;
+            }
+            _ => {}
+        }
+        if in_table {
+            match event {
+                Event::Text(t) => {
+                    current_cell.push(Span::styled(t.into_string(), style(&style_stack)));
+                }
+                Event::Code(c) => {
+                    current_cell.push(Span::styled(
+                        c.into_string(),
+                        style(&style_stack).fg(Color::Cyan),
+                    ));
+                }
+                Event::Start(Tag::Emphasis) => {
+                    let s = style(&style_stack).add_modifier(Modifier::ITALIC);
+                    style_stack.push(s);
+                }
+                Event::Start(Tag::Strong) => {
+                    let s = style(&style_stack).add_modifier(Modifier::BOLD);
+                    style_stack.push(s);
+                }
+                Event::Start(Tag::Strikethrough) => {
+                    let s = style(&style_stack).add_modifier(Modifier::CROSSED_OUT);
+                    style_stack.push(s);
+                }
+                Event::End(TagEnd::Emphasis)
+                | Event::End(TagEnd::Strong)
+                | Event::End(TagEnd::Strikethrough) => {
+                    pop(&mut style_stack);
+                }
+                Event::SoftBreak => {
+                    current_cell.push(Span::raw(" "));
+                }
+                _ => {}
+            }
+            continue;
+        }
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     if !lines.is_empty() && !block_just_ended {
                         lines.push(Line::from(""));
+                        is_table.push(false);
                     }
                     let mut s = Style::default().add_modifier(Modifier::BOLD);
                     if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
@@ -759,16 +1080,17 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 }
                 Tag::Paragraph => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     if !lines.is_empty() && !block_just_ended {
                         lines.push(Line::from(""));
+                        is_table.push(false);
                     }
                     block_just_ended = false;
                 }
                 Tag::BlockQuote(_) => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     let s = style(&style_stack)
                         .fg(Color::DarkGray)
@@ -777,21 +1099,21 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 }
                 Tag::CodeBlock(_) => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     in_code_block = true;
                     style_stack.push(Style::default().fg(Color::LightYellow));
                 }
                 Tag::List(start) => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     list_depth += 1;
                     list_index_stack.push(start);
                 }
                 Tag::Item => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     item_pending_marker = true;
                 }
@@ -820,13 +1142,13 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
             Event::End(end) => match end {
                 TagEnd::Heading(_) | TagEnd::Paragraph => {
                     pop(&mut style_stack);
-                    flush(&mut current, &mut lines);
+                    flush(&mut current, &mut lines, &mut is_table);
                     block_just_ended = true;
                 }
                 TagEnd::BlockQuote(_) => {
                     pop(&mut style_stack);
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     block_just_ended = true;
                 }
@@ -834,7 +1156,7 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                     pop(&mut style_stack);
                     in_code_block = false;
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                     block_just_ended = true;
                 }
@@ -847,7 +1169,7 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 }
                 TagEnd::Item => {
                     if !current.is_empty() {
-                        flush(&mut current, &mut lines);
+                        flush(&mut current, &mut lines, &mut is_table);
                     }
                 }
                 TagEnd::Emphasis
@@ -879,7 +1201,7 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                     let body = t.into_string();
                     for (i, ln) in body.split('\n').enumerate() {
                         if i > 0 {
-                            flush(&mut current, &mut lines);
+                            flush(&mut current, &mut lines, &mut is_table);
                         }
                         if !ln.is_empty() {
                             current.push(Span::styled(
@@ -907,16 +1229,17 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 current.push(Span::raw(" "));
             }
             Event::HardBreak => {
-                flush(&mut current, &mut lines);
+                flush(&mut current, &mut lines, &mut is_table);
             }
             Event::Rule => {
                 if !current.is_empty() {
-                    flush(&mut current, &mut lines);
+                    flush(&mut current, &mut lines, &mut is_table);
                 }
                 lines.push(Line::from(Span::styled(
                     "─".repeat(40),
                     Style::default().fg(Color::DarkGray),
                 )));
+                is_table.push(false);
                 block_just_ended = true;
             }
             _ => {}
@@ -924,12 +1247,13 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
     }
 
     if !current.is_empty() {
-        flush(&mut current, &mut lines);
+        flush(&mut current, &mut lines, &mut is_table);
     }
     if lines.is_empty() {
         lines.push(Line::from(""));
+        is_table.push(false);
     }
-    lines
+    (lines, is_table)
 }
 
 pub fn render_event_log(
@@ -941,13 +1265,13 @@ pub fn render_event_log(
     tick: u64,
     speaker: &str,
 ) {
-    let mut lines = log_lines(log, speaker);
+    let block_inner_w = area.width.saturating_sub(2) as usize;
+    let mut lines = log_lines(log, speaker, block_inner_w);
     if thinking {
         lines.push(thinking_line(tick));
     }
     let total_lines = lines.len();
 
-    let block_inner_w = area.width.saturating_sub(2) as usize;
     // Pre-wrap into terminal rows ourselves. Paragraph's built-in
     // Wrap+scroll has glitches under autoscroll while a worker is
     // streaming — half-overwritten cells leak across frames. With
@@ -1078,7 +1402,7 @@ fn thinking_line(tick: u64) -> Line<'static> {
 /// Compute how many wrapped lines `log` produces at the given inner width.
 /// Used by the autoscroll path to pin the view to the bottom.
 pub fn wrapped_line_count(log: &[LogEntry], inner_width: u16, speaker: &str) -> usize {
-    let lines = log_lines(log, speaker);
+    let lines = log_lines(log, speaker, inner_width as usize);
     wrap_lines_to_rows(&lines, inner_width as usize).len()
 }
 

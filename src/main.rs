@@ -1274,6 +1274,19 @@ async fn handle_key(key: KeyEvent, app: &mut App, state_handle: &StateHandle) ->
             }
             return KeyAction::None;
         }
+        // Vim easter egg: `i` from nav mode drops into insert mode.
+        // Undocumented on purpose.
+        let in_nav = app.focused_compose().map(|c| c.nav_mode).unwrap_or(false);
+        if in_nav
+            && matches!(key.code, KeyCode::Char('i'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            if let Some(cs) = app.focused_compose_mut() {
+                cs.nav_mode = false;
+            }
+            return KeyAction::None;
+        }
 
         let nav_mode = app.focused_compose().map(|c| c.nav_mode).unwrap_or(false);
         if !nav_mode {
